@@ -28,10 +28,16 @@ class ScheduleJob:
 
 
 class ScheduleEngine:
-    def __init__(self, storage_path: str | Path, run_callback: Callable[[ScheduleJob], Dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        storage_path: str | Path,
+        run_callback: Callable[[ScheduleJob], Dict[str, Any]],
+        fire_startup_event: bool = False,
+    ) -> None:
         self.storage_path = Path(storage_path)
         self.storage_path.parent.mkdir(parents=True, exist_ok=True)
         self.run_callback = run_callback
+        self.fire_startup_event = fire_startup_event
         self.lock = threading.Lock()
         self.jobs: Dict[str, ScheduleJob] = {}
         self.event_queue: List[str] = []
@@ -46,7 +52,8 @@ class ScheduleEngine:
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
-        self.trigger_event("on_startup")
+        if self.fire_startup_event:
+            self.trigger_event("on_startup")
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -187,4 +194,3 @@ class ScheduleEngine:
             "history": self.history[-500:],
         }
         self.storage_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-

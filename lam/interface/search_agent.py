@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import csv
 import html
+import hashlib
 import statistics
 import re
 import time
@@ -13,7 +14,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from lam.interface.ai_backend import backend_metadata, normalize_backend
 from lam.interface.app_launcher import normalize_app_name, open_installed_app
@@ -45,6 +46,17 @@ class JobListing:
     salary_max: Optional[float]
     currency: str
     snippet: str = ""
+
+
+@dataclass(slots=True)
+class StudyItem:
+    question: str
+    answer: str
+    category: str
+    difficulty: str
+    source_url: str = ""
+    evidence: str = ""
+    image_path: str = ""
 
 
 def _fetch_text(url: str) -> str:
@@ -121,14 +133,24 @@ def _parse_bing_rss(query: str, limit: int = 8) -> List[SearchResult]:
 
 
 def _search_web(query: str, limit: int = 10) -> List[SearchResult]:
-    results = _parse_duckduckgo(query, limit=limit)
+    results = _safe_search_web(query, limit=limit)
     if len(results) >= max(3, limit // 2):
         return results
-    fallback = _parse_bing_rss(query, limit=limit)
+    try:
+        fallback = _parse_bing_rss(query, limit=limit)
+    except Exception:
+        fallback = []
     out: Dict[str, SearchResult] = {}
     for r in results + fallback:
         out[r.url] = r
     return list(out.values())[:limit]
+
+
+def _safe_search_web(query: str, limit: int = 10) -> List[SearchResult]:
+    try:
+        return _parse_duckduckgo(query, limit=limit)
+    except Exception:
+        return []
 
 
 def _extract_price(text: str) -> Optional[float]:
@@ -191,7 +213,9 @@ def execute_instruction(
     step_mode: bool = False,
     confirm_risky: bool = False,
     ai_backend: str = "deterministic-local",
+    progress_cb: Optional[Callable[[int, str], None]] = None,
 ) -> Dict[str, Any]:
+    _emit_progress(progress_cb, 2, "Understanding your request")
     ai_meta = backend_metadata(ai_backend)
     ai_backend = normalize_backend(ai_backend)
     if not control_granted:
@@ -206,32 +230,17 @@ def execute_instruction(
     if not normalized:
         return {"ok": False, "error": "Instruction is empty.", "instruction": instruction}
 
-    if _is_native_planning_intent(normalized):
+    if _is_native_planning_intent(normalized) or _is_study_pack_intent(normalized) or _is_job_research_intent(normalized):
+        _emit_progress(progress_cb, 8, "Building execution plan")
         plan = _build_native_plan(normalized)
-        execution = _execute_native_plan(plan=plan, instruction=instruction)
+        _emit_progress(progress_cb, 14, "Executing plan")
+        execution = _execute_native_plan(plan=plan, instruction=instruction, progress_cb=progress_cb)
         execution["ai"] = ai_meta
+        _emit_progress(progress_cb, 100, "Completed")
         return execution
 
-    if _is_job_research_intent(normalized):
-        findings = _run_job_market_research(normalized)
-        return {
-            "ok": findings["ok"],
-            "mode": "job_market_research",
-            "instruction": instruction,
-            "ai": ai_meta,
-            "query": findings["query"],
-            "results_count": findings["results_count"],
-            "artifacts": findings["artifacts"],
-            "summary": findings["summary"],
-            "results": findings["results"],
-            "source_status": findings.get("source_status", {}),
-            "opened_url": findings.get("opened_url", ""),
-            "canvas": findings["canvas"],
-            "paused_for_credentials": False,
-            "pause_reason": "",
-        }
-
     if _is_desktop_sequence_intent(normalized):
+        _emit_progress(progress_cb, 12, "Building desktop action sequence")
         plan = build_plan(normalized)
         risk = assess_risk(plan)
         if risk["requires_confirmation"] and not confirm_risky:
@@ -258,6 +267,7 @@ def execute_instruction(
                 },
             }
         run = execute_plan(plan, start_index=0, step_mode=step_mode, allow_input_fallback=True)
+        _emit_progress(progress_cb, 95, "Finalizing desktop run output")
         store = LocalVectorStore()
         app_name = plan.get("app_name", "") or "desktop"
         guidance = get_guidance(app_name=app_name, user_goal=normalized, store=store) if app_name else {"guidance": []}
@@ -289,6 +299,7 @@ def execute_instruction(
 
     open_match = re.search(r"\bopen\s+(.+?)(?:\s+app)?\b", normalized, flags=re.IGNORECASE)
     if open_match and ("search" not in normalized.lower()):
+        _emit_progress(progress_cb, 15, "Opening installed application")
         target = open_match.group(1).strip()
         ok, launched = open_installed_app(target)
         app_name = normalize_app_name(target)
@@ -325,6 +336,7 @@ def execute_instruction(
         }
 
     query = normalized
+    _emit_progress(progress_cb, 20, "Running web search")
     results: List[SearchResult] = []
     if "amazon" in normalized.lower():
         cleaned = re.sub(r"^.*?search\s+amazon\s+for\s+", "", normalized, flags=re.IGNORECASE)
@@ -371,6 +383,7 @@ def execute_instruction(
         "paused_for_credentials": needs_credentials,
         "pause_reason": "Possible login prompt detected. Enter credentials manually and click Resume." if needs_credentials else "",
     }
+    _emit_progress(progress_cb, 100, "Completed")
     return json.loads(json.dumps(response))
 
 
@@ -459,8 +472,20 @@ def _is_native_planning_intent(instruction: str) -> bool:
     return complexity >= 2 or (len(instruction) > 180 and any(k in low for k in ["find", "research", "search"]))
 
 
+def _is_study_pack_intent(instruction: str) -> bool:
+    low = instruction.lower()
+    has_learning = any(x in low for x in ["flashcard", "quiz", "study", "exam", "test prep", "permit"])
+    has_create = any(x in low for x in ["create", "build", "generate", "make"])
+    return has_learning and (has_create or "notebooklm" in low)
+
+
 def _build_native_plan(instruction: str) -> Dict[str, Any]:
-    domain = "job_market" if _is_job_research_intent(instruction) else "web_research"
+    if _is_study_pack_intent(instruction):
+        domain = "study_pack"
+    elif _is_job_research_intent(instruction):
+        domain = "job_market"
+    else:
+        domain = "web_research"
     deliverables: List[str] = []
     low = instruction.lower()
     if "spreadsheet" in low or "csv" in low:
@@ -501,53 +526,126 @@ def _build_native_plan(instruction: str) -> Dict[str, Any]:
     }
 
 
-def _execute_native_plan(plan: Dict[str, Any], instruction: str) -> Dict[str, Any]:
-    if plan.get("domain") == "job_market":
-        findings = _run_job_market_research(instruction)
-        return {
-            "ok": findings["ok"],
-            "mode": "autonomous_plan_execute",
-            "plan": plan,
-            "instruction": instruction,
-            "decision_log": [
-                "Detected multi-step research + artifact request.",
-                "Selected job_market strategy and commercial job-board sources.",
-                "Executed structured extraction and artifact generation.",
-            ],
-            "query": findings["query"],
-            "results_count": findings["results_count"],
-            "artifacts": findings["artifacts"],
-            "summary": findings["summary"],
-            "results": findings["results"],
-            "source_status": findings.get("source_status", {}),
-            "opened_url": findings.get("opened_url", ""),
-            "canvas": findings["canvas"],
-            "paused_for_credentials": False,
-            "pause_reason": "",
-        }
+def _execute_native_plan(
+    plan: Dict[str, Any],
+    instruction: str,
+    progress_cb: Optional[Callable[[int, str], None]] = None,
+) -> Dict[str, Any]:
+    return _run_reflective_planner(plan=plan, instruction=instruction, progress_cb=progress_cb)
 
-    findings = _run_generic_research(instruction)
+
+def _run_reflective_planner(
+    plan: Dict[str, Any],
+    instruction: str,
+    progress_cb: Optional[Callable[[int, str], None]] = None,
+) -> Dict[str, Any]:
+    objective = str(plan.get("objective", instruction))
+    preferred = str(plan.get("domain", "web_research"))
+    attempt_order = _strategy_order(preferred=preferred)
+    best: Dict[str, Any] = {"score": -1.0, "result": {}}
+    decision_log: List[str] = []
+
+    for attempt, strategy in enumerate(attempt_order, start=1):
+        _emit_progress(progress_cb, 18 + (attempt - 1) * 20, f"Planning attempt {attempt}: {strategy}")
+        result = _run_strategy(strategy=strategy, instruction=instruction, progress_cb=progress_cb)
+        score = _score_result_against_objective(result=result, objective=objective)
+        decision_log.append(f"Attempt {attempt} used {strategy} -> quality score {score:.2f}")
+        if score > float(best["score"]):
+            best = {"score": score, "result": result}
+        if score >= 0.72:
+            decision_log.append(f"Accepted attempt {attempt}; score passed threshold.")
+            break
+        decision_log.append(f"Rejected attempt {attempt}; refining strategy.")
+
+    chosen = dict(best["result"] or {})
+    if not chosen:
+        chosen = _run_generic_research(instruction, progress_cb=progress_cb)
+        decision_log.append("Fallback to generic strategy due empty attempts.")
+
+    paused_for_credentials = bool(chosen.get("paused_for_credentials", False))
+    pause_reason = str(chosen.get("pause_reason", "")) if paused_for_credentials else ""
     return {
-        "ok": findings["ok"],
+        "ok": bool(chosen.get("ok", False)),
         "mode": "autonomous_plan_execute",
         "plan": plan,
         "instruction": instruction,
-        "decision_log": [
-            "Detected generic multi-step research task.",
-            "Built diversified web queries and ranked results by relevance.",
-            "Generated reusable spreadsheet/report/dashboard artifacts.",
-        ],
-        "query": findings["query"],
-        "results_count": findings["results_count"],
-        "artifacts": findings["artifacts"],
-        "summary": findings["summary"],
-        "results": findings["results"],
-        "source_status": findings.get("source_status", {}),
-        "opened_url": findings.get("opened_url", ""),
-        "canvas": findings["canvas"],
-        "paused_for_credentials": False,
-        "pause_reason": "",
+        "decision_log": decision_log,
+        "query": chosen.get("query", ""),
+        "results_count": chosen.get("results_count", 0),
+        "artifacts": chosen.get("artifacts", {}),
+        "summary": chosen.get("summary", {}),
+        "results": chosen.get("results", []),
+        "source_status": chosen.get("source_status", {}),
+        "opened_url": chosen.get("opened_url", ""),
+        "canvas": chosen.get(
+            "canvas",
+            {
+                "title": "Task Completed",
+                "subtitle": objective,
+                "cards": [],
+            },
+        ),
+        "paused_for_credentials": paused_for_credentials,
+        "pause_reason": pause_reason,
     }
+
+
+def _strategy_order(preferred: str) -> List[str]:
+    all_strategies = ["study_pack", "job_market", "generic_research"]
+    if preferred == "study_pack":
+        return ["study_pack", "generic_research"]
+    if preferred == "job_market":
+        return ["job_market", "generic_research"]
+    if preferred in all_strategies:
+        return [preferred] + [s for s in all_strategies if s != preferred]
+    return all_strategies
+
+
+def _run_strategy(strategy: str, instruction: str, progress_cb: Optional[Callable[[int, str], None]] = None) -> Dict[str, Any]:
+    if strategy == "study_pack":
+        return _run_study_pack(instruction, progress_cb=progress_cb)
+    if strategy == "job_market":
+        return _run_job_market_research(instruction, progress_cb=progress_cb)
+    return _run_generic_research(instruction, progress_cb=progress_cb)
+
+
+def _score_result_against_objective(result: Dict[str, Any], objective: str) -> float:
+    if not result.get("ok"):
+        return 0.0
+    score = 0.2
+    artifacts = result.get("artifacts", {}) or {}
+    if artifacts:
+        score += 0.2
+    if any(k in artifacts for k in ["quiz_html", "dashboard_html", "report_md"]):
+        score += 0.2
+
+    results_count = int(result.get("results_count", 0) or 0)
+    score += 0.15 if results_count > 0 else 0.0
+    score += 0.1 if results_count >= 20 else 0.0
+
+    low_obj = objective.lower()
+    low_summary = json.dumps(result.get("summary", {})).lower()
+    alignment_terms = [t for t in re.split(r"[^a-z0-9]+", low_obj) if len(t) > 3]
+    overlap = sum(1 for t in alignment_terms if t in low_summary)
+    if alignment_terms:
+        score += min(0.15, overlap / max(1, len(alignment_terms)) * 0.15)
+
+    bad_domains = ("support.google.com", "gmail.com", "mail.google.com")
+    urls = [str(x.get("url", "")).lower() for x in (result.get("results") or [])[:10]]
+    if any(any(b in u for b in bad_domains) for u in urls):
+        score -= 0.25
+
+    low_obj = objective.lower()
+    wants_study = any(t in low_obj for t in ["flashcard", "quiz", "study", "exam", "permit"])
+    wants_jobs = any(t in low_obj for t in ["job", "position", "salary", "linkedin", "indeed"])
+    if wants_study:
+        if "flashcards_csv" not in artifacts or not any(k in artifacts for k in ["quiz_md", "quiz_html"]):
+            score -= 0.5
+    if wants_jobs:
+        if "jobs_csv" not in artifacts and result.get("mode") != "job_market_research":
+            score -= 0.3
+
+    return max(0.0, min(1.0, score))
 
 
 def _is_job_research_intent(instruction: str) -> bool:
@@ -557,26 +655,34 @@ def _is_job_research_intent(instruction: str) -> bool:
     return sum(1 for t in job_terms if t in low) >= 3 and any(t in low for t in analysis_terms)
 
 
-def _run_job_market_research(instruction: str) -> Dict[str, Any]:
+def _run_job_market_research(instruction: str, progress_cb: Optional[Callable[[int, str], None]] = None) -> Dict[str, Any]:
     role_query = _extract_role_query(instruction)
     region_labels = _extract_regions(instruction)
     source_status: Dict[str, str] = {}
     collected: List[JobListing] = []
+    _emit_progress(progress_cb, 18, f"Researching job sources for: {role_query}")
+
+    total_units = max(1, len(region_labels) * 5)
+    done_units = 0
 
     for region in region_labels:
+        _emit_progress(progress_cb, 22 + int((done_units / total_units) * 45), f"Searching LinkedIn ({region.upper()})")
         try:
             li = _scrape_linkedin_jobs(role_query=role_query, region=region, limit=40)
             collected.extend(li)
             source_status[f"linkedin_{region}"] = f"ok:{len(li)}"
         except Exception as exc:
             source_status[f"linkedin_{region}"] = f"error:{type(exc).__name__}"
+        done_units += 1
 
+        _emit_progress(progress_cb, 22 + int((done_units / total_units) * 45), f"Searching BuiltIn ({region.upper()})")
         try:
             bi = _scrape_builtin_jobs(role_query=role_query, region=region, limit=30)
             collected.extend(bi)
             source_status[f"builtin_{region}"] = f"ok:{len(bi)}"
         except Exception as exc:
             source_status[f"builtin_{region}"] = f"error:{type(exc).__name__}"
+        done_units += 1
 
         # Best-effort site-search fallback for other commercial boards.
         site_queries = [
@@ -587,6 +693,7 @@ def _run_job_market_research(instruction: str) -> Dict[str, Any]:
         region_phrase = "Ireland" if region == "ireland" else "United States"
         for source, site_prefix in site_queries:
             query = f'{site_prefix} "{role_query}" {region_phrase} salary remote'
+            _emit_progress(progress_cb, 22 + int((done_units / total_units) * 45), f"Searching {source} ({region.upper()})")
             try:
                 pulled = 0
                 for item in _search_web(query, limit=6):
@@ -598,7 +705,9 @@ def _run_job_market_research(instruction: str) -> Dict[str, Any]:
             except Exception as exc:
                 source_status[f"{source}_{region}"] = f"error:{type(exc).__name__}"
             time.sleep(0.2)
+            done_units += 1
 
+    _emit_progress(progress_cb, 72, "Deduplicating and ranking job listings")
     dedup: Dict[str, JobListing] = {}
     for job in collected:
         dedup[job.url] = job
@@ -607,6 +716,7 @@ def _run_job_market_research(instruction: str) -> Dict[str, Any]:
     if len(jobs) < 12:
         jobs = jobs_all
     jobs.sort(key=lambda j: (_salary_rank(j), not j.remote, j.source, j.title))
+    _emit_progress(progress_cb, 84, "Generating spreadsheet, report, and dashboard")
     artifacts = _write_job_artifacts(instruction=instruction, jobs=jobs)
     summary = _job_summary(jobs)
     top = jobs[:40]
@@ -638,12 +748,14 @@ def _run_job_market_research(instruction: str) -> Dict[str, Any]:
     }
 
 
-def _run_generic_research(instruction: str) -> Dict[str, Any]:
+def _run_generic_research(instruction: str, progress_cb: Optional[Callable[[int, str], None]] = None) -> Dict[str, Any]:
     query = _extract_generic_query(instruction)
     queries = _expand_queries(query)
     collected: List[SearchResult] = []
     source_status: Dict[str, str] = {}
+    _emit_progress(progress_cb, 18, f"Researching: {query}")
     for q in queries:
+        _emit_progress(progress_cb, 24 + int((queries.index(q) / max(1, len(queries))) * 40), f"Searching web for: {q}")
         try:
             rows = _search_web(q, limit=12)
             collected.extend(rows)
@@ -654,7 +766,9 @@ def _run_generic_research(instruction: str) -> Dict[str, Any]:
     for r in collected:
         dedup[r.url] = r
     ranked = list(dedup.values())
+    _emit_progress(progress_cb, 72, "Ranking and summarizing findings")
     ranked.sort(key=lambda x: _relevance_score(x, query), reverse=True)
+    _emit_progress(progress_cb, 84, "Building spreadsheet, report, and dashboard")
     artifacts = _write_generic_research_artifacts(instruction=instruction, query=query, results=ranked)
     summary = {
         "total": len(ranked),
@@ -688,6 +802,201 @@ def _run_generic_research(instruction: str) -> Dict[str, Any]:
     }
 
 
+def _run_study_pack(instruction: str, progress_cb: Optional[Callable[[int, str], None]] = None) -> Dict[str, Any]:
+    topic = _extract_study_topic(instruction)
+    question_count = _extract_question_count(instruction, default_count=200)
+    use_notebooklm = "notebooklm" in instruction.lower()
+    _emit_progress(progress_cb, 16, f"Researching study sources for: {topic}")
+
+    sources = _study_sources_for_topic(topic)
+    preferred_domains = _preferred_domains_for_topic(topic)
+    strict_official = _is_strict_official_topic(topic)
+    source_results: List[SearchResult] = []
+    source_status: Dict[str, str] = {}
+    for i, q in enumerate(sources):
+        _emit_progress(progress_cb, 22 + int((i / max(1, len(sources))) * 38), f"Finding relevant sources: {q}")
+        pulled = _search_web(q, limit=12)
+        filtered = _filter_relevant_results(
+            pulled,
+            must_terms=_must_terms_for_topic(topic),
+            banned_domains={
+                "support.google.com",
+                "mail.google.com",
+                "gmail.com",
+                "support.microsoft.com",
+                "learn.microsoft.com",
+                "microsoft.com",
+                "windows.com",
+            },
+            min_score=2.0,
+            preferred_domains=preferred_domains,
+        )
+        source_results.extend(filtered)
+        source_status[q] = f"ok:{len(filtered)}"
+
+    if len(source_results) < 5:
+        _emit_progress(progress_cb, 58, "Refining search terms due low relevance")
+        for q in _refine_study_queries(topic):
+            pulled = _search_web(q, limit=10)
+            filtered = _filter_relevant_results(
+                pulled,
+                must_terms=_must_terms_for_topic(topic),
+                banned_domains={
+                    "support.google.com",
+                    "mail.google.com",
+                    "gmail.com",
+                    "support.microsoft.com",
+                    "learn.microsoft.com",
+                    "microsoft.com",
+                    "windows.com",
+                },
+                min_score=1.5,
+                preferred_domains=preferred_domains if strict_official else preferred_domains,
+            )
+            source_results.extend(filtered)
+            source_status[q] = f"retry:{len(filtered)}"
+            if len(source_results) >= 10:
+                break
+
+    dedup: Dict[str, SearchResult] = {}
+    for r in source_results:
+        dedup[r.url] = r
+    ranked = sorted(dedup.values(), key=lambda x: _relevance_score(x, topic), reverse=True)
+
+    if not ranked and not strict_official:
+        _emit_progress(progress_cb, 64, "Relaxing filters to recover high-signal sources")
+        fallback_pool: List[SearchResult] = []
+        for q in sources + _refine_study_queries(topic):
+            fallback_pool.extend(_search_web(q, limit=10))
+        ranked = _filter_relevant_results(
+            fallback_pool,
+            must_terms=_must_terms_for_topic(topic),
+            banned_domains={
+                "support.google.com",
+                "mail.google.com",
+                "gmail.com",
+                "dell.com",
+                "lenovo.com",
+                "nvidia.com",
+                "hp.com",
+                "intel.com",
+            },
+            min_score=2.0,
+            preferred_domains=None,
+        )
+        dedup2: Dict[str, SearchResult] = {}
+        for r in ranked:
+            dedup2[r.url] = r
+        ranked = sorted(dedup2.values(), key=lambda x: _relevance_score(x, topic), reverse=True)
+
+    if not ranked:
+        _emit_progress(progress_cb, 66, "Using curated official source links")
+        ranked = _curated_study_sources(topic)
+
+    _emit_progress(progress_cb, 70, "Extracting facts from official source material")
+    fact_bank = _build_fact_bank(topic=topic, sources=ranked)
+    if len(fact_bank) < 20:
+        return {
+            "ok": False,
+            "query": topic,
+            "results_count": 0,
+            "results": [asdict(x) for x in ranked[:10]],
+            "artifacts": {},
+            "summary": {"topic": topic, "error": "insufficient_evidence", "fact_count": len(fact_bank)},
+            "source_status": source_status,
+            "opened_url": "",
+            "paused_for_credentials": False,
+            "pause_reason": "",
+            "canvas": {
+                "title": "Study Pack Blocked",
+                "subtitle": "Not enough validated source evidence. No synthetic quiz generated.",
+                "cards": [{"title": "Evidence", "price": str(len(fact_bank)), "source": "validator", "url": ""}],
+            },
+        }
+
+    _emit_progress(progress_cb, 78, f"Generating {question_count} source-grounded flashcards")
+    cards = _generate_study_items(topic=topic, count=question_count, source_results=ranked, fact_bank=fact_bank)
+    coverage = _study_evidence_coverage(cards)
+    if coverage < 0.85:
+        return {
+            "ok": False,
+            "query": topic,
+            "results_count": 0,
+            "results": [asdict(x) for x in ranked[:10]],
+            "artifacts": {},
+            "summary": {"topic": topic, "error": "low_evidence_coverage", "coverage": coverage},
+            "source_status": source_status,
+            "opened_url": "",
+            "paused_for_credentials": False,
+            "pause_reason": "",
+            "canvas": {
+                "title": "Study Pack Blocked",
+                "subtitle": "Evidence coverage below threshold. No low-quality quiz output allowed.",
+                "cards": [{"title": "Coverage", "price": f"{coverage:.2%}", "source": "validator", "url": ""}],
+            },
+        }
+    quality_issues = _study_human_quality_issues(cards)
+    if quality_issues:
+        return {
+            "ok": False,
+            "query": topic,
+            "results_count": 0,
+            "results": [asdict(x) for x in ranked[:10]],
+            "artifacts": {},
+            "summary": {"topic": topic, "error": "human_quality_failed", "issues": quality_issues[:10]},
+            "source_status": source_status,
+            "opened_url": "",
+            "paused_for_credentials": False,
+            "pause_reason": "",
+            "canvas": {
+                "title": "Study Pack Blocked",
+                "subtitle": "Human-quality validation failed. Output rejected.",
+                "cards": [{"title": "Issues", "price": str(len(quality_issues)), "source": "validator", "url": ""}],
+            },
+        }
+    artifacts = _write_study_artifacts(instruction=instruction, topic=topic, cards=cards, sources=ranked)
+
+    pause_reason = ""
+    if use_notebooklm:
+        _emit_progress(progress_cb, 90, "Opening NotebookLM workspace")
+        notebooklm_url = "https://notebooklm.google.com/"
+        webbrowser.open(notebooklm_url, new=2)
+        pause_reason = "NotebookLM opened. If sign-in is required, complete login and continue."
+    dashboard_uri = Path(artifacts["quiz_html"]).resolve().as_uri()
+    webbrowser.open(dashboard_uri, new=2)
+
+    return {
+        "ok": True,
+        "query": topic,
+        "results_count": len(cards),
+        "results": [asdict(x) for x in ranked[:25]],
+        "artifacts": artifacts,
+        "summary": {
+            "topic": topic,
+            "question_count": len(cards),
+            "sources_found": len(ranked),
+            "notebooklm_requested": use_notebooklm,
+        },
+        "source_status": source_status,
+        "opened_url": dashboard_uri,
+        "paused_for_credentials": bool(use_notebooklm),
+        "pause_reason": pause_reason,
+        "canvas": {
+            "title": "Study Pack Ready",
+            "subtitle": f"{len(cards)} questions for {topic}",
+            "cards": [
+                {
+                    "title": r.title[:90],
+                    "price": "source",
+                    "source": r.source,
+                    "url": r.url,
+                }
+                for r in ranked[:6]
+            ],
+        },
+    }
+
+
 def _extract_role_query(instruction: str) -> str:
     low = instruction.lower()
     if "data and ai" in low:
@@ -701,6 +1010,567 @@ def _extract_generic_query(instruction: str) -> str:
     q = re.sub(r"\b(build|create)\b.*$", "", q, flags=re.IGNORECASE)
     q = re.sub(r"\s+", " ", q).strip(" .")
     return q or instruction.strip()
+
+
+def _extract_study_topic(instruction: str) -> str:
+    text = re.sub(r"\s+", " ", instruction).strip()
+    m = re.search(r"(?:for|about)\s+(.+?)(?:\s+exam|\s+test|\s+quiz|$)", text, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip(" .")
+    return text
+
+
+def _extract_question_count(instruction: str, default_count: int = 200) -> int:
+    m = re.search(r"\b([0-9]{2,4})\s+question", instruction, flags=re.IGNORECASE)
+    if not m:
+        return default_count
+    return max(20, min(500, int(m.group(1))))
+
+
+def _study_sources_for_topic(topic: str) -> List[str]:
+    low = topic.lower()
+    if "south carolina" in low and ("driver" in low or "permit" in low):
+        return [
+            'site:scdmvonline.com south carolina driver manual permit test',
+            'site:dmv.sc.gov Driver Manual PDF South Carolina',
+            'site:dc.statelibrary.sc.gov south carolina driver license manual',
+            f'"{topic}" rules of the road signs permit practice',
+        ]
+    return [
+        f'"{topic}" official handbook PDF',
+        f'"{topic}" practice test questions',
+        f'"{topic}" study guide',
+    ]
+
+
+def _refine_study_queries(topic: str) -> List[str]:
+    return [
+        f'"{topic}" official manual PDF',
+        f'"{topic}" exam topics road signs right of way',
+        f'"{topic}" permit exam sample questions',
+    ]
+
+
+def _must_terms_for_topic(topic: str) -> List[str]:
+    low = topic.lower()
+    terms = [t for t in re.split(r"[^a-z0-9]+", low) if len(t) > 2]
+    if "driver" in low or "permit" in low:
+        terms.extend(["driver", "permit", "manual", "road", "dmv"])
+    return list(dict.fromkeys(terms))[:12]
+
+
+def _preferred_domains_for_topic(topic: str) -> List[str]:
+    low = topic.lower()
+    if "south carolina" in low and ("driver" in low or "permit" in low):
+        return [
+            "dmv.sc.gov",
+            "scdmvonline.com",
+            "dc.statelibrary.sc.gov",
+            "driving-tests.org",
+            "dmv.org",
+        ]
+    if "driver" in low or "permit" in low:
+        return ["dmv", "gov", "state"]
+    return []
+
+
+def _is_strict_official_topic(topic: str) -> bool:
+    low = topic.lower()
+    return ("south carolina" in low) and ("driver" in low or "permit" in low)
+
+
+def _curated_study_sources(topic: str) -> List[SearchResult]:
+    low = topic.lower()
+    if "south carolina" in low and ("driver" in low or "permit" in low):
+        return [
+            SearchResult(
+                title="South Carolina Driver Manual (SC DMV)",
+                url="https://dmv.sc.gov/sites/scdmv/files/media/Files/Driver-Manual.pdf",
+                price=None,
+                source="curated",
+                snippet="Official South Carolina driver manual PDF.",
+            ),
+            SearchResult(
+                title="SC DMV Driver Services",
+                url="https://www.scdmvonline.com/Driver-Services",
+                price=None,
+                source="curated",
+                snippet="South Carolina DMV driver services portal.",
+            ),
+            SearchResult(
+                title="SCDMV Beginner's Permit",
+                url="https://dmv.sc.gov/driver-services/drivers-license/beginner-permits",
+                price=None,
+                source="curated",
+                snippet="Official beginner permit eligibility and requirements.",
+            ),
+            SearchResult(
+                title="South Carolina Driver's License Manual (State Library)",
+                url="https://dc.statelibrary.sc.gov/handle/10827/62666",
+                price=None,
+                source="curated",
+                snippet="State document repository for the SC driver manual.",
+            ),
+        ]
+    return [
+        SearchResult(
+            title=f"Official manual source for {topic}",
+            url="https://www.usa.gov/motor-vehicle-services",
+            price=None,
+            source="curated",
+            snippet="General US DMV service portal.",
+        )
+    ]
+
+
+def _build_fact_bank(topic: str, sources: List[SearchResult]) -> List[Dict[str, str]]:
+    facts: List[Dict[str, str]] = []
+    for src in sources[:12]:
+        url = src.url
+        if url.lower().endswith(".pdf") or "driver-manual.pdf" in url.lower():
+            facts.extend(_extract_pdf_fact_entries(url=url, topic=topic))
+            continue
+        text = _extract_source_text(url)
+        if not text:
+            continue
+        for sentence in _split_sentences(text):
+            clean = _normalize_fact_text(sentence)
+            if _is_fact_sentence(clean, topic):
+                score = _fact_sentence_score(clean)
+                if url.lower().endswith(".pdf") or "driver-manual.pdf" in url.lower():
+                    score += 2.0
+                facts.append(
+                    {
+                        "text": clean.strip(),
+                        "source_url": url,
+                        "category": _categorize_fact(clean),
+                        "score": f"{score:.3f}",
+                        "image_path": "",
+                    }
+                )
+    dedup: Dict[str, Dict[str, str]] = {}
+    for f in facts:
+        key = re.sub(r"\s+", " ", f["text"]).strip().lower()
+        dedup[key] = f
+    ranked = list(dedup.values())
+    ranked.sort(key=lambda x: float(x.get("score", "0")), reverse=True)
+    return ranked
+
+
+def _extract_pdf_fact_entries(url: str, topic: str) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    try:
+        import fitz  # type: ignore
+    except Exception:
+        text = _extract_source_text(url)
+        if not text:
+            return out
+        for s in _split_sentences(text):
+            clean = _normalize_fact_text(s)
+            if _is_fact_sentence(clean, topic):
+                out.append(
+                    {
+                        "text": clean,
+                        "source_url": url,
+                        "category": _categorize_fact(clean),
+                        "score": f"{_fact_sentence_score(clean)+2.0:.3f}",
+                        "image_path": "",
+                    }
+                )
+        return out
+
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=40) as resp:  # nosec B310
+        raw = resp.read()
+    doc = fitz.open(stream=raw, filetype="pdf")
+    max_pages = min(120, int(getattr(doc, "page_count", 0) or 0))
+    for i in range(max_pages):
+        try:
+            page = doc.load_page(i)
+            page_text = page.get_text("text") or ""
+        except Exception:
+            continue
+        for s in _split_sentences(page_text):
+            clean = _normalize_fact_text(s)
+            if not _is_fact_sentence(clean, topic):
+                continue
+            score = _fact_sentence_score(clean) + 2.0
+            image_path = ""
+            if _needs_visual(clean):
+                image_path = _render_pdf_page_image(doc, i, url)
+            out.append(
+                {
+                    "text": clean,
+                    "source_url": url,
+                    "category": _categorize_fact(clean),
+                    "score": f"{score:.3f}",
+                    "image_path": image_path,
+                }
+            )
+    return out
+
+
+def _needs_visual(sentence: str) -> bool:
+    low = sentence.lower()
+    return any(k in low for k in ["sign", "signal", "light", "marking", "lane", "intersection"])
+
+
+def _render_pdf_page_image(doc: Any, page_index: int, source_url: str) -> str:
+    try:
+        import fitz  # type: ignore
+
+        digest = hashlib.sha1(source_url.encode("utf-8")).hexdigest()[:12]
+        out_dir = Path("data/reports/study_assets") / digest
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out = out_dir / f"page_{page_index+1}.png"
+        if out.exists():
+            return str(out.resolve())
+        page = doc.load_page(page_index)
+        pix = page.get_pixmap(matrix=fitz.Matrix(1.6, 1.6), alpha=False)
+        pix.save(str(out))
+        return str(out.resolve())
+    except Exception:
+        return ""
+
+
+def _extract_source_text(url: str) -> str:
+    low = url.lower()
+    try:
+        if low.endswith(".pdf") or "driver-manual.pdf" in low:
+            text = _extract_pdf_text(url)
+            return text
+        html_text = _fetch_text(url)
+        return _extract_text_from_html(html_text)
+    except Exception:
+        return ""
+
+
+def _extract_pdf_text(url: str) -> str:
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=30) as resp:  # nosec B310
+        raw = resp.read()
+
+    # Try fast pure-Python extraction first.
+    try:
+        import io
+        import pypdf
+
+        reader = pypdf.PdfReader(io.BytesIO(raw))
+        chunks: List[str] = []
+        for page in reader.pages[:120]:
+            try:
+                chunks.append(page.extract_text() or "")
+            except Exception:
+                continue
+        joined = "\n".join(chunks).strip()
+        if len(joined) > 5000:
+            return joined
+    except Exception:
+        pass
+
+    # Fallback: PyMuPDF handles many scanned/complex PDFs better.
+    try:
+        import fitz  # type: ignore
+
+        doc = fitz.open(stream=raw, filetype="pdf")
+        chunks2: List[str] = []
+        max_pages = min(120, int(getattr(doc, "page_count", 0) or 0))
+        for i in range(max_pages):
+            try:
+                chunks2.append(doc.load_page(i).get_text("text") or "")
+            except Exception:
+                continue
+        return "\n".join(chunks2).strip()
+    except Exception:
+        return ""
+
+
+def _extract_text_from_html(html_text: str) -> str:
+    text = re.sub(r"<script[\s\S]*?</script>", " ", html_text, flags=re.IGNORECASE)
+    text = re.sub(r"<style[\s\S]*?</style>", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html.unescape(text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _split_sentences(text: str) -> List[str]:
+    parts = re.split(r"(?<=[\.\!\?])\s+", text)
+    out = []
+    for p in parts:
+        s = p.strip()
+        if 60 <= len(s) <= 320:
+            out.append(s)
+    return out
+
+
+def _normalize_fact_text(text: str) -> str:
+    s = text.replace("\r", " ").replace("\n", " ")
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"\b([0-9]{1,2})-([0-9]{1,2})\b", " ", s)
+    s = re.sub(r"\s([•\-])\s", " ", s)
+    return s.strip(" .")
+
+
+def _is_fact_sentence(sentence: str, topic: str) -> bool:
+    low = sentence.lower()
+    must = _must_terms_for_topic(topic)
+    score = sum(1 for t in must if t in low)
+    legal_signal = any(k in low for k in ["must", "shall", "required", "cannot", "may", "permit", "license", "test"])
+    return score >= 1 and legal_signal
+
+
+def _categorize_fact(sentence: str) -> str:
+    low = sentence.lower()
+    mapping = [
+        ("Road Signs", ["sign", "signal", "traffic light"]),
+        ("Permit Rules", ["permit", "license", "application", "under 18", "age"]),
+        ("Right of Way", ["right-of-way", "yield", "intersection"]),
+        ("Safe Driving", ["safe", "seat belt", "defensive", "speed"]),
+        ("Alcohol and Drugs", ["alcohol", "drug", "dui"]),
+        ("Parking and Turns", ["park", "turn", "lane", "u-turn"]),
+    ]
+    for cat, keys in mapping:
+        if any(k in low for k in keys):
+            return cat
+    return "Rules of the Road"
+
+
+def _fact_sentence_score(sentence: str) -> float:
+    low = sentence.lower()
+    score = 0.0
+    score += 1.0 if len(sentence) >= 90 else 0.4
+    score += 0.8 if any(k in low for k in ["must", "shall", "required", "illegal", "prohibited"]) else 0.0
+    score += 0.6 if any(k in low for k in ["speed", "lane", "intersection", "sign", "signal", "right-of-way"]) else 0.0
+    score += 0.4 if re.search(r"\b[0-9]{1,3}\b", sentence) else 0.0
+    return score
+
+
+def _study_evidence_coverage(cards: List[StudyItem]) -> float:
+    if not cards:
+        return 0.0
+    good = sum(1 for c in cards if c.source_url and c.evidence and len(c.evidence) > 20)
+    return good / len(cards)
+
+
+def _study_human_quality_issues(cards: List[StudyItem]) -> List[str]:
+    issues: List[str] = []
+    for i, c in enumerate(cards, start=1):
+        q = c.question.lower()
+        a = c.answer.strip()
+        if len(a) < 25:
+            issues.append(f"Q{i}: answer too short")
+        image_referenced = any(k in q for k in ["image shown", "picture", "sign shown", "visual"])
+        if image_referenced and not c.image_path:
+            issues.append(f"Q{i}: image referenced but no image attached")
+    return issues
+
+
+def _filter_relevant_results(
+    results: List[SearchResult],
+    must_terms: List[str],
+    banned_domains: set[str],
+    min_score: float = 1.0,
+    preferred_domains: Optional[List[str]] = None,
+) -> List[SearchResult]:
+    filtered: List[SearchResult] = []
+    preferred = [d.lower() for d in (preferred_domains or []) if d]
+    for r in results:
+        parsed = urllib.parse.urlparse(r.url)
+        host = (parsed.netloc or "").lower()
+        if any(b in host for b in banned_domains):
+            continue
+        if preferred and not any(p in host for p in preferred):
+            continue
+        score = _result_term_score(r, must_terms)
+        if score >= min_score:
+            filtered.append(r)
+    return filtered
+
+
+def _result_term_score(result: SearchResult, terms: List[str]) -> float:
+    hay = f"{result.title} {result.snippet} {result.url}".lower()
+    hit = sum(1 for t in terms if t in hay)
+    quality_bonus = 0.0
+    host = urllib.parse.urlparse(result.url).netloc.lower()
+    if any(x in host for x in ["dmv.sc.gov", "scdmvonline.com", "state", "gov"]):
+        quality_bonus += 1.0
+    return float(hit) + quality_bonus
+
+
+def _generate_study_items(
+    topic: str,
+    count: int,
+    source_results: List[SearchResult],
+    fact_bank: Optional[List[Dict[str, str]]] = None,
+) -> List[StudyItem]:
+    categories = [
+        "Road Signs",
+        "Right of Way",
+        "Speed and Distance",
+        "Safe Driving",
+        "Sharing the Road",
+        "Permit Rules",
+        "Alcohol and Drugs",
+        "Parking and Turns",
+    ]
+    source_titles = [r.title for r in source_results[:20]] or [f"{topic} official manual"]
+    facts = fact_bank or []
+    facts_with_image = [f for f in facts if str(f.get("image_path", ""))]
+    facts_no_image = [f for f in facts if not str(f.get("image_path", ""))]
+    items: List[StudyItem] = []
+    for i in range(count):
+        cat = categories[i % len(categories)]
+        src = source_titles[i % len(source_titles)]
+        if facts:
+            use_visual = bool(facts_with_image) and (i % 4 == 0)
+            if use_visual:
+                fact = facts_with_image[(i // 4) % len(facts_with_image)]
+            else:
+                base = facts_no_image if facts_no_image else facts
+                fact = base[i % len(base)]
+        else:
+            fact = {"text": f"{topic} official rule", "source_url": "", "category": cat}
+        fact_text = str(fact.get("text", "")).strip()
+        if len(fact_text) > 220:
+            fact_text = fact_text[:220] + "..."
+        img = str(fact.get("image_path", ""))
+        q = f"[{cat}] Q{i+1}: {_fact_to_question(fact_text, has_image=bool(img))}"
+        a = f"{fact_text}"
+        diff = "easy" if i % 3 == 0 else "medium" if i % 3 == 1 else "hard"
+        items.append(
+            StudyItem(
+                question=q,
+                answer=a,
+                category=str(fact.get("category", cat)),
+                difficulty=diff,
+                source_url=str(fact.get("source_url", "")),
+                evidence=fact_text,
+                image_path=img,
+            )
+        )
+    return items
+
+
+def _fact_to_question(fact_text: str, has_image: bool = False) -> str:
+    clean = re.sub(r"\s+", " ", fact_text).strip()
+    if has_image:
+        return "Based on the image shown, what rule or meaning applies in this situation?"
+    low = clean.lower()
+    if low.startswith("if "):
+        tail = clean[3:]
+        return f"If {tail}, what does South Carolina guidance require?"
+    if "must" in low:
+        prefix = clean.split("must", 1)[0].strip(" ,.;:")
+        if prefix:
+            return f"What must be done in South Carolina when {prefix.lower()}?"
+    tokens = re.split(r"[^a-zA-Z0-9]+", clean)
+    key = " ".join([t for t in tokens[:10] if t]) or "this situation"
+    return f"According to the official manual, what is the correct rule regarding {key.lower()}?"
+
+
+def _write_study_artifacts(
+    instruction: str,
+    topic: str,
+    cards: List[StudyItem],
+    sources: List[SearchResult],
+) -> Dict[str, str]:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = Path("data/reports/study_pack") / ts
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    flashcards_csv = out_dir / "flashcards.csv"
+    quiz_md = out_dir / "quiz.md"
+    quiz_html = out_dir / "quiz.html"
+    sources_md = out_dir / "sources.md"
+
+    with flashcards_csv.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["question", "answer", "category", "difficulty", "source_url", "evidence", "image_path"])
+        writer.writeheader()
+        for c in cards:
+            writer.writerow(asdict(c))
+
+    lines = [
+        f"# Study Quiz: {topic}",
+        "",
+        f"- Generated: {datetime.now().isoformat(timespec='seconds')}",
+        f"- Requested by: {instruction}",
+        f"- Total Questions: {len(cards)}",
+        "",
+    ]
+    for i, c in enumerate(cards[: min(len(cards), 200)], start=1):
+        lines.append(f"## Q{i} ({c.category}, {c.difficulty})")
+        lines.append(c.question)
+        lines.append("")
+        lines.append(f"Answer: {c.answer}")
+        if c.source_url:
+            lines.append(f"Source: {c.source_url}")
+        if c.evidence:
+            lines.append(f"Evidence: {c.evidence}")
+        if c.image_path:
+            lines.append(f"Image: {c.image_path}")
+        lines.append("")
+    quiz_md.write_text("\n".join(lines), encoding="utf-8")
+
+    src_lines = ["# Sources", ""]
+    for i, s in enumerate(sources[:50], start=1):
+        src_lines.append(f"{i}. [{s.title}]({s.url})")
+    sources_md.write_text("\n".join(src_lines), encoding="utf-8")
+
+    _write_study_quiz_html(quiz_html, topic=topic, cards=cards, sources=sources)
+    return {
+        "directory": str(out_dir.resolve()),
+        "flashcards_csv": str(flashcards_csv.resolve()),
+        "quiz_md": str(quiz_md.resolve()),
+        "quiz_html": str(quiz_html.resolve()),
+        "sources_md": str(sources_md.resolve()),
+    }
+
+
+def _write_study_quiz_html(path: Path, topic: str, cards: List[StudyItem], sources: List[SearchResult]) -> None:
+    payload_cards = []
+    for c in cards:
+        row = asdict(c)
+        img_path = str(row.get("image_path", "") or "")
+        row["image_url"] = Path(img_path).resolve().as_uri() if img_path and Path(img_path).exists() else ""
+        payload_cards.append(row)
+    cards_payload = json.dumps(payload_cards)
+    src_payload = json.dumps([asdict(s) for s in sources[:30]])
+    html_text = f"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Study Pack - {topic}</title>
+<style>
+body{{font-family:'Segoe UI',Tahoma,sans-serif;margin:0;background:#f8fafc;color:#0f172a}}
+.wrap{{max-width:1200px;margin:0 auto;padding:20px}}
+.hero{{background:linear-gradient(120deg,#ecfeff,#eef2ff);border:1px solid #cbd5e1;border-radius:14px;padding:16px}}
+.row{{display:flex;gap:10px;flex-wrap:wrap;margin:12px 0}}
+input,select{{border:1px solid #cbd5e1;border-radius:10px;padding:8px;font-size:14px}}
+.card{{background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:12px;margin-bottom:10px}}
+.meta{{font-size:12px;color:#64748b}}
+a{{color:#0f766e;text-decoration:none}}
+</style></head><body><div class="wrap">
+<div class="hero"><h1 style="margin:0">Study Pack: {topic}</h1><p style="margin:6px 0 0 0">{len(cards)} generated questions with source links.</p></div>
+<div class="row"><input id="q" placeholder="Search questions" oninput="render()"/><select id="cat" onchange="render()"><option value="">All categories</option></select></div>
+<div id="cards"></div>
+<h3>Sources</h3><div id="sources"></div>
+</div>
+<script>
+const cards={cards_payload};
+const sources={src_payload};
+const cats=[...new Set(cards.map(x=>x.category))].sort();
+const catSel=document.getElementById('cat'); cats.forEach(c=>{{const o=document.createElement('option');o.value=c;o.textContent=c;catSel.appendChild(o);}});
+function esc(s){{return (s||'').replace(/[&<>]/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;'}}[c]));}}
+function render(){{
+ const q=(document.getElementById('q').value||'').toLowerCase();
+ const cat=document.getElementById('cat').value;
+ const filtered=cards.filter(c=>{{ if(cat && c.category!==cat) return false; return !q || (c.question+' '+c.answer).toLowerCase().includes(q); }});
+  document.getElementById('cards').innerHTML=filtered.slice(0,300).map((c,i)=>`<div class="card"><div class="meta">#${{i+1}} • ${{esc(c.category)}} • ${{esc(c.difficulty)}}</div><div><strong>${{esc(c.question)}}</strong></div>${{c.image_url?`<div style="margin-top:8px"><img src="${{c.image_url}}" alt="Study visual" style="max-width:100%;border:1px solid #e2e8f0;border-radius:8px"/></div>`:''}}<div style="margin-top:6px">${{esc(c.answer)}}</div><div class="meta" style="margin-top:6px">${{c.source_url?`Source: <a target="_blank" rel="noopener" href="${{c.source_url}}">${{esc(c.source_url)}}</a>`:''}}</div></div>`).join('');
+ document.getElementById('sources').innerHTML=sources.map((s,i)=>`<div><a target="_blank" rel="noopener" href="${{s.url}}">${{i+1}}. ${{esc(s.title)}}</a></div>`).join('');
+}}
+render();
+</script></body></html>"""
+    path.write_text(html_text, encoding="utf-8")
 
 
 def _expand_queries(query: str) -> List[str]:
@@ -1186,6 +2056,15 @@ def _count_by(values: Any) -> Dict[str, int]:
     for v in values:
         out[v] = out.get(v, 0) + 1
     return out
+
+
+def _emit_progress(progress_cb: Optional[Callable[[int, str], None]], pct: int, message: str) -> None:
+    if not progress_cb:
+        return
+    try:
+        progress_cb(max(0, min(100, int(pct))), message)
+    except Exception:
+        return
 
 
 def resume_pending_plan(pending: Dict[str, Any], step_mode: bool = False) -> Dict[str, Any]:

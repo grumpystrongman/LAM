@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 import threading
 import time
+import uuid
 import webbrowser
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List
+from urllib.parse import parse_qs, urlparse
 
 from lam.adapters.uia_adapter import UIAAdapter
 from lam.interface.ai_backend import AI_BACKENDS, normalize_backend
@@ -39,6 +41,8 @@ class UiState:
     last_selector: Dict[str, Any] = field(default_factory=dict)
     scheduler: ScheduleEngine | None = None
     vault: LocalPasswordVault = field(default_factory=LocalPasswordVault)
+    tasks: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    current_task_id: str = ""
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def snapshot(self) -> Dict[str, Any]:
@@ -64,6 +68,8 @@ class UiState:
                 "schedules": schedules,
                 "schedule_history": schedule_history,
                 "vault_status": self.vault.status(),
+                "current_task_id": self.current_task_id,
+                "task": dict(self.tasks.get(self.current_task_id, {})) if self.current_task_id else {},
             }
 
 
@@ -90,12 +96,21 @@ HTML_PAGE = """<!doctype html>
     button { border:0; border-radius:10px; padding:9px 12px; cursor:pointer; font-weight:600; }
     .primary { background:var(--accent); color:white; }
     .warn { background:#fef3c7; color:#92400e; border:1px solid #fcd34d; }
-    #output { white-space:pre-wrap; max-height:220px; overflow:auto; font-size:13px; color:#0b3a2f; }
-    canvas { width:100%; height:300px; border:1px solid #d1d5db; border-radius:12px; background:linear-gradient(120deg,#f8fafc,#eef2ff); }
+    .summary-head { font-weight:700; font-size:18px; color:#0f172a; }
+    .summary-sub { color:#475569; font-size:14px; margin-top:2px; }
+    .summary-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; margin-top:10px; }
+    .summary-card { border:1px solid #e2e8f0; border-radius:10px; background:#ffffff; padding:10px; }
+    .summary-card .t { font-size:13px; color:#0f172a; font-weight:600; }
+    .summary-card .m { font-size:12px; color:#64748b; margin-top:4px; word-break:break-word; }
+    .artifact-list a { color:#0f766e; text-decoration:none; }
+    .json-box { white-space:pre-wrap; max-height:260px; overflow:auto; font-size:12px; color:#0f172a; background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; padding:10px; }
     .small { color:var(--muted); font-size:12px; }
     .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
     .mono { font-family:Consolas,Menlo,monospace; font-size:12px; }
-    @media (max-width: 1180px) { .wrap { grid-template-columns:1fr; } .side { max-height:35vh; } .grid2{grid-template-columns:1fr;} }
+    .progress-wrap { background:#e5e7eb; border-radius:999px; height:14px; overflow:hidden; }
+    .progress-bar { height:100%; width:0%; background:linear-gradient(90deg,#0f766e,#6366f1); transition:width .2s ease; }
+    .progress-log { max-height:140px; overflow:auto; font-size:12px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; padding:8px; }
+    @media (max-width: 1180px) { .wrap { grid-template-columns:1fr; } .side { max-height:35vh; } .grid2{grid-template-columns:1fr;} .summary-grid{grid-template-columns:1fr;} }
   </style>
 </head>
 <body>
@@ -144,6 +159,9 @@ HTML_PAGE = """<!doctype html>
         <input id="appSearch" type="text" placeholder="Search installed apps"/>
         <button onclick="searchApps()">Find Apps</button>
       </div>
+      <div class="row"><strong>Progress</strong> <span class="small" id="progressLabel">Idle</span></div>
+      <div class="progress-wrap"><div id="progressBar" class="progress-bar"></div></div>
+      <div class="progress-log mono" id="progressLog">No active task.</div>
     </div>
 
     <div class="grid2">
@@ -168,7 +186,7 @@ HTML_PAGE = """<!doctype html>
           <input id="teachWait" type="number" value="1" min="1" style="width:90px"/>
           <button onclick="teachAddWait()">Add Wait</button>
         </div>
-        <div class="small mono" id="teachState">Teach idle.</div>
+        <div class="small" id="teachState">Teach idle.</div>
       </div>
 
       <div class="panel">
@@ -187,7 +205,7 @@ HTML_PAGE = """<!doctype html>
           <button onclick="addSchedule()">Add Schedule</button>
           <button onclick="triggerEvent()">Trigger Event</button>
         </div>
-        <div class="small mono" id="scheduleState">No schedules yet.</div>
+        <div class="small" id="scheduleState">No schedules yet.</div>
       </div>
     </div>
 
@@ -212,34 +230,71 @@ HTML_PAGE = """<!doctype html>
         <button onclick="vaultExport()">Export Encrypted Backup</button>
         <button onclick="vaultImport()">Import Encrypted Backup</button>
       </div>
-      <div class="small mono" id="vaultState">Vault status loading...</div>
-      <div class="small mono" id="vaultList">No entries loaded.</div>
+      <div class="small" id="vaultState">Vault status loading...</div>
+      <div class="small" id="vaultList">No entries loaded.</div>
     </div>
 
-    <div class="panel"><div id="output">No run yet.</div></div>
     <div class="panel">
-      <div class="small">Canvas summary</div>
-      <canvas id="canvas" width="1280" height="500"></canvas>
+      <div class="row">
+        <div><strong>Run Summary</strong></div>
+        <label class="small"><input type="checkbox" id="showDetails" onchange="toggleDetails(this.checked)"/> Show technical details</label>
+      </div>
+      <div class="summary-head" id="summaryHead">Waiting for your instruction</div>
+      <div class="summary-sub" id="summarySub">Use Preview or Run to start.</div>
+      <div class="summary-grid" id="summaryCards"></div>
+      <div class="progress-log" id="activityLog">No activity yet.</div>
+      <details id="detailWrap" style="margin-top:8px;">
+        <summary class="small">Raw JSON (advanced)</summary>
+        <div class="json-box" id="outputRaw">No details yet.</div>
+      </details>
     </div>
   </main>
 </div>
 <script>
 const ui = { history: JSON.parse(localStorage.getItem("lam_ui_history") || "[]") };
+let progressPollTimer = null;
+let detailsVisible = false;
+let lastRaw = {};
 function persistHistory(){ localStorage.setItem("lam_ui_history", JSON.stringify(ui.history.slice(-300))); }
-function drawCanvas(payload){
-  const c=document.getElementById("canvas"),x=c.getContext("2d");
-  x.clearRect(0,0,c.width,c.height);
-  const g=x.createLinearGradient(0,0,c.width,c.height); g.addColorStop(0,"#eff6ff"); g.addColorStop(1,"#eef2ff"); x.fillStyle=g; x.fillRect(0,0,c.width,c.height);
-  x.fillStyle="#0f172a"; x.font="bold 34px Segoe UI"; x.fillText(payload?.title||"Run Summary",24,52);
-  x.fillStyle="#475569"; x.font="20px Segoe UI"; x.fillText(payload?.subtitle||"",24,84);
-  const cards=payload?.cards||[]; const w=390,h=110;
-  cards.slice(0,6).forEach((card,i)=>{ const col=i%3,row=Math.floor(i/3),px=24+col*(w+16),py=110+row*(h+14);
-    x.fillStyle="#fff"; x.strokeStyle="#dbeafe"; x.lineWidth=2; x.beginPath(); x.roundRect(px,py,w,h,12); x.fill(); x.stroke();
-    x.fillStyle="#0f172a"; x.font="bold 17px Segoe UI"; x.fillText((card.title||"").slice(0,46),px+12,py+30);
-    x.fillStyle="#0f766e"; x.font="bold 18px Segoe UI"; x.fillText(card.price||"n/a",px+12,py+58);
-    x.fillStyle="#64748b"; x.font="13px Segoe UI"; x.fillText((card.source||"").toUpperCase(),px+12,py+85);
-  });
+function toggleDetails(v){
+  detailsVisible=!!v;
+  localStorage.setItem("lam_details_visible", detailsVisible ? "1":"0");
+  document.getElementById("detailWrap").open = detailsVisible;
+  if(detailsVisible){ document.getElementById("outputRaw").innerText=JSON.stringify(lastRaw||{},null,2); }
 }
+function setRaw(obj){ lastRaw=obj||{}; if(detailsVisible){ document.getElementById("outputRaw").innerText=JSON.stringify(lastRaw,null,2);} }
+function renderSummary(r){
+  const ok = !!r?.ok;
+  const mode = r?.mode || "status";
+  const count = r?.results_count || (Array.isArray(r?.results)?r.results.length:0);
+  const head = ok ? (r?.canvas?.title || "Task completed") : "Action needs attention";
+  const sub = ok
+    ? (r?.canvas?.subtitle || `${mode}${count?` • ${count} result(s)`:""}`)
+    : (r?.error || "The action could not be completed.");
+  document.getElementById("summaryHead").innerText = head;
+  document.getElementById("summarySub").innerText = sub;
+
+  const cards=[];
+  if(r?.plan?.domain){ cards.push({t:"Planner",m:`${r.plan.domain} (${r.plan.steps?.length||0} steps)`}); }
+  if(r?.query){ cards.push({t:"Query",m:r.query}); }
+  if(count){ cards.push({t:"Results",m:String(count)}); }
+  if(r?.opened_url){ cards.push({t:"Opened",m:r.opened_url}); }
+  if(r?.artifacts){
+    const lines = Object.entries(r.artifacts).slice(0,3).map(([k,v])=>`${k}: ${v}`);
+    cards.push({t:"Artifacts",m:lines.join(" | ")});
+  }
+  (r?.canvas?.cards||[]).slice(0,4).forEach(c=>cards.push({t:c.title||"Item",m:`${c.price||""} ${c.source?`• ${c.source}`:""}`.trim()}));
+  if(cards.length===0){ cards.push({t:"Status",m:ok?"Completed":"Needs input"}); }
+  document.getElementById("summaryCards").innerHTML = cards.slice(0,6).map(c=>`<div class="summary-card"><div class="t">${escapeHtml(c.t||"")}</div><div class="m">${escapeHtml(c.m||"")}</div></div>`).join("");
+
+  const activity=[];
+  if(Array.isArray(r?.decision_log)){ r.decision_log.forEach(x=>activity.push(`• ${x}`)); }
+  if(r?.source_status){ Object.entries(r.source_status).slice(0,10).forEach(([k,v])=>activity.push(`• ${k}: ${v}`)); }
+  if(r?.pause_reason){ activity.push(`• ${r.pause_reason}`); }
+  if(activity.length===0){ activity.push(ok?"• Finished successfully.":"• Check details for error context."); }
+  document.getElementById("activityLog").innerText = activity.join("\\n");
+}
+function escapeHtml(s){ return String(s||"").replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
 async function refreshState(){
   const s=await fetch("/api/state").then(r=>r.json());
   let t=s.control_granted?"Control: granted":"Control: not granted";
@@ -250,22 +305,43 @@ async function refreshState(){
   document.getElementById("stepMode").checked=!!s.step_mode;
   document.getElementById("aiBackend").value=s.ai_backend||"deterministic-local";
   document.getElementById("compressionMode").value=s.compression_mode||"normal";
-  document.getElementById("teachState").innerText=JSON.stringify(s.teach||{},null,2);
-  if(s.global_teach_active){ document.getElementById("teachState").innerText += "\\nGLOBAL_HOOKS: active"; }
-  document.getElementById("scheduleState").innerText=JSON.stringify({jobs:s.schedules||[],recent:s.schedule_history||[]},null,2);
-  document.getElementById("vaultState").innerText=JSON.stringify(s.vault_status||{},null,2);
+  const teach=s.teach||{};
+  document.getElementById("teachState").innerText=`${teach.active?'Recording':'Idle'} • events: ${teach.event_count||0}${s.global_teach_active?' • global hooks active':''}`;
+  const jobs=(s.schedules||[]).length, recent=(s.schedule_history||[]).length;
+  document.getElementById("scheduleState").innerText=`${jobs} schedule(s) configured • ${recent} recent run(s)`;
+  const vs=s.vault_status||{};
+  document.getElementById("vaultState").innerText=`Vault: ${vs.entries||0} entries • ${vs.dpapi_available?'DPAPI secured':'local encryption fallback'}`;
+  renderTask(s.task||{});
 }
 function renderHistory(){
   const el=document.getElementById("history"); el.innerHTML="";
-  [...ui.history].reverse().forEach((item)=>{
+  [...ui.history].reverse().forEach((item,idx)=>{
     const d=document.createElement("div"); d.className="history-item";
-    d.innerHTML=`<div style="font-weight:600">${item.instruction||item.mode||"Run"}</div><div class="small">${item.app_name||""} ${item.opened_url||""}</div>`;
-    d.onclick=()=>{ document.getElementById("output").innerText=JSON.stringify(item,null,2); drawCanvas(item.canvas||{}); };
+    const canRerun = !!(item && item.instruction);
+    d.innerHTML=`<div style="font-weight:600">${item.instruction||item.mode||"Run"}</div><div class="small">${item.app_name||""} ${item.opened_url||""}</div>${canRerun?`<div class="row" style="margin-top:6px"><button onclick="rerunHistory(${idx}); event.stopPropagation();">Re-run</button></div>`:''}`;
+    d.onclick=()=>{ renderSummary(item); setRaw(item); };
     el.appendChild(d);
   });
 }
-async function grantControl(){ if(!confirm("Grant box control?")) return; await fetch("/api/control",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({accept:true})}); await refreshState(); }
-async function revokeControl(){ await fetch("/api/control",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({accept:false})}); await refreshState(); }
+async function rerunHistory(revIndex){
+  const items=[...ui.history].reverse();
+  const item=items[revIndex];
+  if(!item || !item.instruction){ return; }
+  const ai_backend=document.getElementById("aiBackend").value;
+  const r=await fetch("/api/instruct_async",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({instruction:item.instruction,ai_backend})}).then(r=>r.json());
+  if(!r.ok){ showResponse(r); await refreshState(); return; }
+  startTaskPolling(r.task_id, { instruction:item.instruction, ai_backend, confirm_risky:false });
+}
+async function grantControl(){
+  const r=await fetch("/api/control",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({accept:true})}).then(r=>r.json());
+  showResponse({ok:true,mode:"control",canvas:{title:"Control Granted",subtitle:"OpenLAMb can execute actions on this box",cards:[]},control_granted:r.control_granted});
+  await refreshState();
+}
+async function revokeControl(){
+  const r=await fetch("/api/control",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({accept:false})}).then(r=>r.json());
+  showResponse({ok:true,mode:"control",canvas:{title:"Control Revoked",subtitle:"Execution is now blocked until re-enabled",cards:[]},control_granted:r.control_granted});
+  await refreshState();
+}
 async function setStepMode(v){ await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({step_mode:!!v})}); await refreshState(); }
 async function setAiBackend(v){ await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ai_backend:v})}); await refreshState(); }
 async function setCompressionMode(v){ await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({compression_mode:v})}); await refreshState(); }
@@ -273,18 +349,21 @@ async function resumeAfterLogin(){ const r=await fetch("/api/session/resume",{me
 async function runInstruction(){
   const instruction=document.getElementById("instruction").value.trim(); if(!instruction) return;
   const ai_backend=document.getElementById("aiBackend").value;
-  const r=await fetch("/api/instruct",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({instruction,ai_backend})}).then(r=>r.json());
-  if(r.requires_confirmation && confirm("Risky actions detected. Confirm execution?")){
-    const c=await fetch("/api/instruct",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({instruction,confirm_risky:true,ai_backend})}).then(x=>x.json());
-    handleResult(c); await refreshState(); return;
-  }
-  handleResult(r); await refreshState();
+  const r=await fetch("/api/instruct_async",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({instruction,ai_backend})}).then(r=>r.json());
+  if(!r.ok){ showResponse(r); await refreshState(); return; }
+  startTaskPolling(r.task_id, { instruction, ai_backend, confirm_risky:false });
 }
-async function previewInstruction(){ const instruction=document.getElementById("instruction").value.trim(); if(!instruction)return; const r=await fetch("/api/preview",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({instruction})}).then(r=>r.json()); document.getElementById("output").innerText=JSON.stringify(r,null,2); drawCanvas(r.canvas||{}); }
-async function saveAutomation(){ const name=document.getElementById("automationName").value.trim(); const instruction=document.getElementById("instruction").value.trim(); const r=await fetch("/api/automation/save",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name,instruction})}).then(r=>r.json()); document.getElementById("output").innerText=JSON.stringify(r,null,2); await refreshState(); }
-async function runAutomation(){ const name=document.getElementById("automationName").value.trim(); const ai_backend=document.getElementById("aiBackend").value; const r=await fetch("/api/automation/run",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name,ai_backend})}).then(r=>r.json()); handleResult(r); await refreshState(); }
+async function previewInstruction(){ const instruction=document.getElementById("instruction").value.trim(); if(!instruction)return; const r=await fetch("/api/preview",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({instruction})}).then(r=>r.json()); showResponse(r); await refreshState(); }
+async function saveAutomation(){ const name=document.getElementById("automationName").value.trim(); const instruction=document.getElementById("instruction").value.trim(); const r=await fetch("/api/automation/save",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name,instruction})}).then(r=>r.json()); showResponse(r); await refreshState(); }
+async function runAutomation(){
+  const name=document.getElementById("automationName").value.trim();
+  const ai_backend=document.getElementById("aiBackend").value;
+  const r=await fetch("/api/automation/run_async",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name,ai_backend})}).then(r=>r.json());
+  if(!r.ok){ showResponse(r); await refreshState(); return; }
+  startTaskPolling(r.task_id, { instruction:r.instruction||"", ai_backend, confirm_risky:false });
+}
 async function exportHistory(){ const txt=await fetch("/api/history/export").then(r=>r.text()); const blob=new Blob([txt],{type:"application/json"}); const a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download="lam-history-export.json"; a.click(); }
-async function searchApps(){ const q=document.getElementById("appSearch").value.trim(); const r=await fetch("/api/apps/search",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({query:q})}).then(r=>r.json()); document.getElementById("output").innerText=JSON.stringify(r,null,2); }
+async function searchApps(){ const q=document.getElementById("appSearch").value.trim(); const r=await fetch("/api/apps/search",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({query:q})}).then(r=>r.json()); showResponse(r); }
 async function vaultSave(){
   const payload={
     service:document.getElementById("vaultService").value.trim(),
@@ -294,60 +373,106 @@ async function vaultSave(){
     favorite:!!document.getElementById("vaultFavorite").checked
   };
   const r=await fetch("/api/vault/save",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)}).then(r=>r.json());
-  document.getElementById("output").innerText=JSON.stringify(r,null,2); await vaultList(); await refreshState();
+  showResponse(r); await vaultList(); await refreshState();
 }
 async function vaultList(){
   const q=document.getElementById("vaultQuery").value.trim();
   const r=await fetch("/api/vault/list",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({query:q})}).then(r=>r.json());
-  document.getElementById("vaultList").innerText=JSON.stringify(r,null,2);
+  const entries=(r.entries||[]);
+  if(!entries.length){ document.getElementById("vaultList").innerText="No matching entries."; return; }
+  document.getElementById("vaultList").innerText = entries.slice(0,8).map(e=>`${e.service} • ${e.username_masked}${e.favorite?' • ★':''}`).join("\\n");
 }
 async function vaultGenerate(){
   const length=parseInt(document.getElementById("vaultLength").value||"20",10);
   const r=await fetch("/api/vault/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({length})}).then(r=>r.json());
   if(r.ok){ document.getElementById("vaultPassword").value=r.password||""; }
-  document.getElementById("output").innerText=JSON.stringify(r,null,2);
+  showResponse(r);
 }
 async function vaultFill(){
   const service=document.getElementById("vaultService").value.trim() || document.getElementById("vaultQuery").value.trim();
   const submit = confirm("Press OK to autofill and submit (Enter), Cancel to autofill only.");
   const r=await fetch("/api/vault/fill",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({service,submit})}).then(r=>r.json());
-  document.getElementById("output").innerText=JSON.stringify(r,null,2); await refreshState();
+  showResponse(r); await refreshState();
 }
 async function vaultExport(){
   const path=prompt("Export encrypted backup path","data/interface/vault_export.lamvault");
   if(!path) return;
   const r=await fetch("/api/vault/export",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path})}).then(r=>r.json());
-  document.getElementById("output").innerText=JSON.stringify(r,null,2);
+  showResponse(r);
 }
 async function vaultImport(){
   const path=prompt("Import encrypted backup path","data/interface/vault_export.lamvault");
   if(!path) return;
   const r=await fetch("/api/vault/import",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path,merge:true})}).then(r=>r.json());
-  document.getElementById("output").innerText=JSON.stringify(r,null,2); await vaultList(); await refreshState();
+  showResponse(r); await vaultList(); await refreshState();
 }
 function useTemplate(text){ document.getElementById("instruction").value=text; }
-async function captureSelector(){ const r=await fetch("/api/selector/capture",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(r=>r.json()); document.getElementById("output").innerText=JSON.stringify(r,null,2); await refreshState(); }
-async function teachStart(){ const app_name=document.getElementById("teachApp").value.trim(); const r=await fetch("/api/teach/start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({app_name})}).then(r=>r.json()); document.getElementById("output").innerText=JSON.stringify(r,null,2); await refreshState(); }
-async function teachGlobalStart(){ const r=await fetch("/api/teach/global_start",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(r=>r.json()); document.getElementById("output").innerText=JSON.stringify(r,null,2); await refreshState(); }
-async function teachGlobalStop(){ const r=await fetch("/api/teach/global_stop",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(r=>r.json()); document.getElementById("output").innerText=JSON.stringify(r,null,2); await refreshState(); }
-async function teachAddClick(){ const r=await fetch("/api/teach/add_click",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(r=>r.json()); document.getElementById("output").innerText=JSON.stringify(r,null,2); await refreshState(); }
-async function teachAddType(){ const text=document.getElementById("teachTypeText").value; const r=await fetch("/api/teach/add_type",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text})}).then(r=>r.json()); document.getElementById("output").innerText=JSON.stringify(r,null,2); await refreshState(); }
-async function teachAddHotkey(){ const keys=document.getElementById("teachHotkey").value; const r=await fetch("/api/teach/add_hotkey",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({keys})}).then(r=>r.json()); document.getElementById("output").innerText=JSON.stringify(r,null,2); await refreshState(); }
-async function teachAddWait(){ const seconds=parseInt(document.getElementById("teachWait").value||"1",10); const r=await fetch("/api/teach/add_wait",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({seconds})}).then(r=>r.json()); document.getElementById("output").innerText=JSON.stringify(r,null,2); await refreshState(); }
+async function captureSelector(){ const r=await fetch("/api/selector/capture",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(r=>r.json()); showResponse(r); await refreshState(); }
+async function teachStart(){ const app_name=document.getElementById("teachApp").value.trim(); const r=await fetch("/api/teach/start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({app_name})}).then(r=>r.json()); showResponse(r); await refreshState(); }
+async function teachGlobalStart(){ const r=await fetch("/api/teach/global_start",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(r=>r.json()); showResponse(r); await refreshState(); }
+async function teachGlobalStop(){ const r=await fetch("/api/teach/global_stop",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(r=>r.json()); showResponse(r); await refreshState(); }
+async function teachAddClick(){ const r=await fetch("/api/teach/add_click",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(r=>r.json()); showResponse(r); await refreshState(); }
+async function teachAddType(){ const text=document.getElementById("teachTypeText").value; const r=await fetch("/api/teach/add_type",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text})}).then(r=>r.json()); showResponse(r); await refreshState(); }
+async function teachAddHotkey(){ const keys=document.getElementById("teachHotkey").value; const r=await fetch("/api/teach/add_hotkey",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({keys})}).then(r=>r.json()); showResponse(r); await refreshState(); }
+async function teachAddWait(){ const seconds=parseInt(document.getElementById("teachWait").value||"1",10); const r=await fetch("/api/teach/add_wait",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({seconds})}).then(r=>r.json()); showResponse(r); await refreshState(); }
 async function teachStop(){ const r=await fetch("/api/teach/stop",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(r=>r.json()); handleResult(r); if(r.ok && r.instruction){ document.getElementById("instruction").value=r.instruction; } await refreshState(); }
 async function addSchedule(){
   const name=document.getElementById("scheduleName").value.trim(), automation_name=document.getElementById("scheduleAutomation").value.trim();
   const kind=document.getElementById("scheduleKind").value, value=document.getElementById("scheduleValue").value.trim();
   const r=await fetch("/api/schedules/add",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name,automation_name,kind,value})}).then(r=>r.json());
-  document.getElementById("output").innerText=JSON.stringify(r,null,2); await refreshState();
+  showResponse(r); await refreshState();
 }
 async function triggerEvent(){
   const value=document.getElementById("scheduleValue").value.trim()||"manual";
   const r=await fetch("/api/schedules/trigger",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({event:value})}).then(r=>r.json());
-  document.getElementById("output").innerText=JSON.stringify(r,null,2); await refreshState();
+  showResponse(r); await refreshState();
 }
-function handleResult(r){ document.getElementById("output").innerText=JSON.stringify(r,null,2); if(r.ok){ ui.history.push(r); persistHistory(); renderHistory(); } drawCanvas(r.canvas||{}); }
-window.onload=async()=>{ renderHistory(); await refreshState(); await vaultList(); };
+function showResponse(r){ renderSummary(r||{}); setRaw(r||{}); }
+function handleResult(r){ showResponse(r); if(r.ok){ ui.history.push(r); persistHistory(); renderHistory(); } }
+function renderTask(task){
+  const pct = Math.max(0, Math.min(100, parseInt(task.progress||0,10)||0));
+  document.getElementById("progressBar").style.width=`${pct}%`;
+  document.getElementById("progressLabel").innerText = task.message || (task.status||"Idle");
+  const events = task.events || [];
+  document.getElementById("progressLog").innerText = events.length
+    ? events.map(e=>`[${new Date((e.ts||0)*1000).toLocaleTimeString()}] ${e.progress||0}% - ${e.message||""}`).join("\\n")
+    : "No active task.";
+}
+function stopTaskPolling(){ if(progressPollTimer){ clearInterval(progressPollTimer); progressPollTimer=null; } }
+function startTaskPolling(taskId, rerunPayload){
+  stopTaskPolling();
+  const tick = async ()=>{
+    const t = await fetch(`/api/task?id=${encodeURIComponent(taskId)}`).then(r=>r.json());
+    renderTask(t.task||{});
+    if((t.task||{}).status === "done"){
+      stopTaskPolling();
+      const result=(t.task||{}).result||{};
+      if(result.requires_confirmation){
+        if(confirm("Risky actions detected. Confirm execution?")){
+          const c=await fetch("/api/instruct_async",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({...rerunPayload,confirm_risky:true})}).then(r=>r.json());
+          if(c.ok){ startTaskPolling(c.task_id, {...rerunPayload,confirm_risky:true}); return; }
+          handleResult(c); await refreshState(); return;
+        }
+      }
+      handleResult(result); await refreshState();
+      return;
+    }
+    if((t.task||{}).status === "error"){
+      stopTaskPolling();
+      handleResult({ok:false,error:(t.task||{}).error||"Task failed"}); await refreshState();
+    }
+  };
+  progressPollTimer = setInterval(tick, 700);
+  tick();
+}
+window.onload=async()=>{
+  detailsVisible = localStorage.getItem("lam_details_visible")==="1";
+  document.getElementById("showDetails").checked = detailsVisible;
+  toggleDetails(detailsVisible);
+  renderHistory();
+  await refreshState();
+  await vaultList();
+};
 </script>
 </body>
 </html>
@@ -358,19 +483,28 @@ class _Handler(BaseHTTPRequestHandler):
     state: UiState
 
     def do_GET(self) -> None:  # noqa: N802
-        if self.path in {"/", "/index.html"}:
+        parsed = urlparse(self.path)
+        path = parsed.path
+        qs = parse_qs(parsed.query)
+        if path in {"/", "/index.html"}:
             self._send_text(200, HTML_PAGE, "text/html; charset=utf-8")
             return
-        if self.path == "/api/state":
+        if path == "/api/state":
             self._send_json(200, self.state.snapshot())
             return
-        if self.path == "/api/history":
+        if path == "/api/history":
             self._send_json(200, {"history": self.state.snapshot()["history"]})
             return
-        if self.path == "/api/history/export":
+        if path == "/api/history/export":
             snap = self.state.snapshot()
             data = json.dumps({"exported_at": time.time(), "history": snap["history"]}, indent=2)
             self._send_text(200, data, "application/json")
+            return
+        if path == "/api/task":
+            task_id = (qs.get("id", [""])[0] or "").strip()
+            with self.state.lock:
+                task = dict(self.state.tasks.get(task_id, {})) if task_id else {}
+            self._send_json(200, {"ok": bool(task), "task": task})
             return
         self._send_json(404, {"error": "not_found"})
 
@@ -596,6 +730,25 @@ class _Handler(BaseHTTPRequestHandler):
             }
             self.path = "/api/instruct"
 
+        if self.path == "/api/automation/run_async":
+            name = str(payload.get("name", "")).strip()
+            instruction = str(payload.get("instruction", "")).strip()
+            ai_backend = normalize_backend(str(payload.get("ai_backend", "")))
+            with self.state.lock:
+                if not instruction:
+                    instruction = self.state.saved_automations.get(name, "")
+            if not instruction:
+                self._send_json(404, {"ok": False, "error": f"Automation '{name}' not found."})
+                return
+            task_id = _start_instruction_task(
+                state=self.state,
+                instruction=instruction,
+                confirm_risky=bool(payload.get("confirm_risky", False)),
+                ai_backend=ai_backend,
+            )
+            self._send_json(200, {"ok": True, "task_id": task_id, "instruction": instruction})
+            return
+
         if self.path == "/api/schedules/add":
             if not self.state.scheduler:
                 self._send_json(500, {"ok": False, "error": "Scheduler unavailable"})
@@ -645,6 +798,19 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json(200, result)
                 return
             self._send_json(200, {"ok": True, "message": "No pending sequence."})
+            return
+
+        if self.path == "/api/instruct_async":
+            instruction = str(payload.get("instruction", "")).strip()
+            confirm_risky = bool(payload.get("confirm_risky", False))
+            ai_backend = normalize_backend(str(payload.get("ai_backend", "")))
+            task_id = _start_instruction_task(
+                state=self.state,
+                instruction=instruction,
+                confirm_risky=confirm_risky,
+                ai_backend=ai_backend,
+            )
+            self._send_json(200, {"ok": True, "task_id": task_id})
             return
 
         if self.path == "/api/instruct":
@@ -831,3 +997,104 @@ def _save_user_defaults_locked(state: UiState) -> None:
         },
         user=state.user_id,
     )
+
+
+def _start_instruction_task(state: UiState, instruction: str, confirm_risky: bool, ai_backend: str) -> str:
+    task_id = uuid.uuid4().hex
+    now = time.time()
+    with state.lock:
+        state.tasks[task_id] = {
+            "id": task_id,
+            "status": "running",
+            "progress": 0,
+            "message": "Queued",
+            "events": [{"ts": now, "progress": 0, "message": "Queued"}],
+            "result": {},
+            "error": "",
+            "started_ts": now,
+            "finished_ts": 0.0,
+        }
+        state.current_task_id = task_id
+        state.tasks = _trim_tasks(state.tasks)
+
+    def _progress(pct: int, msg: str) -> None:
+        with state.lock:
+            task = state.tasks.get(task_id)
+            if not task:
+                return
+            task["progress"] = max(0, min(100, int(pct)))
+            task["message"] = msg
+            events = task.get("events", [])
+            events.append({"ts": time.time(), "progress": task["progress"], "message": msg})
+            task["events"] = events[-120:]
+
+    def _runner() -> None:
+        with state.lock:
+            granted = state.control_granted
+            paused = state.paused_for_credentials
+            step_mode = state.step_mode
+            backend = normalize_backend(str(ai_backend or state.ai_backend))
+        if paused:
+            with state.lock:
+                task = state.tasks.get(task_id, {})
+                task.update(
+                    {
+                        "status": "error",
+                        "progress": 100,
+                        "message": "Session paused for credential entry. Click Resume.",
+                        "error": "Session paused for credential entry. Click Resume.",
+                        "finished_ts": time.time(),
+                    }
+                )
+            return
+        try:
+            result = execute_instruction(
+                instruction=instruction,
+                control_granted=granted,
+                step_mode=step_mode,
+                confirm_risky=confirm_risky,
+                ai_backend=backend,
+                progress_cb=_progress,
+            )
+            with state.lock:
+                task = state.tasks.get(task_id, {})
+                task.update(
+                    {
+                        "status": "done",
+                        "progress": 100,
+                        "message": "Completed",
+                        "result": result,
+                        "error": "",
+                        "finished_ts": time.time(),
+                    }
+                )
+                if result.get("ok"):
+                    state.history.append(result)
+                    state.history = state.history[-300:]
+                    _save_history(state.history)
+                    state.pending_plan = result.get("pending_plan") or {}
+                    state.paused_for_credentials = bool(result.get("paused_for_credentials", False))
+                    state.pause_reason = str(result.get("pause_reason", "")) if state.paused_for_credentials else ""
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            with state.lock:
+                task = state.tasks.get(task_id, {})
+                task.update(
+                    {
+                        "status": "error",
+                        "progress": 100,
+                        "message": "Failed",
+                        "error": str(exc),
+                        "finished_ts": time.time(),
+                    }
+                )
+
+    threading.Thread(target=_runner, daemon=True).start()
+    return task_id
+
+
+def _trim_tasks(tasks: Dict[str, Dict[str, Any]], keep: int = 30) -> Dict[str, Dict[str, Any]]:
+    if len(tasks) <= keep:
+        return tasks
+    ordered = sorted(tasks.items(), key=lambda x: float(x[1].get("started_ts", 0.0)))
+    trimmed = dict(ordered[-keep:])
+    return trimmed
