@@ -9,6 +9,7 @@ description = "Governance-first LAM platform scaffold for healthcare Windows end
 requires-python = ">=3.10"
 dependencies = [
   "PyYAML>=6.0",
+  "jsonschema>=4.23.0",
 ]
 
 [project.scripts]

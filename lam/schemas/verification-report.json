@@ -1,0 +1,83 @@
+﻿{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openlamb.dev/schemas/verification-report.json",
+  "title": "VerificationReport",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "task_id",
+    "used_expected_tool_family",
+    "targets_match_request",
+    "requested_outputs_exist",
+    "artifact_content_matches_goal",
+    "no_unresolved_execution_errors",
+    "no_irrelevant_detours",
+    "user_goal_satisfied",
+    "final_verification"
+  ],
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "used_expected_tool_family": {
+      "type": "boolean"
+    },
+    "targets_match_request": {
+      "type": "boolean"
+    },
+    "requested_outputs_exist": {
+      "type": "boolean"
+    },
+    "artifact_content_matches_goal": {
+      "type": "boolean"
+    },
+    "no_unresolved_execution_errors": {
+      "type": "boolean"
+    },
+    "no_irrelevant_detours": {
+      "type": "boolean"
+    },
+    "user_goal_satisfied": {
+      "type": "boolean"
+    },
+    "verification_checks": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/check"
+      }
+    },
+    "failed_checks": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "final_verification": {
+      "type": "string",
+      "enum": ["passed", "failed"]
+    }
+  },
+  "$defs": {
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "pass"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "pass": {
+          "type": "boolean"
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

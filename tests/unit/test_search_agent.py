@@ -29,6 +29,11 @@ class TestSearchAgent(unittest.TestCase):
         self.assertEqual(result["mode"], "desktop_sequence")
         self.assertTrue(result["paused_for_credentials"])
         self.assertIsNotNone(result["pending_plan"])
+        self.assertIn("task_envelope", result)
+        self.assertIn("plan_contract", result)
+        self.assertIn("execution_trace", result)
+        self.assertIn("verification_report", result)
+        self.assertIn("final_report", result)
 
     @patch("lam.interface.search_agent.execute_plan")
     def test_resume_pending_plan(self, mock_exec) -> None:

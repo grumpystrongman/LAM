@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openlamb.dev/schemas/final-report.json",
+  "title": "FinalReport",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "task_id",
+    "status",
+    "summary",
+    "actions_taken",
+    "outputs_created",
+    "verification_summary",
+    "remaining_issues",
+    "next_safe_action"
+  ],
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "completed",
+        "partially_completed",
+        "blocked",
+        "failed",
+        "awaiting_confirmation"
+      ]
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "actions_taken": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "outputs_created": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/outputRef"
+      }
+    },
+    "verification_summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "remaining_issues": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "next_safe_action": {
+      "type": "string"
+    }
+  },
+  "$defs": {
+    "outputRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "location"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "location": {
+          "type": "string",
+          "minLength": 1
+        },
+        "description": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

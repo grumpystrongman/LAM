@@ -21,6 +21,7 @@ from lam.interface.app_launcher import normalize_app_name, open_installed_app
 from lam.interface.app_learner import get_guidance
 from lam.interface.desktop_sequence import assess_risk, build_plan, execute_plan
 from lam.interface.local_vector_store import LocalVectorStore
+from lam.interface.operator_contract import attach_operator_contract
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 MIN_LIVE_NON_CURATED_CITATIONS = 3
@@ -316,22 +317,12 @@ def _finalize_operator_result(result: Dict[str, Any], instruction: str, plan_ste
     out = dict(result)
     out["planned_steps"] = _summarize_plan_steps(plan_steps)
     out["undo_plan"] = _build_undo_plan(plan_steps)
-    out["verification"] = _verification_block(bool(out.get("ok", False)), plan_steps, out)
-    out["report"] = {
-        "summary": out.get("canvas", {}).get("title", "Task run completed"),
-        "artifacts": out.get("artifacts", {}),
-        "next_actions": [
-            "Review verification evidence.",
-            "Use history Re-run for repeatable execution.",
-            "Use Resume if a credential checkpoint is active.",
-        ],
-    }
     out["operator_contract"] = {
         "instruction": instruction,
         "model": "plan_validate_execute_verify_report",
         "least_privilege": True,
     }
-    return out
+    return attach_operator_contract(instruction=instruction, result=out, plan_steps=plan_steps)
 
 
 def execute_instruction(
@@ -3012,4 +3003,5 @@ def resume_pending_plan(pending: Dict[str, Any], step_mode: bool = False) -> Dic
             ],
         },
     }
-    return _finalize_operator_result(response, instruction=str(plan.get("instruction", "")), plan_steps=plan_steps)
+    resume_instruction = str(plan.get("instruction", "")).strip() or "Resume pending desktop sequence"
+    return _finalize_operator_result(response, instruction=resume_instruction, plan_steps=plan_steps)

@@ -1,0 +1,160 @@
+﻿{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openlamb.dev/schemas/execution-trace.json",
+  "title": "ExecutionTrace",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "task_id",
+    "plan_validation_result",
+    "step_results"
+  ],
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "plan_validation_result": {
+      "type": "string",
+      "enum": ["valid", "invalid"]
+    },
+    "step_results": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/stepResult"
+      }
+    },
+    "created_artifacts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/artifact"
+      }
+    },
+    "execution_errors": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/error"
+      }
+    }
+  },
+  "$defs": {
+    "stepResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "step_index",
+        "action",
+        "tool_family",
+        "target",
+        "expected_output",
+        "actual_output",
+        "status",
+        "relevance_check_passed"
+      ],
+      "properties": {
+        "step_index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "action": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tool_family": {
+          "type": "string",
+          "minLength": 1
+        },
+        "target": {},
+        "expected_output": {
+          "type": "string",
+          "minLength": 1
+        },
+        "actual_output": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["success", "failed", "skipped", "blocked"]
+        },
+        "relevance_check_passed": {
+          "type": "boolean"
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "recovery_attempted": {
+          "type": "boolean",
+          "default": false
+        },
+        "recovery_notes": {
+          "type": "string"
+        }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_type", "name", "location"],
+      "properties": {
+        "artifact_type": {
+          "type": "string",
+          "enum": [
+            "spreadsheet",
+            "document",
+            "presentation",
+            "draft_reply",
+            "email",
+            "folder",
+            "file",
+            "report",
+            "other"
+          ]
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "location": {
+          "type": "string",
+          "minLength": 1
+        },
+        "content_summary": {
+          "type": "string"
+        }
+      }
+    },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message", "step_index"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "credential_missing",
+            "permission_denied",
+            "file_not_found",
+            "target_ambiguous",
+            "tool_mismatch",
+            "irrelevant_result",
+            "artifact_creation_failed",
+            "verification_failed",
+            "unsafe_action_requires_confirmation",
+            "unknown"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        },
+        "step_index": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}
