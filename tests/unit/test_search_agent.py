@@ -51,6 +51,8 @@ class TestSearchAgent(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["mode"], "preview_desktop_sequence")
         self.assertIn("risk", result)
+        self.assertIn("planned_steps", result)
+        self.assertIn("undo_plan", result)
 
     def test_preview_native_plan(self) -> None:
         result = preview_instruction("Research top AI data leadership jobs in US and Ireland then build spreadsheet and dashboard")
@@ -78,6 +80,20 @@ class TestSearchAgent(unittest.TestCase):
         self.assertEqual(result["mode"], "autonomous_plan_execute")
         self.assertIn("plan", result)
         self.assertEqual(result["results_count"], 3)
+        self.assertIn("verification", result)
+        self.assertIn("report", result)
+        self.assertIn("undo_plan", result)
+
+    def test_destructive_instruction_requires_confirmation(self) -> None:
+        result = execute_instruction(
+            "delete all files in downloads",
+            control_granted=True,
+            confirm_risky=False,
+        )
+        self.assertFalse(result["ok"])
+        self.assertTrue(result.get("requires_confirmation", False))
+        self.assertIn("planned_steps", result)
+        self.assertIn("undo_plan", result)
 
 
 if __name__ == "__main__":

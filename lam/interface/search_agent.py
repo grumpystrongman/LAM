@@ -23,6 +23,20 @@ from lam.interface.desktop_sequence import assess_risk, build_plan, execute_plan
 from lam.interface.local_vector_store import LocalVectorStore
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+DESTRUCTIVE_ACTION_KEYWORDS = {
+    "delete",
+    "remove",
+    "destroy",
+    "send email",
+    "send message",
+    "wire transfer",
+    "transfer money",
+    "payment",
+    "pay bill",
+    "purchase",
+    "buy now",
+    "submit payment",
+}
 
 
 @dataclass(slots=True)
@@ -207,6 +221,118 @@ def _best_price(results: List[SearchResult]) -> Optional[SearchResult]:
     return sorted(priced, key=lambda r: r.price or 999999.0)[0]
 
 
+def _is_destructive_intent(instruction: str, plan_steps: List[Dict[str, Any]]) -> bool:
+    low = instruction.lower()
+    if any(token in low for token in DESTRUCTIVE_ACTION_KEYWORDS):
+        return True
+    for step in plan_steps:
+        merged = " ".join(
+            str(x).lower()
+            for x in [
+                step.get("action", ""),
+                step.get("text", ""),
+                step.get("keys", ""),
+                (step.get("selector", {}) or {}).get("value", "") if isinstance(step.get("selector", {}), dict) else "",
+            ]
+        )
+        if any(token in merged for token in DESTRUCTIVE_ACTION_KEYWORDS):
+            return True
+    return False
+
+
+def _summarize_plan_steps(plan_steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for i, step in enumerate(plan_steps):
+        action = str(step.get("action", step.get("kind", "step")))
+        target = ""
+        selector = step.get("selector", {})
+        if isinstance(selector, dict):
+            target = str(selector.get("value", ""))
+        if not target:
+            target = str(step.get("app", "") or step.get("name", "") or step.get("text", ""))
+        out.append({"index": i, "action": action, "target": target[:140]})
+    return out
+
+
+def _build_undo_plan(plan_steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    undo: List[Dict[str, Any]] = []
+    for i, step in enumerate(plan_steps):
+        action = str(step.get("action", step.get("kind", "step"))).lower()
+        if action in {"type_text", "type"}:
+            instruction = "Use Ctrl+Z or clear edited field to restore prior value."
+        elif action in {"click", "click_found", "submit_action", "set_cell"}:
+            instruction = "Navigate back to impacted record and revert the latest change manually."
+        elif action in {"open_app", "focus_window", "navigate_url"}:
+            instruction = "Close the opened window/tab if this run should be rolled back."
+        elif action in {"copy", "paste", "hotkey"}:
+            instruction = "Restore clipboard/context and reverse any pasted content."
+        elif action in {"research", "extract", "analyze", "produce", "present"}:
+            instruction = "Delete generated local artifacts if run should be fully reverted."
+        else:
+            instruction = "No automatic rollback; use manual checkpoint restore."
+        undo.append({"step_index": i, "action": action, "undo": instruction})
+    return undo
+
+
+def _detect_ambiguities(instruction: str, plan_steps: List[Dict[str, Any]]) -> List[str]:
+    questions: List[str] = []
+    if len(instruction.strip()) < 6:
+        questions.append("Please provide more detail on the target outcome.")
+    for idx, step in enumerate(plan_steps):
+        action = str(step.get("action", step.get("kind", ""))).lower()
+        if action in {"click", "type_text", "type"}:
+            selector = step.get("selector", {})
+            if isinstance(selector, dict):
+                sel_val = str(selector.get("value", "")).strip()
+            else:
+                sel_val = ""
+            if not sel_val and not str(step.get("text", "")).strip():
+                questions.append(f"Step {idx} is missing a target element or text value.")
+        if action == "note":
+            questions.append(f"Step {idx} could not be mapped to an executable action.")
+    return questions
+
+
+def _verification_block(ok: bool, plan_steps: List[Dict[str, Any]], result: Dict[str, Any]) -> Dict[str, Any]:
+    artifacts = result.get("artifacts", {}) or {}
+    trace = result.get("trace", []) or []
+    evidence: List[str] = []
+    if trace:
+        evidence.append(f"Executed trace entries: {len(trace)}")
+    if artifacts:
+        evidence.append(f"Artifacts generated: {', '.join(sorted(artifacts.keys()))}")
+    if result.get("opened_url"):
+        evidence.append(f"Opened target: {result.get('opened_url')}")
+    checks = [
+        {"name": "plan_has_steps", "pass": bool(plan_steps)},
+        {"name": "execution_ok", "pass": bool(ok)},
+        {"name": "evidence_present", "pass": bool(evidence)},
+    ]
+    return {"passed": all(bool(c["pass"]) for c in checks), "checks": checks, "evidence": evidence}
+
+
+def _finalize_operator_result(result: Dict[str, Any], instruction: str, plan_steps: List[Dict[str, Any]]) -> Dict[str, Any]:
+    out = dict(result)
+    out["planned_steps"] = _summarize_plan_steps(plan_steps)
+    out["undo_plan"] = _build_undo_plan(plan_steps)
+    out["verification"] = _verification_block(bool(out.get("ok", False)), plan_steps, out)
+    out["report"] = {
+        "summary": out.get("canvas", {}).get("title", "Task run completed"),
+        "artifacts": out.get("artifacts", {}),
+        "next_actions": [
+            "Review verification evidence.",
+            "Use history Re-run for repeatable execution.",
+            "Use Resume if a credential checkpoint is active.",
+        ],
+    }
+    out["operator_contract"] = {
+        "instruction": instruction,
+        "model": "plan_validate_execute_verify_report",
+        "least_privilege": True,
+    }
+    return out
+
+
 def execute_instruction(
     instruction: str,
     control_granted: bool,
@@ -233,17 +359,52 @@ def execute_instruction(
     if _is_native_planning_intent(normalized) or _is_study_pack_intent(normalized) or _is_job_research_intent(normalized):
         _emit_progress(progress_cb, 8, "Building execution plan")
         plan = _build_native_plan(normalized)
+        plan_steps = [dict(x) for x in plan.get("steps", [])]
+        ambiguities = _detect_ambiguities(normalized, plan_steps)
+        if ambiguities:
+            return {
+                "ok": False,
+                "mode": "needs_clarification",
+                "instruction": instruction,
+                "message": "Clarification required before execution.",
+                "questions": ambiguities[:4],
+                "planned_steps": _summarize_plan_steps(plan_steps),
+                "undo_plan": _build_undo_plan(plan_steps),
+            }
+        if _is_destructive_intent(normalized, plan_steps) and not confirm_risky:
+            return {
+                "ok": False,
+                "mode": "confirmation_required",
+                "instruction": instruction,
+                "requires_confirmation": True,
+                "message": "Destructive or high-impact action detected. Confirm to continue.",
+                "planned_steps": _summarize_plan_steps(plan_steps),
+                "undo_plan": _build_undo_plan(plan_steps),
+            }
+        _emit_progress(progress_cb, 12, f"Plan ready with {len(plan_steps)} step(s)")
         _emit_progress(progress_cb, 14, "Executing plan")
         execution = _execute_native_plan(plan=plan, instruction=instruction, progress_cb=progress_cb)
         execution["ai"] = ai_meta
         _emit_progress(progress_cb, 100, "Completed")
-        return execution
+        return _finalize_operator_result(execution, instruction=instruction, plan_steps=plan_steps)
 
     if _is_desktop_sequence_intent(normalized):
         _emit_progress(progress_cb, 12, "Building desktop action sequence")
         plan = build_plan(normalized)
+        plan_steps = [dict(x) for x in plan.get("steps", [])]
+        ambiguities = _detect_ambiguities(normalized, plan_steps)
+        if ambiguities:
+            return {
+                "ok": False,
+                "mode": "needs_clarification",
+                "instruction": instruction,
+                "message": "Clarification required before execution.",
+                "questions": ambiguities[:4],
+                "planned_steps": _summarize_plan_steps(plan_steps),
+                "undo_plan": _build_undo_plan(plan_steps),
+            }
         risk = assess_risk(plan)
-        if risk["requires_confirmation"] and not confirm_risky:
+        if (risk["requires_confirmation"] or _is_destructive_intent(normalized, plan_steps)) and not confirm_risky:
             return {
                 "ok": False,
                 "mode": "desktop_sequence_preview",
@@ -252,6 +413,8 @@ def execute_instruction(
                 "message": "Risky actions detected. Confirm to execute.",
                 "risk": risk,
                 "plan": plan,
+                "planned_steps": _summarize_plan_steps(plan_steps),
+                "undo_plan": _build_undo_plan(plan_steps),
                 "canvas": {
                     "title": "Confirmation Required",
                     "subtitle": f"{len(risk['risky_steps'])} risky step(s)",
@@ -271,7 +434,7 @@ def execute_instruction(
         store = LocalVectorStore()
         app_name = plan.get("app_name", "") or "desktop"
         guidance = get_guidance(app_name=app_name, user_goal=normalized, store=store) if app_name else {"guidance": []}
-        return {
+        response = {
             "ok": run.ok,
             "mode": "desktop_sequence",
             "instruction": instruction,
@@ -296,17 +459,19 @@ def execute_instruction(
                 ],
             },
         }
+        return _finalize_operator_result(response, instruction=instruction, plan_steps=plan_steps)
 
     open_match = re.search(r"\bopen\s+(.+?)(?:\s+app)?\b", normalized, flags=re.IGNORECASE)
     if open_match and ("search" not in normalized.lower()):
         _emit_progress(progress_cb, 15, "Opening installed application")
         target = open_match.group(1).strip()
+        plan_steps = [{"action": "open_app", "app": normalize_app_name(target)}]
         ok, launched = open_installed_app(target)
         app_name = normalize_app_name(target)
         store = LocalVectorStore()
         guidance = get_guidance(app_name=app_name, user_goal=normalized, store=store)
         if ok:
-            return {
+            response = {
                 "ok": True,
                 "mode": "desktop_app_open",
                 "instruction": instruction,
@@ -325,6 +490,7 @@ def execute_instruction(
                     ],
                 },
             }
+            return _finalize_operator_result(response, instruction=instruction, plan_steps=plan_steps)
         return {
             "ok": False,
             "mode": "desktop_app_open",
@@ -333,8 +499,21 @@ def execute_instruction(
             "error": f"Could not locate installed app '{target}'.",
             "app_name": app_name,
             "guidance": guidance,
+            "planned_steps": _summarize_plan_steps(plan_steps),
+            "undo_plan": _build_undo_plan(plan_steps),
         }
 
+    plan_steps = [{"action": "web_search", "query": normalized}, {"action": "open_result"}]
+    if _is_destructive_intent(normalized, plan_steps) and not confirm_risky:
+        return {
+            "ok": False,
+            "mode": "confirmation_required",
+            "instruction": instruction,
+            "requires_confirmation": True,
+            "message": "Destructive or high-impact action detected. Confirm to continue.",
+            "planned_steps": _summarize_plan_steps(plan_steps),
+            "undo_plan": _build_undo_plan(plan_steps),
+        }
     query = normalized
     _emit_progress(progress_cb, 20, "Running web search")
     results: List[SearchResult] = []
@@ -384,7 +563,7 @@ def execute_instruction(
         "pause_reason": "Possible login prompt detected. Enter credentials manually and click Resume." if needs_credentials else "",
     }
     _emit_progress(progress_cb, 100, "Completed")
-    return json.loads(json.dumps(response))
+    return _finalize_operator_result(json.loads(json.dumps(response)), instruction=instruction, plan_steps=plan_steps)
 
 
 def preview_instruction(instruction: str) -> Dict[str, Any]:
@@ -393,11 +572,14 @@ def preview_instruction(instruction: str) -> Dict[str, Any]:
         return {"ok": False, "error": "Instruction is empty."}
     if _is_native_planning_intent(normalized):
         plan = _build_native_plan(normalized)
+        plan_steps = [dict(x) for x in plan.get("steps", [])]
         return {
             "ok": True,
             "mode": "preview_native_plan",
             "instruction": instruction,
             "plan": plan,
+            "planned_steps": _summarize_plan_steps(plan_steps),
+            "undo_plan": _build_undo_plan(plan_steps),
             "canvas": {
                 "title": "Native Plan Preview",
                 "subtitle": f"{plan.get('domain')} | {len(plan.get('steps', []))} steps",
@@ -409,6 +591,7 @@ def preview_instruction(instruction: str) -> Dict[str, Any]:
         }
     if _is_desktop_sequence_intent(normalized):
         plan = build_plan(normalized)
+        plan_steps = [dict(x) for x in plan.get("steps", [])]
         risk = assess_risk(plan)
         return {
             "ok": True,
@@ -416,6 +599,8 @@ def preview_instruction(instruction: str) -> Dict[str, Any]:
             "instruction": instruction,
             "plan": plan,
             "risk": risk,
+            "planned_steps": _summarize_plan_steps(plan_steps),
+            "undo_plan": _build_undo_plan(plan_steps),
             "canvas": {
                 "title": "Plan Preview",
                 "subtitle": f"{len(plan.get('steps', []))} steps",
@@ -429,6 +614,8 @@ def preview_instruction(instruction: str) -> Dict[str, Any]:
         "ok": True,
         "mode": "preview_search",
         "instruction": instruction,
+        "planned_steps": _summarize_plan_steps([{"action": "web_search", "query": instruction}, {"action": "open_result"}]),
+        "undo_plan": _build_undo_plan([{"action": "web_search"}, {"action": "open_result"}]),
         "canvas": {"title": "Search Preview", "subtitle": instruction, "cards": []},
     }
 
@@ -2069,9 +2256,10 @@ def _emit_progress(progress_cb: Optional[Callable[[int, str], None]], pct: int, 
 
 def resume_pending_plan(pending: Dict[str, Any], step_mode: bool = False) -> Dict[str, Any]:
     plan = pending.get("plan", {})
+    plan_steps = [dict(x) for x in plan.get("steps", [])]
     start = int(pending.get("next_step_index", 0))
     run = execute_plan(plan, start_index=start, step_mode=step_mode, allow_input_fallback=True)
-    return {
+    response = {
         "ok": run.ok,
         "mode": "desktop_sequence_resume",
         "plan": plan,
@@ -2091,3 +2279,4 @@ def resume_pending_plan(pending: Dict[str, Any], step_mode: bool = False) -> Dic
             ],
         },
     }
+    return _finalize_operator_result(response, instruction=str(plan.get("instruction", "")), plan_steps=plan_steps)
