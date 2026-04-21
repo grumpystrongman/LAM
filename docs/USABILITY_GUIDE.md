@@ -73,7 +73,7 @@ Notes:
 
 Prompt:
 
-`Search LinkedIn and other job sites for VP/AVP Data and AI roles in US and Ireland and build spreadsheet, report, dashboard with links`
+`Search LinkedIn and other job sites for Data and AI roles in US and Ireland and build spreadsheet, report, dashboard with links`
 
 Output:
 

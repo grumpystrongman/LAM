@@ -690,11 +690,9 @@ def _run_generic_research(instruction: str) -> Dict[str, Any]:
 
 def _extract_role_query(instruction: str) -> str:
     low = instruction.lower()
-    if "vp of data and ai" in low:
-        return "VP of Data and AI OR AVP of Data and AI OR Head of Data and AI OR Director of Data and AI"
     if "data and ai" in low:
-        return "VP Data and AI OR AVP Data and AI OR Head of Data and AI"
-    return "VP Data AI OR AVP Data AI"
+        return "Data and AI OR Artificial Intelligence OR Data Analytics OR Machine Learning"
+    return "Data and AI roles OR Artificial Intelligence roles OR Data leadership roles"
 
 
 def _extract_generic_query(instruction: str) -> str:

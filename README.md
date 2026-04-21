@@ -20,7 +20,7 @@ It combines governance controls, deterministic execution, teach mode recording, 
 
 - `open chatgpt app then click New chat then type "Daily summary" then press enter`
 - `search Amazon for best price on Abu Garcia Voltiq baitcasting reel`
-- `Search Indeed, LinkedIn, and other commercially available job sites for VP/AVP Data and AI roles in US and Ireland, then build a spreadsheet, report, and dashboard with links`
+- `Search Indeed, LinkedIn, and other commercially available job sites for Data and AI roles in US and Ireland, then build a spreadsheet, report, and dashboard with links`
 - `open linkedin app then login with linkedin`
 
 ## Commercial Feature Set (Current)
