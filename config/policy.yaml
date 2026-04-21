@@ -1,0 +1,49 @@
+governance:
+  require_governance_ready: true
+  controls:
+    identity: true
+    policy: true
+    approval: true
+    audit: true
+    secrets: true
+
+rbac:
+  roles:
+    - Runner
+    - Approver
+    - WorkflowAuthor
+    - Admin
+    - Auditor
+
+abac:
+  require_managed_device: true
+  require_compliant_device: true
+  allowed_network_zones:
+    - corp
+    - vpn
+
+policies:
+  os_action_allowlist:
+    - click
+    - type
+    - hotkey
+    - wait_for
+    - assert_visible
+    - read_cell
+    - set_cell
+    - copy
+    - paste
+    - open_app
+    - focus_window
+    - navigate_url
+    - extract_field
+    - ask_user
+    - require_approval
+    - submit_action
+    - screenshot_redacted
+  deny_rules:
+    - action: paste
+      when_target_domain_not_in_allowlist: true
+    - action: copy
+      when_data_classification_in: [phi, pii, credential]
+      and_target_app_not_trusted: true

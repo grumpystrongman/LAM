@@ -1,0 +1,4 @@
+domains:
+  - "claims.internal.health.local"
+  - "auth.internal.health.local"
+  - "sso.internal.health.local"

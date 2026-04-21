@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+data/
+test_artifacts/
+.pytest_cache/
+.mypy_cache/
+.brv/

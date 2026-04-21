@@ -1,0 +1,71 @@
+workflow:
+  id: "claims_excel_to_web_submit"
+  version: "1.0.0"
+  risk_tier: "high"
+  owner_group: "claims-ops"
+  allowed_roles: ["Runner"]
+  allowed_departments: ["Claims"]
+  publication:
+    state: "published"
+    approved_by: ["author_id", "approver_id"]
+    two_person_rule: true
+  defaults:
+    timeout_ms: 12000
+    retry:
+      max_attempts: 2
+      backoff_ms: 500
+    drift_policy: "ask_user"
+  inputs:
+    - name: "excel_path"
+      type: "file"
+      sensitivity: "internal"
+  steps:
+    - id: "1"
+      type: "open_app"
+      target: { app: "Microsoft Excel", path: "C:\\Program Files\\Microsoft Office\\root\\Office16\\EXCEL.EXE", selector: { strategy: "uia", value: "EXCEL" } }
+      sensitivity: { data_classification: "none", write_impact: "read", requires_approval: false }
+    - id: "2"
+      type: "for_each_row"
+      data: { sheet: "Claims", start_row: 2 }
+      sensitivity: { data_classification: "none", write_impact: "read", requires_approval: false }
+    - id: "3"
+      type: "read_cell"
+      data: { sheet: "Claims", column: "A", save_as: "member_name" }
+      sensitivity: { data_classification: "phi", write_impact: "read", requires_approval: false }
+    - id: "4"
+      type: "read_cell"
+      data: { sheet: "Claims", column: "B", save_as: "claim_id" }
+      sensitivity: { data_classification: "phi", write_impact: "read", requires_approval: false }
+    - id: "5"
+      type: "navigate_url"
+      target: { app: "Browser", url: "https://claims.internal.health.local" }
+      sensitivity: { data_classification: "none", write_impact: "read", requires_approval: false }
+    - id: "6"
+      type: "type"
+      target: { app: "Browser", selector: { strategy: "label", value: "Claim ID", alternates: ["placeholder:Claim ID"] } }
+      data: { value_ref: "claim_id" }
+      sensitivity: { data_classification: "phi", write_impact: "read", requires_approval: false }
+    - id: "7"
+      type: "click"
+      target: { app: "Browser", selector: { strategy: "role_name", value: "button:Search", alternates: ["text:Search"] } }
+      sensitivity: { data_classification: "none", write_impact: "read", requires_approval: false }
+    - id: "8"
+      type: "assert_visible"
+      target: { app: "Browser", selector: { strategy: "text", value: "{{member_name}}" } }
+      sensitivity: { data_classification: "phi", write_impact: "read", requires_approval: false }
+    - id: "9"
+      type: "set_cell"
+      data: { sheet: "Claims", column: "C", value: "ApprovedForProcessing" }
+      sensitivity: { data_classification: "none", write_impact: "write", requires_approval: true }
+    - id: "10"
+      type: "require_approval"
+      data: { level: "high_risk_writeback", approvers: ["manager", "compliance"] }
+      sensitivity: { data_classification: "none", write_impact: "submit", requires_approval: true }
+    - id: "11"
+      type: "submit_action"
+      target: { app: "Browser", selector: { strategy: "role_name", value: "button:Submit" } }
+      sensitivity: { data_classification: "none", write_impact: "submit", requires_approval: true }
+    - id: "12"
+      type: "screenshot_redacted"
+      data: { reason: "proof_of_submission" }
+      sensitivity: { data_classification: "phi", write_impact: "read", requires_approval: false }

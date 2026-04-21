@@ -1,0 +1,15 @@
+sensitive_actions:
+  - submit_action
+  - set_cell
+  - payment_finalize
+  - claim_disposition
+high_risk_actions:
+  - submit_action
+  - payment_finalize
+  - claim_disposition
+approval_policy:
+  default_low_risk:
+    - approver
+  default_high_risk:
+    - manager
+    - compliance

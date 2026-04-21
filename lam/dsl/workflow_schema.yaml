@@ -1,0 +1,34 @@
+workflow:
+  required:
+    - id
+    - version
+    - risk_tier
+    - allowed_roles
+    - publication
+    - steps
+  step_types:
+    - click
+    - type
+    - hotkey
+    - wait_for
+    - assert_visible
+    - read_cell
+    - set_cell
+    - copy
+    - paste
+    - open_app
+    - focus_window
+    - navigate_url
+    - extract_field
+    - ask_user
+    - require_approval
+    - submit_action
+    - screenshot_redacted
+    - if
+    - for_each_row
+  sensitivity:
+    data_classification: [none, phi, pii, credential, internal]
+    write_impact: [read, write, submit]
+    requires_approval: [true, false]
+  controls:
+    drift_policy: [fail_fast, ask_user, fallback_selector]

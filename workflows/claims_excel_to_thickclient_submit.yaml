@@ -1,0 +1,74 @@
+workflow:
+  id: "claims_excel_to_thickclient_submit"
+  version: "1.0.0"
+  risk_tier: "high"
+  owner_group: "claims-ops"
+  allowed_roles: ["Runner"]
+  allowed_departments: ["Claims"]
+  publication:
+    state: "published"
+    approved_by: ["author_id", "approver_id"]
+    two_person_rule: true
+  defaults:
+    timeout_ms: 15000
+    retry:
+      max_attempts: 2
+      backoff_ms: 500
+    drift_policy: "ask_user"
+  steps:
+    - id: "1"
+      type: "open_app"
+      target: { app: "ClaimsDesktop", path: "C:\\Program Files\\ClaimsApp\\Claims.exe", selector: { strategy: "uia", value: "ClaimsApp" } }
+      sensitivity: { data_classification: "none", write_impact: "read", requires_approval: false }
+    - id: "2"
+      type: "focus_window"
+      target: { app: "ClaimsDesktop", selector: { strategy: "uia", value: "Name=Claims Workbench;ControlType=Window" } }
+      sensitivity: { data_classification: "none", write_impact: "read", requires_approval: false }
+    - id: "3"
+      type: "for_each_row"
+      data: { sheet: "Claims", start_row: 2 }
+      sensitivity: { data_classification: "none", write_impact: "read", requires_approval: false }
+    - id: "4"
+      type: "read_cell"
+      data: { sheet: "Claims", column: "A", save_as: "member_name" }
+      sensitivity: { data_classification: "phi", write_impact: "read", requires_approval: false }
+    - id: "5"
+      type: "read_cell"
+      data: { sheet: "Claims", column: "B", save_as: "claim_id" }
+      sensitivity: { data_classification: "phi", write_impact: "read", requires_approval: false }
+    - id: "6"
+      type: "type"
+      target: { app: "ClaimsDesktop", selector: { strategy: "uia", value: "AutomationId=txtClaimId" } }
+      data: { value_ref: "claim_id" }
+      sensitivity: { data_classification: "phi", write_impact: "read", requires_approval: false }
+    - id: "7"
+      type: "hotkey"
+      data: { keys: "ENTER" }
+      target: { app: "ClaimsDesktop", selector: { strategy: "uia", value: "MainWindow" } }
+      sensitivity: { data_classification: "none", write_impact: "read", requires_approval: false }
+    - id: "8"
+      type: "extract_field"
+      target: { app: "ClaimsDesktop", selector: { strategy: "uia", value: "AutomationId=lblMemberName" } }
+      data: { save_as: "member_name_ui" }
+      sensitivity: { data_classification: "phi", write_impact: "read", requires_approval: false }
+    - id: "9"
+      type: "if"
+      data: { condition: "member_name_ui == row.member_name" }
+      sensitivity: { data_classification: "phi", write_impact: "read", requires_approval: false }
+    - id: "10"
+      type: "ask_user"
+      data: { question: "Member mismatch. Which value is correct?", options: ["Excel", "Desktop App", "Skip Row"] }
+      sensitivity: { data_classification: "phi", write_impact: "read", requires_approval: false }
+    - id: "11"
+      type: "type"
+      target: { app: "ClaimsDesktop", selector: { strategy: "uia", value: "AutomationId=txtStatus" } }
+      data: { value: "ApprovedForProcessing" }
+      sensitivity: { data_classification: "none", write_impact: "write", requires_approval: true }
+    - id: "12"
+      type: "require_approval"
+      data: { level: "high_risk_writeback", approvers: ["manager", "compliance"] }
+      sensitivity: { data_classification: "none", write_impact: "submit", requires_approval: true }
+    - id: "13"
+      type: "submit_action"
+      target: { app: "ClaimsDesktop", selector: { strategy: "uia", value: "AutomationId=btnFinalize" } }
+      sensitivity: { data_classification: "none", write_impact: "submit", requires_approval: true }

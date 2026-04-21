@@ -1,0 +1,17 @@
+control_plane:
+  host: "127.0.0.1"
+  port: 8787
+  audit_backend: "sqlite"
+  approval:
+    default_timeout_seconds: 600
+    expire_pending_after_seconds: 3600
+  audit:
+    min_redaction_confidence: 0.95
+    retention_days:
+      audit_metadata: 2555
+      diagnostics: 30
+  auth:
+    require_auth: true
+    allow_anonymous_health: true
+    api_key_env: "LAM_API_KEY"
+    bearer_secret_env: "LAM_BEARER_SECRET"

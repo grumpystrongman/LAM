@@ -1,0 +1,13 @@
+apps:
+  - name: "ClaimsDesktop"
+    path: "C:\\Program Files\\ClaimsApp\\Claims.exe"
+    signer: "O=Contoso Health Systems"
+    sha256: "REPLACE_WITH_REAL_HASH"
+  - name: "Microsoft Excel"
+    path: "C:\\Program Files\\Microsoft Office\\root\\Office16\\EXCEL.EXE"
+    signer: "O=Microsoft Corporation"
+    sha256: "REPLACE_WITH_REAL_HASH"
+  - name: "Browser"
+    path: "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe"
+    signer: "O=Microsoft Corporation"
+    sha256: "REPLACE_WITH_REAL_HASH"
