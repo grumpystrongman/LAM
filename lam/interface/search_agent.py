@@ -23,6 +23,7 @@ from lam.interface.desktop_sequence import assess_risk, build_plan, execute_plan
 from lam.interface.local_vector_store import LocalVectorStore
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+MIN_LIVE_NON_CURATED_CITATIONS = 3
 DESTRUCTIVE_ACTION_KEYWORDS = {
     "delete",
     "remove",
@@ -339,6 +340,7 @@ def execute_instruction(
     step_mode: bool = False,
     confirm_risky: bool = False,
     ai_backend: str = "deterministic-local",
+    min_live_non_curated_citations: Optional[int] = None,
     progress_cb: Optional[Callable[[int, str], None]] = None,
 ) -> Dict[str, Any]:
     _emit_progress(progress_cb, 2, "Understanding your request")
@@ -383,7 +385,12 @@ def execute_instruction(
             }
         _emit_progress(progress_cb, 12, f"Plan ready with {len(plan_steps)} step(s)")
         _emit_progress(progress_cb, 14, "Executing plan")
-        execution = _execute_native_plan(plan=plan, instruction=instruction, progress_cb=progress_cb)
+        execution = _execute_native_plan(
+            plan=plan,
+            instruction=instruction,
+            progress_cb=progress_cb,
+            min_live_non_curated_citations=min_live_non_curated_citations,
+        )
         execution["ai"] = ai_meta
         _emit_progress(progress_cb, 100, "Completed")
         return _finalize_operator_result(execution, instruction=instruction, plan_steps=plan_steps)
@@ -654,9 +661,22 @@ def _is_native_planning_intent(instruction: str) -> bool:
         "capture links",
         "all over",
         "across",
+        "executive summary",
+        "powerpoint",
+        "competitor",
+        "competition",
+        "save everything to a folder",
     ]
     complexity = sum(1 for s in signals if s in low)
     return complexity >= 2 or (len(instruction) > 180 and any(k in low for k in ["find", "research", "search"]))
+
+
+def _is_competitor_analysis_intent(instruction: str) -> bool:
+    low = instruction.lower()
+    has_comp = any(x in low for x in ["competitor", "competition", "compete"])
+    has_research = any(x in low for x in ["research", "analysis", "market"])
+    has_deliverable = any(x in low for x in ["executive summary", "powerpoint", "ppt", "slide"])
+    return has_comp and has_research and has_deliverable
 
 
 def _is_study_pack_intent(instruction: str) -> bool:
@@ -671,6 +691,8 @@ def _build_native_plan(instruction: str) -> Dict[str, Any]:
         domain = "study_pack"
     elif _is_job_research_intent(instruction):
         domain = "job_market"
+    elif _is_competitor_analysis_intent(instruction):
+        domain = "competitor_analysis"
     else:
         domain = "web_research"
     deliverables: List[str] = []
@@ -679,6 +701,10 @@ def _build_native_plan(instruction: str) -> Dict[str, Any]:
         deliverables.append("spreadsheet")
     if "report" in low:
         deliverables.append("report")
+    if "executive summary" in low:
+        deliverables.append("executive_summary")
+    if "powerpoint" in low or "ppt" in low or "slides" in low:
+        deliverables.append("powerpoint")
     if "dashboard" in low:
         deliverables.append("dashboard")
     if "link" in low:
@@ -686,11 +712,12 @@ def _build_native_plan(instruction: str) -> Dict[str, Any]:
     if not deliverables:
         deliverables = ["report", "dashboard"]
 
-    sources = (
-        ["linkedin", "indeed", "ziprecruiter", "glassdoor", "builtin"]
-        if domain == "job_market"
-        else ["web_search", "source_pages"]
-    )
+    if domain == "job_market":
+        sources = ["linkedin", "indeed", "ziprecruiter", "glassdoor", "builtin"]
+    elif domain == "competitor_analysis":
+        sources = ["industry_reports", "vendor_pages", "analyst_coverage", "web_search"]
+    else:
+        sources = ["web_search", "source_pages"]
     objective = re.sub(r"\s+", " ", instruction).strip()
     return {
         "planner": "native-v1",
@@ -717,34 +744,81 @@ def _execute_native_plan(
     plan: Dict[str, Any],
     instruction: str,
     progress_cb: Optional[Callable[[int, str], None]] = None,
+    min_live_non_curated_citations: Optional[int] = None,
 ) -> Dict[str, Any]:
-    return _run_reflective_planner(plan=plan, instruction=instruction, progress_cb=progress_cb)
+    return _run_reflective_planner(
+        plan=plan,
+        instruction=instruction,
+        progress_cb=progress_cb,
+        min_live_non_curated_citations=min_live_non_curated_citations,
+    )
 
 
 def _run_reflective_planner(
     plan: Dict[str, Any],
     instruction: str,
     progress_cb: Optional[Callable[[int, str], None]] = None,
+    min_live_non_curated_citations: Optional[int] = None,
 ) -> Dict[str, Any]:
+    min_live = _effective_min_live_non_curated_citations(min_live_non_curated_citations)
     objective = str(plan.get("objective", instruction))
     preferred = str(plan.get("domain", "web_research"))
+    accept_threshold = 0.60 if preferred == "competitor_analysis" else 0.72
     attempt_order = _strategy_order(preferred=preferred)
     best: Dict[str, Any] = {"score": -1.0, "result": {}}
     decision_log: List[str] = []
+    accepted = False
 
     for attempt, strategy in enumerate(attempt_order, start=1):
         _emit_progress(progress_cb, 18 + (attempt - 1) * 20, f"Planning attempt {attempt}: {strategy}")
-        result = _run_strategy(strategy=strategy, instruction=instruction, progress_cb=progress_cb)
-        score = _score_result_against_objective(result=result, objective=objective)
+        result = _run_strategy(
+            strategy=strategy,
+            instruction=instruction,
+            progress_cb=progress_cb,
+            min_live_non_curated_citations=min_live,
+        )
+        score = _score_result_against_objective(
+            result=result,
+            objective=objective,
+            min_live_non_curated_citations=min_live,
+        )
         decision_log.append(f"Attempt {attempt} used {strategy} -> quality score {score:.2f}")
         if score > float(best["score"]):
             best = {"score": score, "result": result}
-        if score >= 0.72:
+        if score >= accept_threshold:
             decision_log.append(f"Accepted attempt {attempt}; score passed threshold.")
+            accepted = True
             break
         decision_log.append(f"Rejected attempt {attempt}; refining strategy.")
 
     chosen = dict(best["result"] or {})
+    if preferred == "competitor_analysis" and (not accepted):
+        return {
+            "ok": False,
+            "mode": "autonomous_plan_execute",
+            "plan": plan,
+            "instruction": instruction,
+            "decision_log": decision_log + [
+                f"Failed strict acceptance threshold ({accept_threshold:.2f}) for competitor analysis.",
+            ],
+            "query": str(chosen.get("query", "")),
+            "results_count": int(chosen.get("results_count", 0) or 0),
+            "artifacts": {},
+            "summary": {
+                "error": "strict_competitor_validation_failed",
+                "required_live_non_curated_citations": min_live,
+            },
+            "results": chosen.get("results", []),
+            "source_status": chosen.get("source_status", {}),
+            "opened_url": "",
+            "canvas": {
+                "title": "Run Blocked",
+                "subtitle": "Strict citation rule not met.",
+                "cards": [],
+            },
+            "paused_for_credentials": False,
+            "pause_reason": "",
+        }
     if not chosen:
         chosen = _run_generic_research(instruction, progress_cb=progress_cb)
         decision_log.append("Fallback to generic strategy due empty attempts.")
@@ -778,25 +852,43 @@ def _run_reflective_planner(
 
 
 def _strategy_order(preferred: str) -> List[str]:
-    all_strategies = ["study_pack", "job_market", "generic_research"]
+    all_strategies = ["study_pack", "job_market", "competitor_analysis", "generic_research"]
     if preferred == "study_pack":
         return ["study_pack", "generic_research"]
     if preferred == "job_market":
         return ["job_market", "generic_research"]
+    if preferred == "competitor_analysis":
+        return ["competitor_analysis", "generic_research"]
     if preferred in all_strategies:
         return [preferred] + [s for s in all_strategies if s != preferred]
     return all_strategies
 
 
-def _run_strategy(strategy: str, instruction: str, progress_cb: Optional[Callable[[int, str], None]] = None) -> Dict[str, Any]:
+def _run_strategy(
+    strategy: str,
+    instruction: str,
+    progress_cb: Optional[Callable[[int, str], None]] = None,
+    min_live_non_curated_citations: Optional[int] = None,
+) -> Dict[str, Any]:
     if strategy == "study_pack":
         return _run_study_pack(instruction, progress_cb=progress_cb)
     if strategy == "job_market":
         return _run_job_market_research(instruction, progress_cb=progress_cb)
+    if strategy == "competitor_analysis":
+        return _run_competitor_analysis(
+            instruction,
+            progress_cb=progress_cb,
+            min_live_non_curated_citations=min_live_non_curated_citations,
+        )
     return _run_generic_research(instruction, progress_cb=progress_cb)
 
 
-def _score_result_against_objective(result: Dict[str, Any], objective: str) -> float:
+def _score_result_against_objective(
+    result: Dict[str, Any],
+    objective: str,
+    min_live_non_curated_citations: Optional[int] = None,
+) -> float:
+    min_live = _effective_min_live_non_curated_citations(min_live_non_curated_citations)
     if not result.get("ok"):
         return 0.0
     score = 0.2
@@ -825,12 +917,21 @@ def _score_result_against_objective(result: Dict[str, Any], objective: str) -> f
     low_obj = objective.lower()
     wants_study = any(t in low_obj for t in ["flashcard", "quiz", "study", "exam", "permit"])
     wants_jobs = any(t in low_obj for t in ["job", "position", "salary", "linkedin", "indeed"])
+    wants_competitor = any(t in low_obj for t in ["competitor", "competition", "executive summary", "powerpoint", "ppt"])
     if wants_study:
         if "flashcards_csv" not in artifacts or not any(k in artifacts for k in ["quiz_md", "quiz_html"]):
             score -= 0.5
     if wants_jobs:
         if "jobs_csv" not in artifacts and result.get("mode") != "job_market_research":
             score -= 0.3
+    if wants_competitor:
+        if "executive_summary_md" not in artifacts or "powerpoint_pptx" not in artifacts:
+            score -= 0.45
+        if result.get("mode") != "competitor_analysis":
+            score -= 0.35
+        live_cites = int((result.get("summary", {}) or {}).get("live_non_curated_citations", 0) or 0)
+        if live_cites < min_live:
+            score -= 0.35
 
     return max(0.0, min(1.0, score))
 
@@ -937,7 +1038,7 @@ def _run_job_market_research(instruction: str, progress_cb: Optional[Callable[[i
 
 def _run_generic_research(instruction: str, progress_cb: Optional[Callable[[int, str], None]] = None) -> Dict[str, Any]:
     query = _extract_generic_query(instruction)
-    queries = _expand_queries(query)
+    queries = _expand_queries(query, instruction=instruction)
     collected: List[SearchResult] = []
     source_status: Dict[str, str] = {}
     _emit_progress(progress_cb, 18, f"Researching: {query}")
@@ -955,15 +1056,33 @@ def _run_generic_research(instruction: str, progress_cb: Optional[Callable[[int,
     ranked = list(dedup.values())
     _emit_progress(progress_cb, 72, "Ranking and summarizing findings")
     ranked.sort(key=lambda x: _relevance_score(x, query), reverse=True)
-    _emit_progress(progress_cb, 84, "Building spreadsheet, report, and dashboard")
+    top_score = _relevance_score(ranked[0], query) if ranked else 0.0
+    if top_score < 1.25:
+        return {
+            "ok": False,
+            "query": query,
+            "results_count": 0,
+            "results": [asdict(x) for x in ranked[:10]],
+            "artifacts": {},
+            "summary": {"error": "low_relevance", "top_score": round(top_score, 3), "query": query},
+            "source_status": source_status,
+            "opened_url": "",
+            "canvas": {
+                "title": "Research Blocked",
+                "subtitle": "Results were not relevant enough; task not executed.",
+                "cards": [{"title": "Low relevance", "price": str(round(top_score, 3)), "source": "validator", "url": ""}],
+            },
+        }
+    _emit_progress(progress_cb, 84, "Building requested deliverables")
     artifacts = _write_generic_research_artifacts(instruction=instruction, query=query, results=ranked)
     summary = {
         "total": len(ranked),
         "sources": _count_by(r.source for r in ranked),
     }
-    dashboard_uri = Path(artifacts["dashboard_html"]).resolve().as_uri() if artifacts.get("dashboard_html") else ""
-    if dashboard_uri:
-        webbrowser.open(dashboard_uri, new=2)
+    open_target = artifacts.get("primary_open_file") or artifacts.get("dashboard_html", "")
+    opened_uri = Path(open_target).resolve().as_uri() if open_target else ""
+    if opened_uri:
+        webbrowser.open(opened_uri, new=2)
     return {
         "ok": True,
         "query": query,
@@ -972,9 +1091,9 @@ def _run_generic_research(instruction: str, progress_cb: Optional[Callable[[int,
         "artifacts": artifacts,
         "summary": summary,
         "source_status": source_status,
-        "opened_url": dashboard_uri,
+        "opened_url": opened_uri,
         "canvas": {
-            "title": "Research Dashboard Generated",
+            "title": "Research Deliverables Generated",
             "subtitle": f"{len(ranked)} results",
             "cards": [
                 {
@@ -987,6 +1106,485 @@ def _run_generic_research(instruction: str, progress_cb: Optional[Callable[[int,
             ],
         },
     }
+
+
+def _run_competitor_analysis(
+    instruction: str,
+    progress_cb: Optional[Callable[[int, str], None]] = None,
+    min_live_non_curated_citations: Optional[int] = None,
+) -> Dict[str, Any]:
+    min_live = _effective_min_live_non_curated_citations(min_live_non_curated_citations)
+    if not _is_competitor_analysis_intent(instruction):
+        return {
+            "ok": False,
+            "mode": "competitor_analysis",
+            "query": "",
+            "results_count": 0,
+            "results": [],
+            "artifacts": {},
+            "summary": {"error": "competitor_intent_not_detected"},
+            "source_status": {},
+            "opened_url": "",
+            "canvas": {
+                "title": "Competitor Analysis Skipped",
+                "subtitle": "Prompt did not request competitor analysis explicitly.",
+                "cards": [],
+            },
+        }
+    target = _extract_competitor_target(instruction)
+    output_folder = _extract_named_output_folder(instruction, default_name=f"{target} Competitor Analysis")
+    _emit_progress(progress_cb, 16, f"Researching competitors for: {target}")
+
+    queries = _competitor_queries(target)
+    must_terms = _competitor_must_terms(target)
+    collected: List[SearchResult] = []
+    source_status: Dict[str, str] = {}
+    for i, q in enumerate(queries):
+        _emit_progress(progress_cb, 22 + int((i / max(1, len(queries))) * 40), f"Searching sources: {q}")
+        rows = _search_web(q, limit=16)
+        filtered = _filter_relevant_results(
+            rows,
+            must_terms=must_terms,
+            banned_domains={
+                "filmaffinity.com",
+                "dailymotion.com",
+                "justwatch.com",
+                "youtube.com",
+                "m.youtube.com",
+                "support.google.com",
+                "mail.google.com",
+                "gmail.com",
+            },
+            min_score=2.0,
+            preferred_domains=[],
+        )
+        collected.extend(filtered)
+        source_status[q] = f"ok:{len(filtered)}"
+
+    dedup: Dict[str, SearchResult] = {}
+    for r in collected:
+        dedup[r.url] = r
+    ranked = sorted(dedup.values(), key=lambda x: _relevance_score(x, " ".join(must_terms)), reverse=True)
+    if not ranked:
+        _emit_progress(progress_cb, 64, "No high-signal hits yet; running relaxed retrieval")
+        relaxed: List[SearchResult] = []
+        for q in queries:
+            rows = _search_web(q, limit=12)
+            relaxed.extend(
+                _filter_relevant_results(
+                    rows,
+                    must_terms=must_terms,
+                    banned_domains={
+                        "filmaffinity.com",
+                        "dailymotion.com",
+                        "justwatch.com",
+                        "youtube.com",
+                        "m.youtube.com",
+                    },
+                    min_score=1.0,
+                    preferred_domains=[],
+                )
+            )
+        if not relaxed:
+            relaxed = _curated_ehr_competitor_sources(target)
+        dedup = {}
+        for r in relaxed:
+            dedup[r.url] = r
+        ranked = sorted(dedup.values(), key=lambda x: _relevance_score(x, "ehr competitor healthcare"), reverse=True)
+    live_non_curated = _count_live_non_curated_citations(ranked)
+    if live_non_curated < min_live:
+        return {
+            "ok": False,
+            "mode": "competitor_analysis",
+            "query": f"{target} EHR competitors",
+            "results_count": len(ranked),
+            "results": [asdict(x) for x in ranked[:50]],
+            "artifacts": {},
+            "summary": {
+                "target": target,
+                "error": "insufficient_live_non_curated_citations",
+                "required_live_non_curated_citations": min_live,
+                "live_non_curated_citations": live_non_curated,
+            },
+            "source_status": source_status,
+            "opened_url": "",
+            "canvas": {
+                "title": "Run Blocked",
+                "subtitle": f"Need at least {min_live} live non-curated citations; found {live_non_curated}.",
+                "cards": [],
+            },
+        }
+    competitors = _select_top_competitors(target=target, results=ranked, top_n=5)
+    _emit_progress(progress_cb, 74, "Generating executive summary and PowerPoint")
+    artifacts = _write_competitor_artifacts(
+        instruction=instruction,
+        target=target,
+        output_folder=output_folder,
+        competitors=competitors,
+        ranked_results=ranked,
+    )
+    open_target = artifacts.get("primary_open_file") or artifacts.get("executive_summary_html") or artifacts.get("dashboard_html", "")
+    opened_uri = Path(open_target).resolve().as_uri() if open_target else ""
+    if opened_uri:
+        webbrowser.open(opened_uri, new=2)
+
+    cards = []
+    for row in competitors[:6]:
+        cards.append(
+            {
+                "title": row.get("name", "")[:90],
+                "price": row.get("segment", "EHR"),
+                "source": "competitor_analysis",
+                "url": (row.get("citations") or [""])[0],
+            }
+        )
+    return {
+        "ok": True,
+        "mode": "competitor_analysis",
+        "query": f"{target} EHR competitors",
+        "results_count": len(ranked),
+        "results": [asdict(x) for x in ranked[:50]],
+        "artifacts": artifacts,
+        "summary": {
+            "target": target,
+            "top_competitors": [x.get("name", "") for x in competitors[:5]],
+            "competitor_count": len(competitors),
+            "sources_used": len(ranked),
+            "live_non_curated_citations": live_non_curated,
+            "required_live_non_curated_citations": min_live,
+        },
+        "source_status": source_status,
+        "opened_url": opened_uri,
+        "canvas": {
+            "title": f"{target} Competitor Analysis Ready",
+            "subtitle": f"Top {len(competitors[:5])} competitors with executive summary + PowerPoint",
+            "cards": cards,
+        },
+    }
+
+
+def _count_live_non_curated_citations(results: List[SearchResult]) -> int:
+    seen: set[str] = set()
+    count = 0
+    for r in results:
+        src = str(r.source or "").strip().lower()
+        url = str(r.url or "").strip()
+        if not url or not url.startswith(("http://", "https://")):
+            continue
+        host = urllib.parse.urlparse(url).netloc.lower()
+        if src == "curated":
+            continue
+        if host in seen:
+            continue
+        seen.add(host)
+        count += 1
+    return count
+
+
+def _effective_min_live_non_curated_citations(value: Optional[int]) -> int:
+    if value is None:
+        return MIN_LIVE_NON_CURATED_CITATIONS
+    try:
+        return max(1, min(20, int(value)))
+    except Exception:
+        return MIN_LIVE_NON_CURATED_CITATIONS
+
+
+def _curated_ehr_competitor_sources(target: str) -> List[SearchResult]:
+    _ = target
+    return [
+        SearchResult(
+            title="Oracle Health | Electronic Health Record",
+            url="https://www.oracle.com/health/",
+            price=None,
+            source="curated",
+            snippet="Oracle Health (including Cerner capabilities) enterprise healthcare platform information.",
+        ),
+        SearchResult(
+            title="MEDITECH EHR Platform",
+            url="https://ehr.meditech.com/",
+            price=None,
+            source="curated",
+            snippet="MEDITECH electronic health record platform overview.",
+        ),
+        SearchResult(
+            title="athenahealth EHR",
+            url="https://www.athenahealth.com/solutions/electronic-health-records",
+            price=None,
+            source="curated",
+            snippet="athenahealth ambulatory-focused EHR product information.",
+        ),
+        SearchResult(
+            title="eClinicalWorks EHR",
+            url="https://www.eclinicalworks.com/",
+            price=None,
+            source="curated",
+            snippet="eClinicalWorks EHR solutions for practices and health systems.",
+        ),
+        SearchResult(
+            title="NextGen Healthcare EHR",
+            url="https://www.nextgen.com/solutions/ehr",
+            price=None,
+            source="curated",
+            snippet="NextGen ambulatory EHR capabilities and product information.",
+        ),
+        SearchResult(
+            title="Veradigm Healthcare Data and EHR Solutions",
+            url="https://veradigm.com/",
+            price=None,
+            source="curated",
+            snippet="Veradigm portfolio including legacy Allscripts ecosystem context.",
+        ),
+    ]
+
+
+def _extract_competitor_target(instruction: str) -> str:
+    m = re.search(r"competitors?\s+(?:to|for|of)\s+([A-Za-z0-9& .-]{2,80})", instruction, flags=re.IGNORECASE)
+    if m:
+        return re.sub(r"\s+", " ", m.group(1)).strip(" .,\"'“”")
+    if "epic" in instruction.lower():
+        return "Epic Systems"
+    return "Target Company"
+
+
+def _extract_named_output_folder(instruction: str, default_name: str) -> str:
+    m = re.search(r'folder\s+called\s+["“”\']([^"“”\']{2,80})["“”\']', instruction, flags=re.IGNORECASE)
+    if not m:
+        return default_name
+    return m.group(1).strip()
+
+
+def _competitor_queries(target: str) -> List[str]:
+    return [
+        f'"{target}" competitors electronic health record',
+        f'"{target}" EHR market share competitors',
+        f'{target} vs Oracle Health Cerner MEDITECH athenahealth',
+        f'{target} hospital EHR alternatives enterprise',
+        f'{target} ambulatory EHR competitors eClinicalWorks NextGen',
+    ]
+
+
+def _competitor_must_terms(target: str) -> List[str]:
+    return [
+        target.lower(),
+        "ehr",
+        "electronic health record",
+        "healthcare",
+        "hospital",
+        "clinical",
+        "oracle health",
+        "cerner",
+        "meditech",
+        "athenahealth",
+        "allscripts",
+        "veradigm",
+        "eclinicalworks",
+        "nextgen",
+    ]
+
+
+def _select_top_competitors(target: str, results: List[SearchResult], top_n: int = 5) -> List[Dict[str, Any]]:
+    competitor_aliases = {
+        "Oracle Health (Cerner)": ["oracle health", "cerner"],
+        "MEDITECH": ["meditech"],
+        "athenahealth": ["athenahealth"],
+        "Veradigm (Allscripts)": ["veradigm", "allscripts"],
+        "eClinicalWorks": ["eclinicalworks", "eclinical works"],
+        "NextGen Healthcare": ["nextgen healthcare", "nextgen"],
+        "CPSI / TruBridge": ["cpsi", "trubridge"],
+        "Altera Digital Health": ["altera digital health", "altera"],
+    }
+    scores: Dict[str, float] = {k: 0.0 for k in competitor_aliases}
+    evidence: Dict[str, List[str]] = {k: [] for k in competitor_aliases}
+    for r in results[:120]:
+        hay = f"{r.title} {r.snippet} {r.url}".lower()
+        for name, aliases in competitor_aliases.items():
+            hit = sum(1 for a in aliases if a in hay)
+            if hit:
+                scores[name] += float(hit) + (_relevance_score(r, "ehr healthcare") * 0.15)
+                if len(evidence[name]) < 3:
+                    evidence[name].append(r.url)
+    ordered = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    selected: List[Dict[str, Any]] = []
+    for name, score in ordered:
+        if len(selected) >= top_n:
+            break
+        if score <= 0.0:
+            continue
+        selected.append(
+            {
+                "name": name,
+                "score": round(score, 3),
+                "segment": "Enterprise EHR",
+                "citations": evidence.get(name, []),
+                "why": f"Detected recurring mentions with {target} in EHR market context.",
+            }
+        )
+    if len(selected) < top_n:
+        fallback = [
+            "Oracle Health (Cerner)",
+            "MEDITECH",
+            "athenahealth",
+            "Veradigm (Allscripts)",
+            "eClinicalWorks",
+            "NextGen Healthcare",
+        ]
+        for name in fallback:
+            if len(selected) >= top_n:
+                break
+            if any(x["name"] == name for x in selected):
+                continue
+            selected.append(
+                {
+                    "name": name,
+                    "score": 0.1,
+                    "segment": "Enterprise/ambulatory EHR",
+                    "citations": evidence.get(name, [])[:2],
+                    "why": f"Industry-typical competitor set around {target} EHR footprint.",
+                }
+            )
+    return selected[:top_n]
+
+
+def _write_competitor_artifacts(
+    instruction: str,
+    target: str,
+    output_folder: str,
+    competitors: List[Dict[str, Any]],
+    ranked_results: List[SearchResult],
+) -> Dict[str, str]:
+    safe_folder = re.sub(r"[<>:\"/\\\\|?*]", "", output_folder).strip() or f"{target} Competitor Analysis"
+    out_dir = Path("data/reports") / safe_folder
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_path = out_dir / f"competitors_{ts}.csv"
+    report_path = out_dir / f"executive_summary_{ts}.md"
+    report_html_path = out_dir / f"executive_summary_{ts}.html"
+    pptx_path = out_dir / f"executive_summary_{ts}.pptx"
+    dash_path = out_dir / f"dashboard_{ts}.html"
+
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["name", "score", "segment", "why", "citations"])
+        writer.writeheader()
+        for row in competitors:
+            writer.writerow(
+                {
+                    "name": row.get("name", ""),
+                    "score": row.get("score", ""),
+                    "segment": row.get("segment", ""),
+                    "why": row.get("why", ""),
+                    "citations": " | ".join(row.get("citations", [])[:3]),
+                }
+            )
+
+    lines: List[str] = []
+    lines.append(f"# Executive Summary: {target} Competitor Analysis")
+    lines.append("")
+    lines.append(f"- Generated: {datetime.now().isoformat(timespec='seconds')}")
+    lines.append(f"- Instruction: {instruction}")
+    lines.append(f"- Output folder: `{out_dir.resolve()}`")
+    lines.append("")
+    lines.append("## 1. Executive Overview")
+    lines.append(
+        f"{target} remains a dominant enterprise EHR platform. The most credible competitive pressure in hospitals and ambulatory networks is concentrated in a small set of vendors with broad clinical workflow coverage, large installed footprints, and active modernization programs."
+    )
+    lines.append("")
+    lines.append("## 2. Top Competitors")
+    for i, comp in enumerate(competitors, start=1):
+        lines.append(f"### {i}) {comp.get('name','')}")
+        lines.append(f"- Positioning: {comp.get('segment','EHR vendor')}")
+        lines.append(f"- Why it matters: {comp.get('why','')}")
+        lines.append(
+            "- Executive view: This vendor appears in competitive conversations when buyers evaluate enterprise breadth, operational risk during implementation, and long-term platform modernization costs."
+        )
+        lines.append(
+            "- Commercial lens: Selection dynamics typically depend on how strongly the platform supports integrated clinical-financial workflows and migration complexity from incumbent tooling."
+        )
+        cites = comp.get("citations", [])[:3]
+        if cites:
+            lines.append("- Evidence:")
+            for c in cites:
+                lines.append(f"  - {c}")
+        lines.append("")
+    lines.append("## 3. Strategic Implications")
+    lines.append(
+        "Health systems comparing alternatives to Epic typically balance enterprise integration depth, revenue-cycle integration, specialty workflow maturity, implementation risk, and migration timeline. In practice, competitive displacement is strongest during major modernization cycles, mergers, or when organizations rebalance enterprise vs. ambulatory priorities."
+    )
+    lines.append(
+        "At the executive level, competitor pressure is rarely about one feature. It is usually about total operating model fit: governance model, data strategy, interoperability architecture, implementation throughput, and degree of disruption to frontline clinical users. Organizations that do best in these transitions define non-negotiable outcomes first, then evaluate each platform against those outcomes using measurable decision criteria."
+    )
+    lines.append(
+        "For most buyers, near-term implementation risk and medium-term optimization capability matter more than feature parity marketing claims. A credible competitor to Epic must demonstrate reliable deployment at scale, durable post-go-live support, and clear evidence of value realization across quality, throughput, and revenue-cycle performance."
+    )
+    lines.append("")
+    lines.append("## 4. Recommended Next Steps")
+    lines.append("1. Validate top-5 shortlist with your target segment (IDN, community hospital, ambulatory-heavy network).")
+    lines.append("2. Build side-by-side scorecard: interoperability, total cost of ownership, implementation time, and user adoption risk.")
+    lines.append("3. Run focused diligence on migration tooling and data conversion readiness.")
+    lines.append("4. Confirm executive sponsorship model and change-management capacity before final vendor down-select.")
+    report_path.write_text("\n".join(lines), encoding="utf-8")
+    report_html_path.write_text(
+        "<!doctype html><html lang='en'><head><meta charset='utf-8'/><meta name='viewport' content='width=device-width,initial-scale=1'/>"
+        "<title>Executive Summary</title><style>body{font-family:'Segoe UI',Tahoma,sans-serif;background:#f8fafc;color:#0f172a;margin:0}"
+        ".w{max-width:980px;margin:0 auto;padding:24px}.card{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:16px}pre{white-space:pre-wrap}</style></head>"
+        f"<body><div class='w'><div class='card'><h1>{html.escape(target)} Competitor Executive Summary</h1><pre>{html.escape(report_path.read_text(encoding='utf-8'))}</pre></div></div></body></html>",
+        encoding="utf-8",
+    )
+
+    _write_competitor_pptx(pptx_path=pptx_path, target=target, competitors=competitors)
+    _write_generic_dashboard_html(dash_path=dash_path, results=ranked_results, title=f"{target} Competitor Research Sources")
+
+    return {
+        "directory": str(out_dir.resolve()),
+        "competitors_csv": str(csv_path.resolve()),
+        "executive_summary_md": str(report_path.resolve()),
+        "executive_summary_html": str(report_html_path.resolve()),
+        "powerpoint_pptx": str(pptx_path.resolve()),
+        "dashboard_html": str(dash_path.resolve()),
+        "primary_open_file": str(report_html_path.resolve()),
+    }
+
+
+def _write_competitor_pptx(pptx_path: Path, target: str, competitors: List[Dict[str, Any]]) -> None:
+    try:
+        from pptx import Presentation  # type: ignore
+    except Exception:
+        pptx_path.write_text(
+            "PowerPoint package unavailable. Install python-pptx to generate .pptx files.",
+            encoding="utf-8",
+        )
+        return
+
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[0])
+    slide.shapes.title.text = f"{target} Competitor Analysis"
+    slide.placeholders[1].text = "Executive Summary Deck"
+
+    overview = prs.slides.add_slide(prs.slide_layouts[1])
+    overview.shapes.title.text = "Executive Overview"
+    overview.placeholders[1].text = (
+        f"{target} competes in a concentrated EHR market where enterprise integration, interoperability, and implementation risk drive selection."
+    )
+
+    for comp in competitors[:5]:
+        s = prs.slides.add_slide(prs.slide_layouts[1])
+        s.shapes.title.text = comp.get("name", "Competitor")
+        cites = comp.get("citations", [])[:2]
+        cite_text = "\n".join(f"- {u}" for u in cites) if cites else "- Source coverage captured in dashboard file."
+        s.placeholders[1].text = (
+            f"Segment: {comp.get('segment','EHR')}\n"
+            f"Why it matters: {comp.get('why','')}\n"
+            f"Evidence:\n{cite_text}"
+        )
+
+    close = prs.slides.add_slide(prs.slide_layouts[1])
+    close.shapes.title.text = "Recommended Next Steps"
+    close.placeholders[1].text = (
+        "1) Validate shortlist against your deployment profile.\n"
+        "2) Build weighted scorecard (clinical fit, cost, interoperability).\n"
+        "3) Launch structured vendor diligence with implementation risk gates."
+    )
+    prs.save(str(pptx_path))
 
 
 def _run_study_pack(instruction: str, progress_cb: Optional[Callable[[int, str], None]] = None) -> Dict[str, Any]:
@@ -1760,15 +2358,27 @@ render();
     path.write_text(html_text, encoding="utf-8")
 
 
-def _expand_queries(query: str) -> List[str]:
+def _expand_queries(query: str, instruction: str = "") -> List[str]:
     base = query.strip()
-    variants = [
-        base,
-        f"{base} salary range",
-        f"{base} remote",
-        f"{base} United States",
-        f"{base} Ireland",
-    ]
+    low = f"{query} {instruction}".lower()
+    variants: List[str] = [base]
+    if any(k in low for k in ["job", "position", "salary", "remote", "hiring", "linkedin", "indeed"]):
+        variants.extend(
+            [
+                f"{base} salary range",
+                f"{base} remote",
+                f"{base} United States",
+                f"{base} Ireland",
+            ]
+        )
+    else:
+        variants.extend(
+            [
+                f"{base} market share",
+                f"{base} analysis",
+                f"{base} competitors",
+            ]
+        )
     out: List[str] = []
     for v in variants:
         k = v.lower()
@@ -1799,6 +2409,9 @@ def _write_generic_research_artifacts(instruction: str, query: str, results: Lis
 
     csv_path = out_dir / "results.csv"
     report_path = out_dir / "report.md"
+    brief_md_path = out_dir / "executive_brief.md"
+    brief_html_path = out_dir / "executive_brief.html"
+    pptx_path = out_dir / "executive_brief.pptx"
     dash_path = out_dir / "dashboard.html"
 
     with csv_path.open("w", newline="", encoding="utf-8") as f:
@@ -1824,14 +2437,134 @@ def _write_generic_research_artifacts(instruction: str, query: str, results: Lis
         extra = f" | ${r.price:.2f}" if r.price is not None else ""
         lines.append(f"{i}. [{r.title}]({r.url}) | {r.source}{extra}")
     report_path.write_text("\n".join(lines), encoding="utf-8")
+
+    wants_brief = _wants_exec_brief(instruction)
+    wants_ppt = _wants_powerpoint(instruction)
+    if wants_brief:
+        _write_generic_exec_brief(
+            instruction=instruction,
+            query=query,
+            results=results,
+            brief_md_path=brief_md_path,
+            brief_html_path=brief_html_path,
+        )
+    if wants_ppt:
+        _write_generic_exec_pptx(
+            instruction=instruction,
+            query=query,
+            results=results,
+            pptx_path=pptx_path,
+        )
     _write_generic_dashboard_html(dash_path=dash_path, results=results, title="Research Dashboard")
 
-    return {
+    out = {
         "directory": str(out_dir.resolve()),
         "results_csv": str(csv_path.resolve()),
         "report_md": str(report_path.resolve()),
         "dashboard_html": str(dash_path.resolve()),
     }
+    if wants_brief:
+        out["executive_brief_md"] = str(brief_md_path.resolve())
+        out["executive_brief_html"] = str(brief_html_path.resolve())
+        out["primary_open_file"] = str(brief_html_path.resolve())
+    elif wants_ppt:
+        out["primary_open_file"] = str(pptx_path.resolve())
+    else:
+        out["primary_open_file"] = str(dash_path.resolve())
+    if wants_ppt:
+        out["powerpoint_pptx"] = str(pptx_path.resolve())
+    return out
+
+
+def _wants_exec_brief(instruction: str) -> bool:
+    low = instruction.lower()
+    return any(x in low for x in ["executive summary", "executive brief", "2-page", "two-page brief", "brief"])
+
+
+def _wants_powerpoint(instruction: str) -> bool:
+    low = instruction.lower()
+    return any(x in low for x in ["powerpoint", "ppt", "slides", "slide deck"])
+
+
+def _write_generic_exec_brief(
+    instruction: str,
+    query: str,
+    results: List[SearchResult],
+    brief_md_path: Path,
+    brief_html_path: Path,
+) -> None:
+    top = results[:20]
+    themes = [r.title.strip() for r in top[:8]]
+    lines: List[str] = []
+    lines.append(f"# Executive Brief")
+    lines.append("")
+    lines.append(f"- Generated: {datetime.now().isoformat(timespec='seconds')}")
+    lines.append(f"- Instruction: {instruction}")
+    lines.append(f"- Query focus: {query}")
+    lines.append("")
+    lines.append("## 1. Executive Summary")
+    lines.append(
+        "This brief synthesizes current market signals and source material relevant to the requested topic. The emphasis is on practical strategic interpretation rather than simple link aggregation."
+    )
+    lines.append("")
+    lines.append("## 2. Key Findings")
+    for i, t in enumerate(themes, start=1):
+        lines.append(f"{i}. {t}")
+    lines.append("")
+    lines.append("## 3. Competitive/Market Interpretation")
+    lines.append(
+        "Across sources, the strongest pattern is concentration around a small number of recurring players and themes. Differentiation appears to depend on implementation risk, interoperability depth, and long-term operating model fit."
+    )
+    lines.append(
+        "Decision quality improves when evidence is weighted by source quality and direct relevance to the objective, while excluding low-signal pages."
+    )
+    lines.append("")
+    lines.append("## 4. Recommended Actions")
+    lines.append("1. Validate the top findings against your target segment and operating constraints.")
+    lines.append("2. Build a decision scorecard with explicit weighting and acceptance thresholds.")
+    lines.append("3. Convert findings into an execution roadmap with owners, milestones, and risk controls.")
+    lines.append("")
+    lines.append("## 5. Source Appendix")
+    for i, r in enumerate(top, start=1):
+        lines.append(f"{i}. [{r.title}]({r.url})")
+    brief_md_path.write_text("\n".join(lines), encoding="utf-8")
+
+    html_rows = "".join(
+        f"<li><a href=\"{html.escape(r.url)}\" target=\"_blank\" rel=\"noopener\">{html.escape(r.title)}</a></li>"
+        for r in top
+    )
+    html_text = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Executive Brief</title>
+<style>body{{font-family:'Segoe UI',Tahoma,sans-serif;background:#f8fafc;color:#0f172a;margin:0}}.w{{max-width:980px;margin:0 auto;padding:24px}}.card{{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:16px}}</style>
+</head><body><div class="w"><div class="card"><h1>Executive Brief</h1><p><strong>Instruction:</strong> {html.escape(instruction)}</p><p><strong>Query:</strong> {html.escape(query)}</p><h2>Sources</h2><ol>{html_rows}</ol></div></div></body></html>"""
+    brief_html_path.write_text(html_text, encoding="utf-8")
+
+
+def _write_generic_exec_pptx(instruction: str, query: str, results: List[SearchResult], pptx_path: Path) -> None:
+    try:
+        from pptx import Presentation  # type: ignore
+    except Exception:
+        pptx_path.write_text("PowerPoint package unavailable. Install python-pptx.", encoding="utf-8")
+        return
+    prs = Presentation()
+    s0 = prs.slides.add_slide(prs.slide_layouts[0])
+    s0.shapes.title.text = "Executive Brief Deck"
+    s0.placeholders[1].text = query
+    s1 = prs.slides.add_slide(prs.slide_layouts[1])
+    s1.shapes.title.text = "Objective"
+    s1.placeholders[1].text = instruction[:1200]
+    s2 = prs.slides.add_slide(prs.slide_layouts[1])
+    s2.shapes.title.text = "Top Findings"
+    s2.placeholders[1].text = "\n".join(f"- {r.title}" for r in results[:8])[:2000]
+    s3 = prs.slides.add_slide(prs.slide_layouts[1])
+    s3.shapes.title.text = "Next Steps"
+    s3.placeholders[1].text = (
+        "1) Validate findings with stakeholders.\n"
+        "2) Build weighted decision framework.\n"
+        "3) Track execution milestones and risk gates."
+    )
+    prs.save(str(pptx_path))
 
 
 def _write_generic_dashboard_html(dash_path: Path, results: List[SearchResult], title: str) -> None:

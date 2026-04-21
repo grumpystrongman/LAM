@@ -23,6 +23,8 @@ abac:
     - vpn
 
 policies:
+  competitor_analysis:
+    min_live_non_curated_citations: 3
   os_action_allowlist:
     - click
     - type

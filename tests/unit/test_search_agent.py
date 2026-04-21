@@ -64,9 +64,10 @@ class TestSearchAgent(unittest.TestCase):
     def test_job_research_flow(self, mock_run) -> None:
         mock_run.return_value = {
             "ok": True,
+            "mode": "job_market_research",
             "query": "VP Data and AI",
             "results_count": 3,
-            "artifacts": {"dashboard_html": "C:\\temp\\dash.html"},
+            "artifacts": {"dashboard_html": "C:\\temp\\dash.html", "jobs_csv": "C:\\temp\\jobs.csv"},
             "summary": {"total": 3},
             "results": [{"title": "VP Data and AI", "url": "https://example.com"}],
             "opened_url": "file:///C:/temp/dash.html",
@@ -83,6 +84,75 @@ class TestSearchAgent(unittest.TestCase):
         self.assertIn("verification", result)
         self.assertIn("report", result)
         self.assertIn("undo_plan", result)
+
+    @patch("lam.interface.search_agent._run_competitor_analysis")
+    def test_competitor_analysis_flow(self, mock_run) -> None:
+        mock_run.return_value = {
+            "ok": True,
+            "mode": "competitor_analysis",
+            "query": "Epic Systems EHR competitors",
+            "results_count": 12,
+            "artifacts": {
+                "executive_summary_md": "C:\\temp\\executive_summary.md",
+                "powerpoint_pptx": "C:\\temp\\executive_summary.pptx",
+                "dashboard_html": "C:\\temp\\dashboard.html",
+            },
+            "summary": {
+                "target": "Epic Systems",
+                "top_competitors": ["Oracle Health (Cerner)"],
+                "live_non_curated_citations": 4,
+                "required_live_non_curated_citations": 3,
+            },
+            "results": [{"title": "Oracle Health vs Epic", "url": "https://example.com"}],
+            "opened_url": "file:///C:/temp/dashboard.html",
+            "canvas": {"title": "Epic Systems Competitor Analysis Ready", "subtitle": "Top 5", "cards": []},
+        }
+        result = execute_instruction(
+            "Research the top 5 competitors to Epic Systems, build a 2-page executive summary, create a PowerPoint, and save everything to a folder called Epic Competitor Analysis.",
+            control_granted=True,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["mode"], "autonomous_plan_execute")
+        self.assertIn("executive_summary_md", result["artifacts"])
+        self.assertIn("powerpoint_pptx", result["artifacts"])
+        self.assertIn("verification", result)
+
+    @patch("lam.interface.search_agent._run_generic_research")
+    @patch("lam.interface.search_agent._run_competitor_analysis")
+    def test_competitor_analysis_strict_citation_gate(self, mock_comp, mock_generic) -> None:
+        mock_comp.return_value = {
+            "ok": False,
+            "mode": "competitor_analysis",
+            "query": "Epic Systems EHR competitors",
+            "results_count": 2,
+            "results": [],
+            "artifacts": {},
+            "summary": {
+                "error": "insufficient_live_non_curated_citations",
+                "live_non_curated_citations": 0,
+                "required_live_non_curated_citations": 3,
+            },
+            "source_status": {},
+            "opened_url": "",
+            "canvas": {"title": "Run Blocked", "subtitle": "Strict citation gate", "cards": []},
+        }
+        mock_generic.return_value = {
+            "ok": True,
+            "query": "fallback generic query",
+            "results_count": 20,
+            "results": [{"title": "x", "url": "https://example.com", "source": "duckduckgo"}],
+            "artifacts": {"report_md": "C:\\temp\\report.md"},
+            "summary": {"total": 20},
+            "source_status": {},
+            "opened_url": "file:///C:/temp/report.md",
+            "canvas": {"title": "Generic Result", "subtitle": "fallback", "cards": []},
+        }
+        result = execute_instruction(
+            "Research the top 5 competitors to Epic Systems and build executive summary and PowerPoint",
+            control_granted=True,
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["summary"].get("error"), "strict_competitor_validation_failed")
 
     def test_destructive_instruction_requires_confirmation(self) -> None:
         result = execute_instruction(

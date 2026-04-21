@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any, Dict, List
 from urllib.parse import parse_qs, urlparse
 
+import yaml
+
 from lam.adapters.uia_adapter import UIAAdapter
 from lam.interface.ai_backend import AI_BACKENDS, normalize_backend
 from lam.interface.app_launcher import list_installed_apps
@@ -33,6 +35,7 @@ class UiState:
     step_mode: bool = False
     ai_backend: str = "deterministic-local"
     compression_mode: str = "normal"
+    min_live_non_curated_citations: int = 3
     user_id: str = field(default_factory=current_user)
     saved_automations: Dict[str, str] = field(default_factory=dict)
     history: List[Dict[str, Any]] = field(default_factory=list)
@@ -58,6 +61,7 @@ class UiState:
                 "step_mode": self.step_mode,
                 "ai_backend": self.ai_backend,
                 "compression_mode": self.compression_mode,
+                "min_live_non_curated_citations": self.min_live_non_curated_citations,
                 "ai_backends": AI_BACKENDS,
                 "user_id": self.user_id,
                 "saved_automations": dict(self.saved_automations),
@@ -139,6 +143,9 @@ HTML_PAGE = """<!doctype html>
           <option value="normal" selected>compression: normal</option>
           <option value="strict">compression: strict</option>
         </select>
+        <label class="small">min live cites:
+          <input id="minLiveCites" type="number" min="1" max="20" value="3" style="width:80px" onchange="setMinLiveCites(this.value)"/>
+        </label>
       </div>
       <div class="row">
         <input id="instruction" class="wide" type="text" placeholder="open chatgpt app then click New chat then type &quot;hello&quot; then press enter"/>
@@ -150,6 +157,7 @@ HTML_PAGE = """<!doctype html>
         <button onclick="saveAutomation()">Save</button>
         <button onclick="runAutomation()">Run Saved</button>
         <button onclick="exportHistory()">Export History</button>
+        <button class="warn" onclick="clearHistory()">Clear History</button>
       </div>
       <div class="row">
         <button onclick="useTemplate('open chatgpt app then click New chat then type \\'Daily summary\\' then press enter')">Template: ChatGPT Daily</button>
@@ -242,6 +250,7 @@ HTML_PAGE = """<!doctype html>
       <div class="summary-head" id="summaryHead">Waiting for your instruction</div>
       <div class="summary-sub" id="summarySub">Use Preview or Run to start.</div>
       <div class="summary-grid" id="summaryCards"></div>
+      <div class="artifact-list" id="artifactList"></div>
       <div class="progress-log" id="activityLog">No activity yet.</div>
       <details id="detailWrap" style="margin-top:8px;">
         <summary class="small">Raw JSON (advanced)</summary>
@@ -286,6 +295,14 @@ function renderSummary(r){
   (r?.canvas?.cards||[]).slice(0,4).forEach(c=>cards.push({t:c.title||"Item",m:`${c.price||""} ${c.source?`• ${c.source}`:""}`.trim()}));
   if(cards.length===0){ cards.push({t:"Status",m:ok?"Completed":"Needs input"}); }
   document.getElementById("summaryCards").innerHTML = cards.slice(0,6).map(c=>`<div class="summary-card"><div class="t">${escapeHtml(c.t||"")}</div><div class="m">${escapeHtml(c.m||"")}</div></div>`).join("");
+  const artifacts = r?.artifacts || {};
+  const entries = Object.entries(artifacts).filter(([k,v])=>typeof v==="string" && v.trim().length>0);
+  if(entries.length){
+    const links = entries.map(([k,v])=>`<div><a href="${escapeHtml(toUri(v))}" target="_blank" rel="noopener">${escapeHtml(k)}</a></div>`).join("");
+    document.getElementById("artifactList").innerHTML = `<div class="small" style="margin-top:8px">Artifacts</div>${links}`;
+  } else {
+    document.getElementById("artifactList").innerHTML = "";
+  }
 
   const activity=[];
   if(Array.isArray(r?.decision_log)){ r.decision_log.forEach(x=>activity.push(`• ${x}`)); }
@@ -295,6 +312,13 @@ function renderSummary(r){
   document.getElementById("activityLog").innerText = activity.join("\\n");
 }
 function escapeHtml(s){ return String(s||"").replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function toUri(path){
+  const p = String(path||"");
+  if(p.startsWith("http://") || p.startsWith("https://") || p.startsWith("file:///")) return p;
+  const normalized = p.replace(/\\\\/g,"/");
+  if(/^[A-Za-z]:\\//.test(normalized)){ return `file:///${normalized}`; }
+  return p;
+}
 async function refreshState(){
   const s=await fetch("/api/state").then(r=>r.json());
   let t=s.control_granted?"Control: granted":"Control: not granted";
@@ -305,6 +329,7 @@ async function refreshState(){
   document.getElementById("stepMode").checked=!!s.step_mode;
   document.getElementById("aiBackend").value=s.ai_backend||"deterministic-local";
   document.getElementById("compressionMode").value=s.compression_mode||"normal";
+  document.getElementById("minLiveCites").value=String(s.min_live_non_curated_citations||3);
   const teach=s.teach||{};
   document.getElementById("teachState").innerText=`${teach.active?'Recording':'Idle'} • events: ${teach.event_count||0}${s.global_teach_active?' • global hooks active':''}`;
   const jobs=(s.schedules||[]).length, recent=(s.schedule_history||[]).length;
@@ -328,9 +353,10 @@ async function rerunHistory(revIndex){
   const item=items[revIndex];
   if(!item || !item.instruction){ return; }
   const ai_backend=document.getElementById("aiBackend").value;
-  const r=await fetch("/api/instruct_async",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({instruction:item.instruction,ai_backend})}).then(r=>r.json());
+  const min_live_non_curated_citations=parseInt(document.getElementById("minLiveCites").value||"3",10);
+  const r=await fetch("/api/instruct_async",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({instruction:item.instruction,ai_backend,min_live_non_curated_citations})}).then(r=>r.json());
   if(!r.ok){ showResponse(r); await refreshState(); return; }
-  startTaskPolling(r.task_id, { instruction:item.instruction, ai_backend, confirm_risky:false });
+  startTaskPolling(r.task_id, { instruction:item.instruction, ai_backend, min_live_non_curated_citations, confirm_risky:false });
 }
 async function grantControl(){
   const r=await fetch("/api/control",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({accept:true})}).then(r=>r.json());
@@ -345,24 +371,36 @@ async function revokeControl(){
 async function setStepMode(v){ await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({step_mode:!!v})}); await refreshState(); }
 async function setAiBackend(v){ await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ai_backend:v})}); await refreshState(); }
 async function setCompressionMode(v){ await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({compression_mode:v})}); await refreshState(); }
+async function setMinLiveCites(v){ const n=Math.max(1,Math.min(20,parseInt(v||"3",10)||3)); await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({min_live_non_curated_citations:n})}); await refreshState(); }
 async function resumeAfterLogin(){ const r=await fetch("/api/session/resume",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(r=>r.json()); handleResult(r); await refreshState(); }
 async function runInstruction(){
   const instruction=document.getElementById("instruction").value.trim(); if(!instruction) return;
   const ai_backend=document.getElementById("aiBackend").value;
-  const r=await fetch("/api/instruct_async",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({instruction,ai_backend})}).then(r=>r.json());
+  const min_live_non_curated_citations=parseInt(document.getElementById("minLiveCites").value||"3",10);
+  const r=await fetch("/api/instruct_async",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({instruction,ai_backend,min_live_non_curated_citations})}).then(r=>r.json());
   if(!r.ok){ showResponse(r); await refreshState(); return; }
-  startTaskPolling(r.task_id, { instruction, ai_backend, confirm_risky:false });
+  startTaskPolling(r.task_id, { instruction, ai_backend, min_live_non_curated_citations, confirm_risky:false });
 }
 async function previewInstruction(){ const instruction=document.getElementById("instruction").value.trim(); if(!instruction)return; const r=await fetch("/api/preview",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({instruction})}).then(r=>r.json()); showResponse(r); await refreshState(); }
 async function saveAutomation(){ const name=document.getElementById("automationName").value.trim(); const instruction=document.getElementById("instruction").value.trim(); const r=await fetch("/api/automation/save",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name,instruction})}).then(r=>r.json()); showResponse(r); await refreshState(); }
 async function runAutomation(){
   const name=document.getElementById("automationName").value.trim();
   const ai_backend=document.getElementById("aiBackend").value;
-  const r=await fetch("/api/automation/run_async",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name,ai_backend})}).then(r=>r.json());
+  const min_live_non_curated_citations=parseInt(document.getElementById("minLiveCites").value||"3",10);
+  const r=await fetch("/api/automation/run_async",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name,ai_backend,min_live_non_curated_citations})}).then(r=>r.json());
   if(!r.ok){ showResponse(r); await refreshState(); return; }
-  startTaskPolling(r.task_id, { instruction:r.instruction||"", ai_backend, confirm_risky:false });
+  startTaskPolling(r.task_id, { instruction:r.instruction||"", ai_backend, min_live_non_curated_citations, confirm_risky:false });
 }
 async function exportHistory(){ const txt=await fetch("/api/history/export").then(r=>r.text()); const blob=new Blob([txt],{type:"application/json"}); const a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download="lam-history-export.json"; a.click(); }
+async function clearHistory(){
+  if(!confirm("Clear local and server history?")) return;
+  await fetch("/api/history/clear",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});
+  ui.history = [];
+  persistHistory();
+  renderHistory();
+  showResponse({ok:true,mode:"history",canvas:{title:"History Cleared",subtitle:"Previous runs removed from this interface.",cards:[]}})
+  await refreshState();
+}
 async function searchApps(){ const q=document.getElementById("appSearch").value.trim(); const r=await fetch("/api/apps/search",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({query:q})}).then(r=>r.json()); showResponse(r); }
 async function vaultSave(){
   const payload={
@@ -531,8 +569,20 @@ class _Handler(BaseHTTPRequestHandler):
                     mode = self.state.compression_mode
                 self.state.compression_mode = mode
                 self.state.recorder.set_compression_mode(self.state.compression_mode)
+                min_live = payload.get("min_live_non_curated_citations", self.state.min_live_non_curated_citations)
+                try:
+                    self.state.min_live_non_curated_citations = max(1, min(20, int(min_live)))
+                except Exception:
+                    pass
                 _save_user_defaults_locked(self.state)
             self._send_json(200, self.state.snapshot())
+            return
+
+        if self.path == "/api/history/clear":
+            with self.state.lock:
+                self.state.history = []
+                _save_history(self.state.history)
+            self._send_json(200, {"ok": True, "cleared": True})
             return
 
         if self.path == "/api/apps/search":
@@ -720,6 +770,7 @@ class _Handler(BaseHTTPRequestHandler):
             name = str(payload.get("name", "")).strip()
             instruction = str(payload.get("instruction", "")).strip()
             ai_backend = normalize_backend(str(payload.get("ai_backend", "")))
+            min_live = int(payload.get("min_live_non_curated_citations", 3))
             if not instruction:
                 with self.state.lock:
                     instruction = self.state.saved_automations.get(name, "")
@@ -727,6 +778,7 @@ class _Handler(BaseHTTPRequestHandler):
                 "instruction": instruction,
                 "confirm_risky": bool(payload.get("confirm_risky", False)),
                 "ai_backend": ai_backend,
+                "min_live_non_curated_citations": min_live,
             }
             self.path = "/api/instruct"
 
@@ -734,6 +786,7 @@ class _Handler(BaseHTTPRequestHandler):
             name = str(payload.get("name", "")).strip()
             instruction = str(payload.get("instruction", "")).strip()
             ai_backend = normalize_backend(str(payload.get("ai_backend", "")))
+            min_live = int(payload.get("min_live_non_curated_citations", 3))
             with self.state.lock:
                 if not instruction:
                     instruction = self.state.saved_automations.get(name, "")
@@ -745,6 +798,7 @@ class _Handler(BaseHTTPRequestHandler):
                 instruction=instruction,
                 confirm_risky=bool(payload.get("confirm_risky", False)),
                 ai_backend=ai_backend,
+                min_live_non_curated_citations=min_live,
             )
             self._send_json(200, {"ok": True, "task_id": task_id, "instruction": instruction})
             return
@@ -804,11 +858,13 @@ class _Handler(BaseHTTPRequestHandler):
             instruction = str(payload.get("instruction", "")).strip()
             confirm_risky = bool(payload.get("confirm_risky", False))
             ai_backend = normalize_backend(str(payload.get("ai_backend", "")))
+            min_live = int(payload.get("min_live_non_curated_citations", 3))
             task_id = _start_instruction_task(
                 state=self.state,
                 instruction=instruction,
                 confirm_risky=confirm_risky,
                 ai_backend=ai_backend,
+                min_live_non_curated_citations=min_live,
             )
             self._send_json(200, {"ok": True, "task_id": task_id})
             return
@@ -821,6 +877,7 @@ class _Handler(BaseHTTPRequestHandler):
                 paused = self.state.paused_for_credentials
                 step_mode = self.state.step_mode
                 ai_backend = normalize_backend(str(payload.get("ai_backend", self.state.ai_backend)))
+                min_live = max(1, min(20, int(payload.get("min_live_non_curated_citations", self.state.min_live_non_curated_citations))))
             if paused:
                 self._send_json(409, {"ok": False, "error": "Session paused for credential entry. Click Resume."})
                 return
@@ -830,6 +887,7 @@ class _Handler(BaseHTTPRequestHandler):
                 step_mode=step_mode,
                 confirm_risky=confirm_risky,
                 ai_backend=ai_backend,
+                min_live_non_curated_citations=min_live,
             )
             if result.get("ok"):
                 with self.state.lock:
@@ -885,6 +943,7 @@ def run_ui_server(host: str = "127.0.0.1", port: int = 8795, open_browser: bool 
             granted = state.control_granted
             step_mode = state.step_mode
             ai_backend = state.ai_backend
+            min_live = state.min_live_non_curated_citations
         if not granted:
             return {"ok": False, "error": "Control not granted; scheduled run skipped."}
         if not instruction:
@@ -895,6 +954,7 @@ def run_ui_server(host: str = "127.0.0.1", port: int = 8795, open_browser: bool 
             step_mode=step_mode,
             confirm_risky=True,
             ai_backend=ai_backend,
+            min_live_non_curated_citations=min_live,
         )
         if result.get("ok"):
             with state.lock:
@@ -979,12 +1039,19 @@ def _apply_user_defaults(state: UiState) -> None:
     step_mode = bool(defaults.get("step_mode", state.step_mode))
     ai_backend = normalize_backend(str(defaults.get("ai_backend", state.ai_backend)))
     compression_mode = str(defaults.get("compression_mode", state.compression_mode)).strip().lower()
+    policy_default = _load_policy_min_live_non_curated_citations()
+    min_live = defaults.get("min_live_non_curated_citations", policy_default)
+    try:
+        min_live_val = max(1, min(20, int(min_live)))
+    except Exception:
+        min_live_val = policy_default
     if compression_mode not in {"aggressive", "normal", "strict"}:
         compression_mode = "normal"
     with state.lock:
         state.step_mode = step_mode
         state.ai_backend = ai_backend
         state.compression_mode = compression_mode
+        state.min_live_non_curated_citations = min_live_val
         state.recorder.set_compression_mode(compression_mode)
 
 
@@ -994,12 +1061,31 @@ def _save_user_defaults_locked(state: UiState) -> None:
             "step_mode": state.step_mode,
             "ai_backend": state.ai_backend,
             "compression_mode": state.compression_mode,
+            "min_live_non_curated_citations": state.min_live_non_curated_citations,
         },
         user=state.user_id,
     )
 
 
-def _start_instruction_task(state: UiState, instruction: str, confirm_risky: bool, ai_backend: str) -> str:
+def _load_policy_min_live_non_curated_citations(default_value: int = 3) -> int:
+    policy_path = Path("config/policy.yaml")
+    if not policy_path.exists():
+        return default_value
+    try:
+        raw = yaml.safe_load(policy_path.read_text(encoding="utf-8")) or {}
+        value = (((raw.get("policies", {}) or {}).get("competitor_analysis", {}) or {}).get("min_live_non_curated_citations", default_value))
+        return max(1, min(20, int(value)))
+    except Exception:
+        return default_value
+
+
+def _start_instruction_task(
+    state: UiState,
+    instruction: str,
+    confirm_risky: bool,
+    ai_backend: str,
+    min_live_non_curated_citations: int = 3,
+) -> str:
     task_id = uuid.uuid4().hex
     now = time.time()
     with state.lock:
@@ -1034,6 +1120,7 @@ def _start_instruction_task(state: UiState, instruction: str, confirm_risky: boo
             paused = state.paused_for_credentials
             step_mode = state.step_mode
             backend = normalize_backend(str(ai_backend or state.ai_backend))
+            min_live = max(1, min(20, int(min_live_non_curated_citations or state.min_live_non_curated_citations)))
         if paused:
             with state.lock:
                 task = state.tasks.get(task_id, {})
@@ -1054,6 +1141,7 @@ def _start_instruction_task(state: UiState, instruction: str, confirm_risky: boo
                 step_mode=step_mode,
                 confirm_risky=confirm_risky,
                 ai_backend=backend,
+                min_live_non_curated_citations=min_live,
                 progress_cb=_progress,
             )
             with state.lock:
