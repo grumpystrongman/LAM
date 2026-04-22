@@ -10,6 +10,7 @@ requires-python = ">=3.10"
 dependencies = [
   "PyYAML>=6.0",
   "jsonschema>=4.23.0",
+  "playwright>=1.58.0",
 ]
 
 [project.scripts]

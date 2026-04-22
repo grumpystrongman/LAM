@@ -4,9 +4,13 @@ import json
 import csv
 import html
 import hashlib
+import os
+import shutil
 import statistics
+import subprocess
 import re
 import time
+import uuid
 import urllib.parse
 import urllib.request
 import webbrowser
@@ -14,7 +18,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 
 from lam.interface.ai_backend import backend_metadata, normalize_backend
 from lam.interface.app_launcher import normalize_app_name, open_installed_app
@@ -22,6 +26,7 @@ from lam.interface.app_learner import get_guidance
 from lam.interface.desktop_sequence import assess_risk, build_plan, execute_plan
 from lam.interface.local_vector_store import LocalVectorStore
 from lam.interface.operator_contract import attach_operator_contract
+from lam.interface.password_vault import LocalPasswordVault
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 MIN_LIVE_NON_CURATED_CITATIONS = 3
@@ -38,6 +43,24 @@ DESTRUCTIVE_ACTION_KEYWORDS = {
     "purchase",
     "buy now",
     "submit payment",
+}
+
+COMMUNICATION_SOCIAL_KEYWORDS = {
+    "whatsapp",
+    "telegram",
+    "messenger",
+    "discord",
+    "slack",
+    "chat",
+    "dm",
+    "social media",
+    "instagram",
+    "facebook",
+    "linkedin",
+    "x.com",
+    "twitter",
+    "tiktok",
+    "reddit",
 }
 
 
@@ -73,6 +96,21 @@ class StudyItem:
     source_url: str = ""
     evidence: str = ""
     image_path: str = ""
+
+
+@dataclass(slots=True)
+class EmailActionItem:
+    message_id: str
+    sender: str
+    subject: str
+    received_at: str
+    snippet: str
+    requires_action: bool
+    reason: str
+    draft_created: bool
+
+
+_EMAIL_AUTH_SESSIONS: Dict[str, Dict[str, Any]] = {}
 
 
 def _fetch_text(url: str) -> str:
@@ -295,6 +333,227 @@ def _detect_ambiguities(instruction: str, plan_steps: List[Dict[str, Any]]) -> L
     return questions
 
 
+def _classify_explicit_route(instruction: str) -> str:
+    low = instruction.lower()
+    if _is_email_triage_intent(instruction) or _is_competitor_analysis_intent(instruction) or _is_study_pack_intent(instruction) or _is_job_research_intent(instruction):
+        return ""
+    asks_chat_action = any(x in low for x in ["respond", "reply", "message", "post", "send"]) and any(
+        x in low for x in ["chat", "dm", "thread", "comment", "message"]
+    )
+    asks_social_or_comms = any(token in low for token in COMMUNICATION_SOCIAL_KEYWORDS)
+    if asks_chat_action or asks_social_or_comms:
+        return "desktop_sequence"
+
+    asks_document = any(x in low for x in ["write document", "write a document", "document", "doc", "memo", "brief"])
+    asks_powerpoint = any(x in low for x in ["powerpoint", "ppt", "slide deck", "slides"])
+    asks_visuals = any(x in low for x in ["create visuals", "visual", "diagram", "infographic", "poster"])
+    if asks_document or asks_powerpoint or asks_visuals:
+        return "artifact_generation"
+    return ""
+
+
+def _requested_outputs(instruction: str) -> Set[str]:
+    low = instruction.lower()
+    requested: Set[str] = set()
+    if any(x in low for x in ["spreadsheet", "csv", "task list"]):
+        requested.add("spreadsheet")
+    if any(x in low for x in ["report", "document", "doc", "memo", "brief"]):
+        requested.add("document")
+    if "executive summary" in low:
+        requested.add("executive_summary")
+    if any(x in low for x in ["powerpoint", "ppt", "slides", "slide deck"]):
+        requested.add("powerpoint")
+    if any(x in low for x in ["dashboard", "html dashboard"]):
+        requested.add("dashboard")
+    if any(x in low for x in ["visual", "visuals", "diagram", "infographic"]):
+        requested.add("visual")
+    if any(x in low for x in ["draft reply", "draft replies", "reply", "respond", "chat response"]):
+        requested.add("chat_response")
+    return requested
+
+
+def _plan_represented_outputs(plan: Dict[str, Any], plan_steps: List[Dict[str, Any]]) -> Set[str]:
+    represented: Set[str] = set()
+    deliverables = [str(x).lower() for x in (plan.get("deliverables") or [])]
+    deliverable_map = {
+        "spreadsheet": "spreadsheet",
+        "csv": "spreadsheet",
+        "report": "document",
+        "document": "document",
+        "executive_summary": "executive_summary",
+        "powerpoint": "powerpoint",
+        "dashboard": "dashboard",
+        "visual": "visual",
+        "draft_reply": "chat_response",
+        "apply_links": "links",
+    }
+    for item in deliverables:
+        if item in deliverable_map:
+            represented.add(deliverable_map[item])
+
+    for step in plan_steps:
+        action = str(step.get("action", step.get("kind", ""))).lower()
+        text = str(step.get("text", "")).lower()
+        if action in {"save_csv", "set_cell"}:
+            represented.add("spreadsheet")
+        if action in {"create_draft"}:
+            represented.add("chat_response")
+        if action in {"produce"}:
+            represented.update({"document", "dashboard"})
+        if action in {"present"}:
+            represented.add("dashboard")
+        if action in {"type_text", "type"} and text:
+            represented.add("chat_response")
+    return represented
+
+
+def _fail_fast_output_mismatch(
+    instruction: str,
+    mode: str,
+    plan_steps: List[Dict[str, Any]],
+    requested_outputs: Set[str],
+    represented_outputs: Set[str],
+) -> Dict[str, Any]:
+    missing = sorted(x for x in requested_outputs if x not in represented_outputs)
+    return {
+        "ok": False,
+        "mode": mode,
+        "instruction": instruction,
+        "error": "requested_outputs_not_in_plan",
+        "message": "Requested outputs are not represented in the execution plan. Refine the plan before execution.",
+        "missing_outputs": missing,
+        "requested_outputs": sorted(requested_outputs),
+        "planned_outputs": sorted(represented_outputs),
+        "planned_steps": _summarize_plan_steps(plan_steps),
+        "undo_plan": _build_undo_plan(plan_steps),
+    }
+
+
+def _artifact_plan_steps(deliverables: Set[str]) -> List[Dict[str, Any]]:
+    steps: List[Dict[str, Any]] = [{"kind": "research", "name": "Parse instruction into artifact outline", "target": {"query": "instruction_outline"}}]
+    steps.append({"kind": "produce", "name": "Draft artifact content from the instruction", "target": {"id": "artifact:draft"}})
+    if "document" in deliverables or "executive_summary" in deliverables:
+        steps.append({"kind": "produce", "name": "Write markdown document artifact", "target": {"path": "data/reports/artifact_generation"}})
+    if "powerpoint" in deliverables:
+        steps.append({"kind": "produce", "name": "Build PowerPoint artifact", "target": {"path": "data/reports/artifact_generation"}})
+    if "visual" in deliverables:
+        steps.append({"kind": "produce", "name": "Create visual HTML artifact", "target": {"path": "data/reports/artifact_generation"}})
+    return steps
+
+
+def _build_artifact_generation_plan(instruction: str) -> Dict[str, Any]:
+    requested = _requested_outputs(instruction)
+    deliverables: Set[str] = set()
+    if "executive_summary" in requested:
+        deliverables.add("executive_summary")
+        deliverables.add("document")
+    if "document" in requested:
+        deliverables.add("document")
+    if "powerpoint" in requested:
+        deliverables.add("powerpoint")
+    if "visual" in requested:
+        deliverables.add("visual")
+    if not deliverables:
+        deliverables.add("document")
+    return {
+        "planner": "deterministic-artifact-v1",
+        "domain": "artifact_generation",
+        "objective": re.sub(r"\s+", " ", instruction).strip(),
+        "deliverables": sorted(deliverables),
+        "sources": ["user_instruction"],
+        "constraints": {
+            "prefer_public_pages": False,
+            "no_password_capture": True,
+            "persist_history": True,
+        },
+        "steps": _artifact_plan_steps(deliverables),
+    }
+
+
+def _write_simple_pptx(pptx_path: Path, title: str, subtitle: str, bullets: List[str]) -> None:
+    try:
+        from pptx import Presentation  # type: ignore
+    except Exception:
+        pptx_path.write_text("PowerPoint package unavailable. Install python-pptx to generate .pptx files.", encoding="utf-8")
+        return
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[1])
+    slide.shapes.title.text = title
+    body = slide.placeholders[1].text_frame
+    body.text = subtitle
+    for item in bullets[:6]:
+        para = body.add_paragraph()
+        para.text = f"- {item}"
+    prs.save(str(pptx_path))
+
+
+def _run_artifact_generation(plan: Dict[str, Any], instruction: str, progress_cb: Optional[Callable[[int, str], None]] = None) -> Dict[str, Any]:
+    _emit_progress(progress_cb, 20, "Generating requested artifacts")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = Path("data/reports/artifact_generation") / ts
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    deliverables = {str(x).lower() for x in (plan.get("deliverables") or [])}
+    objective = str(plan.get("objective", instruction)).strip()
+    title = objective[:100] if objective else "Generated Artifact"
+    bullets = [seg.strip().capitalize() for seg in re.split(r"[.;]", objective) if seg.strip()]
+    if not bullets:
+        bullets = ["Generated from user instruction."]
+
+    artifacts: Dict[str, str] = {}
+    if "document" in deliverables or "executive_summary" in deliverables:
+        doc_path = out_dir / "document.md"
+        doc_lines = [f"# {title}", "", "## Summary", ""]
+        doc_lines.extend([f"- {item}" for item in bullets[:8]])
+        doc_path.write_text("\n".join(doc_lines) + "\n", encoding="utf-8")
+        artifacts["document_md"] = str(doc_path.resolve())
+        if "executive_summary" in deliverables:
+            artifacts["executive_summary_md"] = str(doc_path.resolve())
+
+    if "powerpoint" in deliverables:
+        pptx_path = out_dir / "deck.pptx"
+        _write_simple_pptx(pptx_path=pptx_path, title=title, subtitle="Auto-generated deck outline", bullets=bullets)
+        artifacts["powerpoint_pptx"] = str(pptx_path.resolve())
+
+    if "visual" in deliverables:
+        visual_path = out_dir / "visual.html"
+        visual_path.write_text(
+            (
+                "<!doctype html><html><head><meta charset='utf-8'><title>Generated Visual</title></head>"
+                "<body style='font-family:Segoe UI,Arial,sans-serif;background:#f8fafc;'>"
+                "<div style='max-width:900px;margin:48px auto;padding:32px;background:white;border:1px solid #dbe4ef;border-radius:16px;'>"
+                f"<h1 style='margin-top:0'>{html.escape(title)}</h1>"
+                "<p>Instruction-derived visual placeholder.</p>"
+                "</div></body></html>"
+            ),
+            encoding="utf-8",
+        )
+        artifacts["visual_html"] = str(visual_path.resolve())
+
+    open_target = artifacts.get("visual_html") or artifacts.get("document_md") or artifacts.get("powerpoint_pptx", "")
+    opened_uri = ""
+    if open_target:
+        opened_uri = Path(open_target).resolve().as_uri()
+        webbrowser.open(opened_uri, new=2)
+
+    _emit_progress(progress_cb, 100, "Completed")
+    return {
+        "ok": True,
+        "mode": "artifact_generation",
+        "query": objective,
+        "results_count": 0,
+        "results": [],
+        "artifacts": artifacts,
+        "summary": {"outputs_generated": sorted(artifacts.keys())},
+        "opened_url": opened_uri,
+        "canvas": {
+            "title": "Artifacts Generated",
+            "subtitle": objective[:120],
+            "cards": [{"title": k, "price": "saved", "source": "artifact", "url": Path(v).resolve().as_uri()} for k, v in artifacts.items()],
+        },
+    }
+
+
 def _verification_block(ok: bool, plan_steps: List[Dict[str, Any]], result: Dict[str, Any]) -> Dict[str, Any]:
     artifacts = result.get("artifacts", {}) or {}
     trace = result.get("trace", []) or []
@@ -332,6 +591,8 @@ def execute_instruction(
     confirm_risky: bool = False,
     ai_backend: str = "deterministic-local",
     min_live_non_curated_citations: Optional[int] = None,
+    manual_auth_phase: bool = False,
+    auth_session_id: Optional[str] = None,
     progress_cb: Optional[Callable[[int, str], None]] = None,
 ) -> Dict[str, Any]:
     _emit_progress(progress_cb, 2, "Understanding your request")
@@ -349,10 +610,41 @@ def execute_instruction(
     if not normalized:
         return {"ok": False, "error": "Instruction is empty.", "instruction": instruction}
 
+    explicit_route = _classify_explicit_route(normalized)
+
+    if explicit_route == "artifact_generation":
+        _emit_progress(progress_cb, 8, "Building deterministic artifact plan")
+        plan = _build_artifact_generation_plan(normalized)
+        plan_steps = [dict(x) for x in plan.get("steps", [])]
+        requested_outputs = _requested_outputs(normalized)
+        represented_outputs = _plan_represented_outputs(plan, plan_steps)
+        if requested_outputs and any(x not in represented_outputs for x in requested_outputs):
+            return _fail_fast_output_mismatch(
+                instruction=instruction,
+                mode="artifact_generation_plan_invalid",
+                plan_steps=plan_steps,
+                requested_outputs=requested_outputs,
+                represented_outputs=represented_outputs,
+            )
+        execution = _run_artifact_generation(plan=plan, instruction=instruction, progress_cb=progress_cb)
+        execution["ai"] = ai_meta
+        execution["plan"] = plan
+        return _finalize_operator_result(execution, instruction=instruction, plan_steps=plan_steps)
+
     if _is_native_planning_intent(normalized) or _is_study_pack_intent(normalized) or _is_job_research_intent(normalized):
         _emit_progress(progress_cb, 8, "Building execution plan")
         plan = _build_native_plan(normalized)
         plan_steps = [dict(x) for x in plan.get("steps", [])]
+        requested_outputs = _requested_outputs(normalized)
+        represented_outputs = _plan_represented_outputs(plan, plan_steps)
+        if requested_outputs and any(x not in represented_outputs for x in requested_outputs):
+            return _fail_fast_output_mismatch(
+                instruction=instruction,
+                mode="native_plan_invalid",
+                plan_steps=plan_steps,
+                requested_outputs=requested_outputs,
+                represented_outputs=represented_outputs,
+            )
         ambiguities = _detect_ambiguities(normalized, plan_steps)
         if ambiguities:
             return {
@@ -381,15 +673,27 @@ def execute_instruction(
             instruction=instruction,
             progress_cb=progress_cb,
             min_live_non_curated_citations=min_live_non_curated_citations,
+            manual_auth_phase=manual_auth_phase,
+            auth_session_id=auth_session_id,
         )
         execution["ai"] = ai_meta
         _emit_progress(progress_cb, 100, "Completed")
         return _finalize_operator_result(execution, instruction=instruction, plan_steps=plan_steps)
 
-    if _is_desktop_sequence_intent(normalized):
+    if explicit_route == "desktop_sequence" or _is_desktop_sequence_intent(normalized):
         _emit_progress(progress_cb, 12, "Building desktop action sequence")
         plan = build_plan(normalized)
         plan_steps = [dict(x) for x in plan.get("steps", [])]
+        requested_outputs = _requested_outputs(normalized)
+        represented_outputs = _plan_represented_outputs(plan, plan_steps)
+        if requested_outputs and any(x not in represented_outputs for x in requested_outputs):
+            return _fail_fast_output_mismatch(
+                instruction=instruction,
+                mode="desktop_plan_invalid",
+                plan_steps=plan_steps,
+                requested_outputs=requested_outputs,
+                represented_outputs=represented_outputs,
+            )
         ambiguities = _detect_ambiguities(normalized, plan_steps)
         if ambiguities:
             return {
@@ -501,7 +805,16 @@ def execute_instruction(
             "undo_plan": _build_undo_plan(plan_steps),
         }
 
-    plan_steps = [{"action": "web_search", "query": normalized}, {"action": "open_result"}]
+    plan_steps = [{"action": "web_search", "target": {"query": normalized}}, {"action": "open_result", "target": {"query": normalized}}]
+    requested_outputs = _requested_outputs(normalized)
+    if requested_outputs:
+        return _fail_fast_output_mismatch(
+            instruction=instruction,
+            mode="search_plan_invalid",
+            plan_steps=plan_steps,
+            requested_outputs=requested_outputs,
+            represented_outputs=set(),
+        )
     if _is_destructive_intent(normalized, plan_steps) and not confirm_risky:
         return {
             "ok": False,
@@ -534,6 +847,7 @@ def execute_instruction(
     if best:
         opened_url = best.url
         webbrowser.open(best.url, new=2)
+        plan_steps[1]["target"] = {"url": opened_url}
     needs_credentials = _likely_requires_login(normalized, opened_url, best.title if best else "")
 
     response = {
@@ -568,6 +882,33 @@ def preview_instruction(instruction: str) -> Dict[str, Any]:
     normalized = instruction.strip()
     if not normalized:
         return {"ok": False, "error": "Instruction is empty."}
+    explicit_route = _classify_explicit_route(normalized)
+    if explicit_route == "artifact_generation":
+        plan = _build_artifact_generation_plan(normalized)
+        plan_steps = [dict(x) for x in plan.get("steps", [])]
+        requested_outputs = _requested_outputs(normalized)
+        represented_outputs = _plan_represented_outputs(plan, plan_steps)
+        if requested_outputs and any(x not in represented_outputs for x in requested_outputs):
+            return _fail_fast_output_mismatch(
+                instruction=instruction,
+                mode="preview_artifact_plan_invalid",
+                plan_steps=plan_steps,
+                requested_outputs=requested_outputs,
+                represented_outputs=represented_outputs,
+            )
+        return {
+            "ok": True,
+            "mode": "preview_artifact_generation",
+            "instruction": instruction,
+            "plan": plan,
+            "planned_steps": _summarize_plan_steps(plan_steps),
+            "undo_plan": _build_undo_plan(plan_steps),
+            "canvas": {
+                "title": "Artifact Plan Preview",
+                "subtitle": f"{len(plan_steps)} steps",
+                "cards": [{"title": s.get("name", ""), "price": s.get("kind", "step"), "source": "planner", "url": ""} for s in plan_steps[:6]],
+            },
+        }
     if _is_native_planning_intent(normalized):
         plan = _build_native_plan(normalized)
         plan_steps = [dict(x) for x in plan.get("steps", [])]
@@ -587,7 +928,7 @@ def preview_instruction(instruction: str) -> Dict[str, Any]:
                 ],
             },
         }
-    if _is_desktop_sequence_intent(normalized):
+    if explicit_route == "desktop_sequence" or _is_desktop_sequence_intent(normalized):
         plan = build_plan(normalized)
         plan_steps = [dict(x) for x in plan.get("steps", [])]
         risk = assess_risk(plan)
@@ -612,8 +953,12 @@ def preview_instruction(instruction: str) -> Dict[str, Any]:
         "ok": True,
         "mode": "preview_search",
         "instruction": instruction,
-        "planned_steps": _summarize_plan_steps([{"action": "web_search", "query": instruction}, {"action": "open_result"}]),
-        "undo_plan": _build_undo_plan([{"action": "web_search"}, {"action": "open_result"}]),
+        "planned_steps": _summarize_plan_steps(
+            [{"action": "web_search", "target": {"query": instruction}}, {"action": "open_result", "target": {"query": instruction}}]
+        ),
+        "undo_plan": _build_undo_plan(
+            [{"action": "web_search", "target": {"query": instruction}}, {"action": "open_result", "target": {"query": instruction}}]
+        ),
         "canvas": {"title": "Search Preview", "subtitle": instruction, "cards": []},
     }
 
@@ -641,6 +986,8 @@ def _is_native_planning_intent(instruction: str) -> bool:
     low = instruction.lower()
     if _is_desktop_sequence_intent(low):
         return False
+    if _is_email_triage_intent(instruction):
+        return True
     signals = [
         "then",
         "from there",
@@ -677,8 +1024,18 @@ def _is_study_pack_intent(instruction: str) -> bool:
     return has_learning and (has_create or "notebooklm" in low)
 
 
+def _is_email_triage_intent(instruction: str) -> bool:
+    low = instruction.lower()
+    has_email_scope = any(x in low for x in ["inbox", "gmail", "email"])
+    has_time_filter = any(x in low for x in ["last 48 hours", "last 24 hours", "today", "unread", "recent"])
+    has_outputs = any(x in low for x in ["draft", "reply", "spreadsheet", "task list", "action"])
+    return has_email_scope and has_outputs and has_time_filter
+
+
 def _build_native_plan(instruction: str) -> Dict[str, Any]:
-    if _is_study_pack_intent(instruction):
+    if _is_email_triage_intent(instruction):
+        domain = "email_triage"
+    elif _is_study_pack_intent(instruction):
         domain = "study_pack"
     elif _is_job_research_intent(instruction):
         domain = "job_market"
@@ -703,13 +1060,35 @@ def _build_native_plan(instruction: str) -> Dict[str, Any]:
     if not deliverables:
         deliverables = ["report", "dashboard"]
 
-    if domain == "job_market":
+    if domain == "email_triage":
+        sources = ["gmail_ui"]
+    elif domain == "job_market":
         sources = ["linkedin", "indeed", "ziprecruiter", "glassdoor", "builtin"]
     elif domain == "competitor_analysis":
         sources = ["industry_reports", "vendor_pages", "analyst_coverage", "web_search"]
     else:
         sources = ["web_search", "source_pages"]
     objective = re.sub(r"\s+", " ", instruction).strip()
+    if domain == "email_triage":
+        return {
+            "planner": "native-v1",
+            "domain": domain,
+            "objective": objective,
+            "deliverables": ["spreadsheet", "draft_reply"],
+            "sources": sources,
+            "constraints": {
+                "prefer_public_pages": False,
+                "no_password_capture": True,
+                "persist_history": True,
+            },
+            "steps": [
+                {"kind": "list_recent_messages", "name": "Open inbox and filter last 48 hours", "target": {"url": "https://mail.google.com/"}},
+                {"kind": "read_message", "name": "Read candidate messages and classify action-needed", "target": {"query": "newer_than:2d in:inbox"}},
+                {"kind": "create_draft", "name": "Create draft replies for action-needed emails", "target": {"id": "gmail:drafts"}},
+                {"kind": "save_csv", "name": "Write task list spreadsheet artifact", "target": {"path": "data/reports/email_triage"}},
+                {"kind": "present", "name": "Open report dashboard for review", "target": {"id": "artifact:email_triage_report"}},
+            ],
+        }
     return {
         "planner": "native-v1",
         "domain": domain,
@@ -722,11 +1101,11 @@ def _build_native_plan(instruction: str) -> Dict[str, Any]:
             "persist_history": True,
         },
         "steps": [
-            {"kind": "research", "name": "Collect candidate sources and listings"},
-            {"kind": "extract", "name": "Extract structured fields"},
-            {"kind": "analyze", "name": "Rank, deduplicate, summarize"},
-            {"kind": "produce", "name": "Generate requested artifacts"},
-            {"kind": "present", "name": "Open dashboard and return actionable links"},
+            {"kind": "research", "name": "Collect candidate sources and listings", "target": {"query": objective}},
+            {"kind": "extract", "name": "Extract structured fields", "target": {"id": "dataset:candidate_results"}},
+            {"kind": "analyze", "name": "Rank, deduplicate, summarize", "target": {"id": "dataset:structured_records"}},
+            {"kind": "produce", "name": "Generate requested artifacts", "target": {"path": "data/reports"}},
+            {"kind": "present", "name": "Open dashboard and return actionable links", "target": {"id": "artifact:dashboard_html"}},
         ],
     }
 
@@ -736,12 +1115,16 @@ def _execute_native_plan(
     instruction: str,
     progress_cb: Optional[Callable[[int, str], None]] = None,
     min_live_non_curated_citations: Optional[int] = None,
+    manual_auth_phase: bool = False,
+    auth_session_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     return _run_reflective_planner(
         plan=plan,
         instruction=instruction,
         progress_cb=progress_cb,
         min_live_non_curated_citations=min_live_non_curated_citations,
+        manual_auth_phase=manual_auth_phase,
+        auth_session_id=auth_session_id,
     )
 
 
@@ -750,6 +1133,8 @@ def _run_reflective_planner(
     instruction: str,
     progress_cb: Optional[Callable[[int, str], None]] = None,
     min_live_non_curated_citations: Optional[int] = None,
+    manual_auth_phase: bool = False,
+    auth_session_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     min_live = _effective_min_live_non_curated_citations(min_live_non_curated_citations)
     objective = str(plan.get("objective", instruction))
@@ -767,7 +1152,40 @@ def _run_reflective_planner(
             instruction=instruction,
             progress_cb=progress_cb,
             min_live_non_curated_citations=min_live,
+            manual_auth_phase=manual_auth_phase,
+            auth_session_id=auth_session_id,
         )
+        if bool(result.get("paused_for_credentials", False)) or str(result.get("error_code", "")) in {"credential_missing", "permission_denied"}:
+            decision_log.append(f"Attempt {attempt} blocked: {result.get('error_code') or 'paused_for_credentials'}")
+            chosen = dict(result)
+            return {
+                "ok": bool(chosen.get("ok", False)),
+                "mode": "autonomous_plan_execute",
+                "plan": plan,
+                "instruction": instruction,
+                "decision_log": decision_log,
+                "query": chosen.get("query", ""),
+                "results_count": chosen.get("results_count", 0),
+                "artifacts": chosen.get("artifacts", {}),
+                "summary": chosen.get("summary", {}),
+                "results": chosen.get("results", []),
+                "source_status": chosen.get("source_status", {}),
+                "opened_url": chosen.get("opened_url", ""),
+                "canvas": chosen.get(
+                    "canvas",
+                    {
+                        "title": "Task Blocked",
+                        "subtitle": objective,
+                        "cards": [],
+                    },
+                ),
+                "paused_for_credentials": bool(chosen.get("paused_for_credentials", False)),
+                "pause_reason": str(chosen.get("pause_reason", "")),
+                "error": chosen.get("error", ""),
+                "error_code": chosen.get("error_code", ""),
+                "trace": chosen.get("trace", []),
+                "auth_session_id": chosen.get("auth_session_id", ""),
+            }
         score = _score_result_against_objective(
             result=result,
             objective=objective,
@@ -839,11 +1257,17 @@ def _run_reflective_planner(
         ),
         "paused_for_credentials": paused_for_credentials,
         "pause_reason": pause_reason,
+        "error": chosen.get("error", ""),
+        "error_code": chosen.get("error_code", ""),
+        "trace": chosen.get("trace", []),
+        "auth_session_id": chosen.get("auth_session_id", ""),
     }
 
 
 def _strategy_order(preferred: str) -> List[str]:
-    all_strategies = ["study_pack", "job_market", "competitor_analysis", "generic_research"]
+    all_strategies = ["email_triage", "study_pack", "job_market", "competitor_analysis", "generic_research"]
+    if preferred == "email_triage":
+        return ["email_triage"]
     if preferred == "study_pack":
         return ["study_pack", "generic_research"]
     if preferred == "job_market":
@@ -860,7 +1284,16 @@ def _run_strategy(
     instruction: str,
     progress_cb: Optional[Callable[[int, str], None]] = None,
     min_live_non_curated_citations: Optional[int] = None,
+    manual_auth_phase: bool = False,
+    auth_session_id: Optional[str] = None,
 ) -> Dict[str, Any]:
+    if strategy == "email_triage":
+        return _run_email_triage(
+            instruction,
+            progress_cb=progress_cb,
+            manual_auth_phase=manual_auth_phase,
+            auth_session_id=auth_session_id,
+        )
     if strategy == "study_pack":
         return _run_study_pack(instruction, progress_cb=progress_cb)
     if strategy == "job_market":
@@ -909,6 +1342,7 @@ def _score_result_against_objective(
     wants_study = any(t in low_obj for t in ["flashcard", "quiz", "study", "exam", "permit"])
     wants_jobs = any(t in low_obj for t in ["job", "position", "salary", "linkedin", "indeed"])
     wants_competitor = any(t in low_obj for t in ["competitor", "competition", "executive summary", "powerpoint", "ppt"])
+    wants_email_triage = any(t in low_obj for t in ["inbox", "gmail", "draft replies", "draft reply", "task list"]) and "last" in low_obj
     if wants_study:
         if "flashcards_csv" not in artifacts or not any(k in artifacts for k in ["quiz_md", "quiz_html"]):
             score -= 0.5
@@ -923,8 +1357,863 @@ def _score_result_against_objective(
         live_cites = int((result.get("summary", {}) or {}).get("live_non_curated_citations", 0) or 0)
         if live_cites < min_live:
             score -= 0.35
+    if wants_email_triage:
+        if "email_tasks_csv" not in artifacts and "task_list_csv" not in artifacts:
+            score -= 0.45
+        if result.get("mode") != "email_triage":
+            score -= 0.4
 
     return max(0.0, min(1.0, score))
+
+
+def _run_email_triage(
+    instruction: str,
+    progress_cb: Optional[Callable[[int, str], None]] = None,
+    manual_auth_phase: bool = False,
+    auth_session_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    return _run_email_triage_active_browser(
+        instruction=instruction,
+        progress_cb=progress_cb,
+        manual_auth_phase=manual_auth_phase,
+        auth_session_id=auth_session_id,
+    )
+
+
+def _run_email_triage_active_browser(
+    instruction: str,
+    progress_cb: Optional[Callable[[int, str], None]] = None,
+    manual_auth_phase: bool = False,
+    auth_session_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    profile_dir = Path("data/interface/browser_profile")
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    account = _extract_inbox_account(instruction)
+    trace: List[Dict[str, Any]] = []
+
+    # Manual-auth phase is explicit: open Gmail in controlled session and pause.
+    if manual_auth_phase:
+        _emit_progress(progress_cb, 12, "Opening Gmail auth target")
+        started = _start_email_auth_session(profile_dir=profile_dir)
+        if not started.get("ok"):
+            return {
+                "ok": False,
+                "mode": "email_triage",
+                "query": "newer_than:2d in:inbox",
+                "results_count": 0,
+                "results": [],
+                "artifacts": {},
+                "summary": {"error": "manual_auth_phase", "detail": str(started.get("error", "auth_open_failed"))},
+                "source_status": {"gmail_ui": "auth_launch_failed"},
+                "opened_url": "https://mail.google.com/",
+                "paused_for_credentials": True,
+                "pause_reason": "Unable to start Gmail auth target. Resolve and click Resume.",
+                "error": "credential_missing",
+                "error_code": "credential_missing",
+                "auth_phase": "manual",
+                "auth_session_id": "",
+                "trace": [],
+                "canvas": {
+                    "title": "Paused For Manual Auth",
+                    "subtitle": "Sign in in opened tab, then click Resume.",
+                    "cards": [],
+            },
+        }
+        sid = str(started.get("auth_session_id", ""))
+        focused = focus_auth_session(sid, fallback_url="https://mail.google.com/")
+        opened = str(focused.get("opened_url", "https://mail.google.com/"))
+        trace.append({"step": 0, "action": "open_auth_tab", "ok": True, "opened_url": opened})
+        return {
+            "ok": False,
+            "mode": "email_triage",
+            "query": "newer_than:2d in:inbox",
+            "results_count": 0,
+            "results": [],
+            "artifacts": {},
+            "summary": {"error": "manual_auth_phase"},
+            "source_status": {"gmail_ui": "manual_auth_phase"},
+            "opened_url": opened,
+            "paused_for_credentials": True,
+            "pause_reason": "Sign in if required in the opened Gmail tab, then click Resume.",
+            "error": "credential_missing",
+            "error_code": "credential_missing",
+            "auth_phase": "manual",
+            "auth_session_id": sid,
+            "trace": trace,
+            "canvas": {
+                "title": "Paused For Manual Auth",
+                "subtitle": "Sign in in opened tab, then click Resume.",
+                "cards": [],
+            },
+        }
+
+    sid = str(auth_session_id or "").strip()
+    session = _EMAIL_AUTH_SESSIONS.get(sid, {})
+    if not session:
+        started = _start_email_auth_session(profile_dir=profile_dir)
+        nsid = str(started.get("auth_session_id", ""))
+        focused = focus_auth_session(nsid, fallback_url="https://mail.google.com/")
+        opened = str(focused.get("opened_url", "https://mail.google.com/"))
+        return {
+            "ok": False,
+            "mode": "email_triage",
+            "query": "newer_than:2d in:inbox",
+            "results_count": 0,
+            "results": [],
+            "artifacts": {},
+            "summary": {"error": "credential_missing", "account": account},
+            "source_status": {"gmail_ui": "manual_auth_phase"},
+            "opened_url": opened,
+            "paused_for_credentials": True,
+            "pause_reason": "Gmail auth session required. Sign in in the opened tab, then click Resume.",
+            "error": "credential_missing",
+            "error_code": "credential_missing",
+            "auth_session_id": nsid,
+            "trace": [{"step": 0, "action": "open_auth_tab", "ok": True, "opened_url": opened}],
+            "canvas": {
+                "title": "Paused For Login",
+                "subtitle": "Sign in to Gmail, then click Resume.",
+                "cards": [],
+            },
+        }
+
+    session["auth_confirmed"] = True
+    focused = focus_auth_session(sid, fallback_url="https://mail.google.com/")
+    opened = str(focused.get("opened_url", "https://mail.google.com/"))
+    trace.append({"step": 0, "action": "focus_auth_tab", "ok": bool(focused.get("ok", False)), "opened_url": opened})
+
+    _emit_progress(progress_cb, 24, "Opening automation browser context")
+    page = None
+    context = None
+    playwright = None
+    browser = None
+    items: List[EmailActionItem] = []
+    try:
+        from playwright.sync_api import sync_playwright
+
+        playwright = sync_playwright().start()
+        try:
+            context = _launch_persistent_chrome_with_retry(playwright, profile_dir=profile_dir)
+        except Exception:
+            browser = playwright.chromium.launch(headless=False, args=["--start-maximized"])
+            context = browser.new_context()
+        page = _select_best_context_page(context, "https://mail.google.com/")
+        if page is None:
+            page = context.new_page()
+        try:
+            page.goto("https://mail.google.com/", timeout=30000)
+        except Exception:
+            try:
+                if context is not None:
+                    context.close()
+            except Exception:
+                pass
+            context = None
+            try:
+                if browser is not None:
+                    browser.close()
+            except Exception:
+                pass
+            browser = playwright.chromium.launch(headless=False, args=["--start-maximized"])
+            context = browser.new_context()
+            page = context.new_page()
+            page.goto("https://mail.google.com/", timeout=30000)
+
+        _emit_progress(progress_cb, 26, "Checking Gmail auth state")
+        ready = _gmail_wait_ready_state(page, timeout_ms=12000)
+        if ready == "login":
+            _emit_progress(progress_cb, 30, "Attempting Gmail sign-in from local vault")
+            login_attempt = _gmail_try_login_with_vault(page=page, account=account)
+            trace.append(
+                {
+                    "step": 0,
+                    "action": "vault_login_attempt",
+                    "ok": bool(login_attempt.get("ok", False)),
+                    "mode": "vault",
+                    "error": str(login_attempt.get("error", "")),
+                }
+            )
+            if login_attempt.get("ok"):
+                ready = _gmail_wait_ready_state(page, timeout_ms=18000)
+            else:
+                ready = "login"
+        if ready == "login":
+            return {
+                "ok": False,
+                "mode": "email_triage",
+                "query": "newer_than:2d in:inbox",
+                "results_count": 0,
+                "results": [],
+                "artifacts": {},
+                "summary": {"error": "credential_missing", "account": account},
+                "source_status": {"gmail_ui": "manual_auth_phase"},
+                "opened_url": opened,
+                "paused_for_credentials": True,
+                "pause_reason": "Complete Gmail sign-in in the opened tab, then click Resume.",
+                "error": "credential_missing",
+                "error_code": "credential_missing",
+                "auth_session_id": sid,
+                "trace": trace,
+                "canvas": {
+                    "title": "Paused For Login",
+                    "subtitle": "Sign in to Gmail, then click Resume.",
+                    "cards": [],
+                },
+            }
+        if ready == "unknown":
+            try:
+                page.goto("https://mail.google.com/", timeout=20000)
+                ready = _gmail_wait_ready_state(page, timeout_ms=8000)
+            except Exception:
+                ready = "unknown"
+        if ready == "unknown":
+            try:
+                page.goto("https://accounts.google.com/ServiceLogin?service=mail", timeout=20000)
+                login_attempt = _gmail_try_login_with_vault(page=page, account=account)
+                trace.append(
+                    {
+                        "step": 0,
+                        "action": "vault_login_attempt_unknown_state",
+                        "ok": bool(login_attempt.get("ok", False)),
+                        "mode": "vault",
+                        "error": str(login_attempt.get("error", "")),
+                    }
+                )
+                page.goto("https://mail.google.com/", timeout=20000)
+                ready = _gmail_wait_ready_state(page, timeout_ms=12000)
+            except Exception:
+                ready = "unknown"
+        if ready != "mail":
+            current_url = ""
+            try:
+                current_url = str(page.url or "")
+            except Exception:
+                current_url = ""
+            if "workspace.google.com/intl" in current_url.lower():
+                return {
+                    "ok": False,
+                    "mode": "email_triage",
+                    "query": "newer_than:2d in:inbox",
+                    "results_count": 0,
+                    "results": [],
+                    "artifacts": {},
+                    "summary": {
+                        "error": "automation_blocked_by_google",
+                        "account": account,
+                        "detail": "Google returned a marketing/workspace page to automated browser context.",
+                    },
+                    "source_status": {"gmail_ui": "automation_blocked_by_google"},
+                    "opened_url": opened,
+                    "paused_for_credentials": False,
+                    "pause_reason": "",
+                    "error": "automation_blocked_by_google",
+                    "error_code": "automation_blocked_by_google",
+                    "auth_session_id": sid,
+                    "trace": trace,
+                    "canvas": {
+                        "title": "Automation Blocked By Google",
+                        "subtitle": "Automated Gmail browser context was blocked by Google. Use app-password IMAP mode or OAuth API mode.",
+                        "cards": [],
+                    },
+                }
+            return {
+                "ok": False,
+                "mode": "email_triage",
+                "query": "newer_than:2d in:inbox",
+                "results_count": 0,
+                "results": [],
+                "artifacts": {},
+                "summary": {"error": "credential_missing", "account": account},
+                "source_status": {"gmail_ui": f"not_ready:{ready}"},
+                "opened_url": opened,
+                "paused_for_credentials": True,
+                "pause_reason": "Open Gmail inbox in auth tab, then click Resume.",
+                "error": "credential_missing",
+                "error_code": "credential_missing",
+                "auth_session_id": sid,
+                "trace": trace,
+                "canvas": {
+                    "title": "Paused For Inbox Ready",
+                    "subtitle": f"Ensure Gmail inbox is loaded, then Resume. Current URL: {current_url[:120]}",
+                    "cards": [],
+                },
+            }
+
+        _emit_progress(progress_cb, 38, "Filtering inbox for last 48 hours")
+        _gmail_filter_last_48h(page)
+        trace.append({"step": 1, "action": "filter_last_48h", "ok": True, "query": "newer_than:2d in:inbox"})
+
+        _emit_progress(progress_cb, 52, "Reading candidate emails")
+        rows = _gmail_collect_rows(page, max_rows=20, scroll_passes=4)
+        max_rows = min(len(rows), 20)
+        for idx in range(max_rows):
+            item = _gmail_process_message(page, idx)
+            if item is None:
+                _gmail_back_to_inbox(page)
+                continue
+            if item.requires_action:
+                item.draft_created = _gmail_create_draft_reply(page, item)
+            items.append(item)
+            _gmail_back_to_inbox(page)
+            trace.append(
+                {
+                    "step": 2,
+                    "action": "process_message",
+                    "ok": True,
+                    "message_id": item.message_id,
+                    "subject": item.subject,
+                    "requires_action": item.requires_action,
+                    "draft_created": item.draft_created,
+                }
+            )
+    finally:
+        try:
+            if context is not None:
+                context.close()
+        except Exception:
+            pass
+        try:
+            if browser is not None:
+                browser.close()
+        except Exception:
+            pass
+        try:
+            if playwright is not None:
+                playwright.stop()
+        except Exception:
+            pass
+
+    _emit_progress(progress_cb, 78, "Writing spreadsheet and dashboard artifacts")
+    artifacts = _write_email_triage_artifacts(instruction=instruction, account=account, items=items)
+    opened_url = Path(artifacts.get("email_triage_html", artifacts.get("email_tasks_csv", ""))).resolve().as_uri()
+    webbrowser.open(opened_url, new=2)
+    _emit_progress(progress_cb, 92, "Finalizing run report")
+
+    action_items = [x for x in items if x.requires_action]
+    return {
+        "ok": True,
+        "mode": "email_triage",
+        "query": "newer_than:2d in:inbox",
+        "results_count": len(items),
+        "results": [asdict(x) for x in items[:50]],
+        "artifacts": artifacts,
+        "summary": {
+            "account": account,
+            "messages_processed": len(items),
+            "action_required": len(action_items),
+            "drafts_created": sum(1 for x in action_items if x.draft_created),
+            "active_browser_mode": False,
+            "auth_session_reused": True,
+        },
+        "source_status": {"gmail_ui": "ok"},
+        "opened_url": opened_url,
+        "paused_for_credentials": False,
+        "pause_reason": "",
+        "trace": trace,
+        "auth_session_id": sid,
+        "canvas": {
+            "title": "Inbox Triage Completed",
+            "subtitle": f"Processed {len(items)} messages; {len(action_items)} require action.",
+            "cards": [
+                {
+                    "title": x.subject[:90],
+                    "price": "drafted" if x.draft_created else ("needs action" if x.requires_action else "info"),
+                    "source": x.sender,
+                    "url": "",
+                }
+                for x in items[:6]
+            ],
+        },
+    }
+
+
+def _extract_inbox_account(instruction: str) -> str:
+    m = re.search(r"([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)", instruction)
+    if m:
+        return m.group(1).strip().lower()
+    return "inbox"
+
+
+def _start_email_auth_session(profile_dir: Path) -> Dict[str, Any]:
+    sid = uuid.uuid4().hex
+    url = "https://mail.google.com/"
+    try:
+        webbrowser.open(url, new=2)
+        _EMAIL_AUTH_SESSIONS[sid] = {
+            "mode": "manual_auth_tab",
+            "url": url,
+            "profile_dir": str(profile_dir.resolve()),
+            "created_ts": time.time(),
+            "auth_confirmed": False,
+        }
+        return {"ok": True, "auth_session_id": sid}
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        return {"ok": False, "error": str(exc)}
+
+
+def focus_auth_session(auth_session_id: str, fallback_url: str = "https://mail.google.com/") -> Dict[str, Any]:
+    sid = str(auth_session_id or "").strip()
+    sess = _EMAIL_AUTH_SESSIONS.get(sid, {}) if sid else {}
+    if not sess:
+        try:
+            webbrowser.open(fallback_url, new=2)
+        except Exception:
+            pass
+        return {"ok": False, "error": "auth_session_not_found", "opened_url": fallback_url}
+    target = str(sess.get("url", fallback_url) or fallback_url)
+    try:
+        webbrowser.open(target, new=2)
+        return {"ok": True, "auth_session_id": sid, "opened_url": target}
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        return {"ok": False, "error": str(exc), "opened_url": target}
+
+
+def focus_email_auth_session(auth_session_id: str, fallback_url: str = "https://mail.google.com/") -> Dict[str, Any]:
+    return focus_auth_session(auth_session_id=auth_session_id, fallback_url=fallback_url)
+
+
+def _select_best_context_page(context: Any, target_url: str) -> Any:
+    best = None
+    try:
+        pages = list(getattr(context, "pages", []) or [])
+    except Exception:
+        pages = []
+    target_host = urllib.parse.urlparse(target_url).netloc.lower()
+    for page in pages:
+        try:
+            url = str(page.url or "").lower()
+        except Exception:
+            continue
+        if target_host and target_host in url:
+            return page
+        if "about:blank" in url and best is None:
+            best = page
+    return best
+
+
+def _close_email_auth_session(session_id: str) -> None:
+    _EMAIL_AUTH_SESSIONS.pop(session_id, None)
+
+
+def _launch_persistent_chrome_with_retry(playwright: Any, profile_dir: Path) -> Any:
+    last_exc: Exception | None = None
+    for attempt in range(2):
+        try:
+            return playwright.chromium.launch_persistent_context(
+                str(profile_dir),
+                channel="chrome",
+                headless=False,
+                args=["--start-maximized"],
+            )
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            last_exc = exc
+            if attempt == 0:
+                _terminate_profile_browser_processes(profile_dir=profile_dir)
+                time.sleep(0.6)
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Failed to launch persistent browser context")
+
+
+def _terminate_profile_browser_processes(profile_dir: Path) -> Dict[str, Any]:
+    profile_abs = str(profile_dir.resolve())
+    needle = f"--user-data-dir={profile_abs}".replace("'", "''")
+    script = (
+        "$procs = Get-CimInstance Win32_Process | Where-Object { "
+        "(($_.Name -match '^(chrome|msedge)\\.exe$') -and ($_.CommandLine -like '*"
+        + needle
+        + "*')) }; "
+        "$ids=@(); "
+        "foreach($p in $procs){ $ids += $p.ProcessId; try { Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop } catch {} }; "
+        "if($ids.Count -eq 0){ 'none' } else { ($ids -join ',') }"
+    )
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+        return {"ok": True, "killed": (out.stdout or "").strip(), "stderr": (out.stderr or "").strip()}
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        return {"ok": False, "error": str(exc)}
+
+
+def _is_profile_browser_running(profile_dir: Path) -> bool:
+    profile_abs = str(profile_dir.resolve())
+    needle = f"--user-data-dir={profile_abs}".replace("'", "''")
+    script = (
+        "$procs = Get-CimInstance Win32_Process | Where-Object { "
+        "(($_.Name -match '^(chrome|msedge)\\.exe$') -and ($_.CommandLine -like '*"
+        + needle
+        + "*')) }; "
+        "if($procs){ 'yes' } else { 'no' }"
+    )
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=6,
+            check=False,
+        )
+        return (out.stdout or "").strip().lower() == "yes"
+    except Exception:
+        return False
+
+
+def _open_auth_browser(profile_dir: Path, url: str) -> Dict[str, Any]:
+    profile_abs = str(profile_dir.resolve())
+    candidates: List[str] = []
+    for key in ["PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"]:
+        root = str(Path(str(os.environ.get(key, ""))))
+        if not root or root == ".":
+            continue
+        candidates.extend(
+            [
+                str(Path(root) / "Google" / "Chrome" / "Application" / "chrome.exe"),
+                str(Path(root) / "Microsoft" / "Edge" / "Application" / "msedge.exe"),
+            ]
+        )
+    which_chrome = shutil.which("chrome") or shutil.which("chrome.exe")
+    which_edge = shutil.which("msedge") or shutil.which("msedge.exe")
+    if which_chrome:
+        candidates.insert(0, which_chrome)
+    if which_edge:
+        candidates.insert(1, which_edge)
+    exe = next((c for c in candidates if c and Path(c).exists()), "")
+    if exe:
+        try:
+            subprocess.Popen(
+                [exe, f"--user-data-dir={profile_abs}", "--profile-directory=Default", url],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=0x00000008,  # DETACHED_PROCESS
+            )
+            return {"ok": True, "method": "profile_browser", "exe": exe, "url": url, "profile_dir": profile_abs}
+        except Exception as exc:
+            return {"ok": False, "method": "profile_browser", "error": str(exc), "url": url, "profile_dir": profile_abs}
+    try:
+        webbrowser.open(url, new=2)
+        return {"ok": True, "method": "default_browser", "url": url, "profile_dir": profile_abs}
+    except Exception as exc:
+        return {"ok": False, "method": "default_browser", "error": str(exc), "url": url, "profile_dir": profile_abs}
+
+
+def _gmail_login_required(page: Any) -> bool:
+    url = str(page.url or "").lower()
+    if "accounts.google.com" in url:
+        return True
+    try:
+        if page.locator("input[type='password'], input[type='email']").count() > 0 and page.locator("input[name='q']").count() == 0:
+            return True
+    except Exception:
+        return True
+    return False
+
+
+def _gmail_try_login_with_vault(page: Any, account: str) -> Dict[str, Any]:
+    try:
+        vault = LocalPasswordVault()
+        resolved = vault.find_entry_by_service("gmail")
+        if not resolved.get("ok"):
+            resolved = vault.find_entry_by_service("google")
+        if not resolved.get("ok"):
+            return {"ok": False, "error": "vault_entry_not_found"}
+        entry = resolved.get("entry", {}) or {}
+        username = str(entry.get("username", "")).strip()
+        password = str(entry.get("password", "")).strip()
+        if not username or not password:
+            return {"ok": False, "error": "vault_entry_missing_secret"}
+        if account and "@" in account and username.lower() != account.lower():
+            # Respect explicit account request.
+            return {"ok": False, "error": "vault_account_mismatch"}
+
+        # Email step
+        email_visible = page.locator("input[type='email']:visible").first
+        if email_visible.count() > 0:
+            try:
+                email_visible.click(timeout=4000)
+            except Exception:
+                pass
+            email_visible.fill(username, timeout=8000)
+            try:
+                page.locator("#identifierNext button:visible, #identifierNext:visible").first.click(timeout=5000)
+            except Exception:
+                page.keyboard.press("Enter")
+            page.wait_for_timeout(1200)
+        else:
+            # Account chooser step.
+            try:
+                account_tile = page.locator(
+                    f"[data-identifier='{username}']:visible, div[data-email='{username}']:visible, div[data-identifier='{username}']:visible"
+                ).first
+                if account_tile.count() > 0:
+                    account_tile.click(timeout=5000)
+                    page.wait_for_timeout(1200)
+            except Exception:
+                pass
+
+        # Password step
+        pwd_visible = page.locator("input[name='Passwd']:visible, input[type='password']:visible").first
+        if pwd_visible.count() > 0:
+            try:
+                pwd_visible.click(timeout=4000)
+            except Exception:
+                pass
+            pwd_visible.fill(password, timeout=8000)
+            try:
+                page.locator("#passwordNext button:visible, #passwordNext:visible").first.click(timeout=5000)
+            except Exception:
+                page.keyboard.press("Enter")
+            page.wait_for_timeout(2200)
+        else:
+            # No visible password field may indicate already-signed-in or challenge state.
+            if _gmail_login_required(page):
+                return {"ok": False, "error": "password_field_not_visible"}
+
+        try:
+            vault.touch_used(str(entry.get("id", "")))
+        except Exception:
+            pass
+        return {"ok": True}
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        return {"ok": False, "error": str(exc)}
+
+
+def _gmail_wait_ready_state(page: Any, timeout_ms: int = 15000) -> str:
+    deadline = time.time() + (max(1000, timeout_ms) / 1000.0)
+    while time.time() < deadline:
+        if _gmail_login_required(page):
+            return "login"
+        try:
+            url = str(page.url or "").lower()
+            if page.locator("input[name='q'], input[aria-label='Search mail']").count() > 0:
+                return "mail"
+            if page.locator("div[role='main'] tr.zA, div[gh='cm'], div.T-I.T-I-KE").count() > 0 and "mail.google.com" in url:
+                return "mail"
+            if "mail.google.com" in url and "accounts.google.com" not in url:
+                # Soft-ready fallback for slower/lazy Gmail layouts.
+                if page.locator("body").count() > 0:
+                    return "mail"
+        except Exception:
+            pass
+        time.sleep(0.25)
+    return "unknown"
+
+
+def _gmail_filter_last_48h(page: Any) -> None:
+    search = page.locator("input[name='q'], input[aria-label='Search mail'], textarea[name='q']")
+    try:
+        search.first.click(timeout=12000)
+    except Exception:
+        try:
+            page.keyboard.press("/")
+            page.wait_for_timeout(400)
+        except Exception:
+            pass
+    # Retry after '/' shortcut focus attempt.
+    search = page.locator("input[name='q'], input[aria-label='Search mail'], textarea[name='q']")
+    search.first.fill("newer_than:2d in:inbox", timeout=12000)
+    page.keyboard.press("Enter")
+    page.wait_for_timeout(1200)
+
+
+def _gmail_collect_rows(page: Any, max_rows: int = 20, scroll_passes: int = 4) -> List[Any]:
+    rows: List[Any] = []
+    for _ in range(max(1, scroll_passes)):
+        locator = page.locator("tr.zA")
+        count = locator.count()
+        for i in range(min(count, max_rows)):
+            rows.append(locator.nth(i))
+            if len(rows) >= max_rows:
+                return rows
+        page.mouse.wheel(0, 1600)
+        page.wait_for_timeout(350)
+    return rows[:max_rows]
+
+
+def _gmail_process_message(page: Any, row_index: int) -> Optional[EmailActionItem]:
+    rows = page.locator("tr.zA")
+    if row_index >= rows.count():
+        return None
+    row = rows.nth(row_index)
+    row.click(timeout=12000)
+    page.wait_for_timeout(700)
+    sender = ""
+    subject = ""
+    snippet = ""
+    received_at = ""
+    try:
+        sender = (page.locator("h3 span[email], span[email]").first.get_attribute("email") or "").strip()
+    except Exception:
+        sender = ""
+    try:
+        subject = (page.locator("h2.hP").first.inner_text(timeout=5000) or "").strip()
+    except Exception:
+        subject = ""
+    try:
+        snippet = (page.locator("div.a3s").first.inner_text(timeout=5000) or "").strip()
+        snippet = re.sub(r"\s+", " ", snippet)[:450]
+    except Exception:
+        snippet = ""
+    try:
+        received_at = (page.locator("span.g3").first.get_attribute("title") or "").strip()
+    except Exception:
+        received_at = ""
+    requires_action, reason = _classify_requires_action(subject=subject, snippet=snippet)
+    message_id = hashlib.sha256(f"{sender}|{subject}|{received_at}".encode("utf-8", errors="ignore")).hexdigest()[:16]
+    return EmailActionItem(
+        message_id=message_id,
+        sender=sender or "unknown",
+        subject=subject or "(no subject)",
+        received_at=received_at or "",
+        snippet=snippet,
+        requires_action=requires_action,
+        reason=reason,
+        draft_created=False,
+    )
+
+
+def _classify_requires_action(subject: str, snippet: str) -> tuple[bool, str]:
+    hay = f"{subject} {snippet}".lower()
+    action_keywords = [
+        "action required",
+        "please review",
+        "please respond",
+        "deadline",
+        "approve",
+        "approval",
+        "follow up",
+        "urgent",
+        "asap",
+        "can you",
+        "could you",
+        "request",
+        "next steps",
+    ]
+    for kw in action_keywords:
+        if kw in hay:
+            return True, f"matched:{kw}"
+    return False, "no_action_keyword"
+
+
+def _gmail_create_draft_reply(page: Any, item: EmailActionItem) -> bool:
+    try:
+        reply = page.locator("div[aria-label='Reply'], [data-tooltip='Reply']").first
+        reply.click(timeout=7000)
+        page.wait_for_timeout(500)
+        body = page.locator("div[aria-label='Message Body'][role='textbox'], div[role='textbox'][aria-label='Message Body']").last
+        body.click(timeout=5000)
+        body.fill(_build_draft_text(item))
+        page.wait_for_timeout(250)
+        return True
+    except Exception:
+        return False
+
+
+def _build_draft_text(item: EmailActionItem) -> str:
+    return (
+        f"Hi,\n\n"
+        f"Thanks for the note about \"{item.subject}\". I reviewed your message and will follow up with the requested details shortly.\n\n"
+        f"Current action item: {item.reason}.\n\n"
+        "Best,\n"
+        "Jeff"
+    )
+
+
+def _gmail_back_to_inbox(page: Any) -> None:
+    try:
+        page.keyboard.press("u")
+        page.wait_for_timeout(500)
+    except Exception:
+        try:
+            page.go_back()
+            page.wait_for_timeout(500)
+        except Exception:
+            return
+
+
+def _write_email_triage_artifacts(instruction: str, account: str, items: List[EmailActionItem]) -> Dict[str, str]:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = Path("data/reports/email_triage") / ts
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / "task_list.csv"
+    md_path = out_dir / "summary.md"
+    html_path = out_dir / "dashboard.html"
+
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "message_id",
+                "sender",
+                "subject",
+                "received_at",
+                "requires_action",
+                "reason",
+                "draft_created",
+                "snippet",
+            ],
+        )
+        writer.writeheader()
+        for item in items:
+            writer.writerow(asdict(item))
+
+    action_items = [x for x in items if x.requires_action]
+    lines = [
+        "# Inbox Triage Summary",
+        "",
+        f"- Generated: {datetime.now().isoformat(timespec='seconds')}",
+        f"- Instruction: {instruction}",
+        f"- Account: {account}",
+        f"- Messages processed: {len(items)}",
+        f"- Action required: {len(action_items)}",
+        f"- Drafts created: {sum(1 for x in action_items if x.draft_created)}",
+        "",
+        "## Action-Needed Messages",
+    ]
+    for idx, item in enumerate(action_items[:100], start=1):
+        lines.append(f"{idx}. **{item.subject}** | {item.sender} | {item.received_at or 'n/a'} | draft={item.draft_created}")
+        lines.append(f"   - reason: {item.reason}")
+    md_path.write_text("\n".join(lines), encoding="utf-8")
+
+    rows = json.dumps([asdict(x) for x in items])
+    html_text = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Inbox Triage Dashboard</title>
+<style>
+body{{font-family:'Segoe UI',Tahoma,sans-serif;background:#f8fafc;color:#0f172a;margin:0}}
+.w{{max-width:1180px;margin:0 auto;padding:20px}}
+.hero{{background:#ffffff;border:1px solid #e2e8f0;border-radius:12px;padding:14px}}
+table{{width:100%;border-collapse:collapse;background:#fff;margin-top:12px}}
+th,td{{padding:8px;border-bottom:1px solid #e2e8f0;vertical-align:top;font-size:13px}}
+th{{background:#0f172a;color:#e2e8f0;position:sticky;top:0}}
+.pill{{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px}}
+.ok{{background:#dcfce7;color:#166534}} .wait{{background:#fee2e2;color:#991b1b}}
+input{{padding:8px;border:1px solid #cbd5e1;border-radius:8px;min-width:280px;margin-top:8px}}
+</style></head><body><div class="w"><div class="hero"><h1 style="margin:0">Inbox Triage Dashboard</h1><p style="margin:4px 0 0 0">{html.escape(account)}</p><input id="q" placeholder="Filter sender/subject/snippet" oninput="render()"/></div><table><thead><tr><th>Sender</th><th>Subject</th><th>Received</th><th>Action</th><th>Draft</th><th>Snippet</th></tr></thead><tbody id="rows"></tbody></table></div>
+<script>
+const data={rows};
+function esc(s){{ return (s||'').replace(/[&<>]/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;'}}[c])); }}
+function render(){{
+ const q=(document.getElementById('q').value||'').toLowerCase();
+ const filtered=data.filter(x=>!q || (x.sender+' '+x.subject+' '+x.snippet).toLowerCase().includes(q));
+ document.getElementById('rows').innerHTML=filtered.map(x=>`<tr><td>${{esc(x.sender)}}</td><td>${{esc(x.subject)}}</td><td>${{esc(x.received_at||'')}}</td><td><span class="pill ${{x.requires_action?'wait':'ok'}}">${{x.requires_action?'needs action':'info'}}</span></td><td>${{x.draft_created?'yes':'no'}}</td><td>${{esc((x.snippet||'').slice(0,220))}}</td></tr>`).join('');
+}}
+render();
+</script></body></html>"""
+    html_path.write_text(html_text, encoding="utf-8")
+    return {
+        "directory": str(out_dir.resolve()),
+        "email_tasks_csv": str(csv_path.resolve()),
+        "summary_md": str(md_path.resolve()),
+        "email_triage_html": str(html_path.resolve()),
+        "primary_open_file": str(html_path.resolve()),
+    }
 
 
 def _is_job_research_intent(instruction: str) -> bool:

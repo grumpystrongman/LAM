@@ -45,6 +45,27 @@ class TestOperatorContractSchemaGate(unittest.TestCase):
         self.assertIn("schema_validation_errors", out)
         self.assertEqual(out["final_report"]["status"], "failed")
 
+    def test_anti_drift_per_step_diagnostics_present(self) -> None:
+        result = {
+            "ok": True,
+            "mode": "autonomous_plan_execute",
+            "query": "sample",
+            "artifacts": {},
+            "results": [],
+            "canvas": {"title": "Search Summary"},
+        }
+        plan_steps = [{"action": "research", "target": "instruction_scope"}]
+        out = attach_operator_contract(
+            instruction="Research competitors and produce report.",
+            result=result,
+            plan_steps=plan_steps,
+        )
+        self.assertIn("anti_drift", out)
+        self.assertTrue(out["anti_drift"]["has_failures"])
+        self.assertGreaterEqual(out["anti_drift"]["failed_steps"], 1)
+        first = out["anti_drift"]["step_rules"][0]
+        self.assertIn("target_validity", first["failed_rules"])
+
 
 if __name__ == "__main__":
     unittest.main()
