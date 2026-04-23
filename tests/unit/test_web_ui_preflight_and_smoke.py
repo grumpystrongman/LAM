@@ -16,6 +16,16 @@ class TestWebUiPreflightAndSmoke(unittest.TestCase):
 
         with state.lock:
             state.reliability_suite_result = {"ok": True, "finished_at": time.time()}
+            err_mid = web_ui._preflight_gate_error_locked(state)
+        self.assertIn("Run Human 20-Test Suite", err_mid)
+
+        with state.lock:
+            state.human_suite_result = {"ok": True, "suite": "core20"}
+            err_mid2 = web_ui._preflight_gate_error_locked(state)
+        self.assertIn("Run Killer 5 Suite", err_mid2)
+
+        with state.lock:
+            state.killer_suite_result = {"ok": True, "suite": "killer5"}
             err2 = web_ui._preflight_gate_error_locked(state)
         self.assertEqual(err2, "")
 
@@ -47,4 +57,3 @@ class TestWebUiPreflightAndSmoke(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

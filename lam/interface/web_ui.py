@@ -29,7 +29,13 @@ from lam.interface.selector_picker import capture_selector_at_cursor
 from lam.interface.teach_recorder import TeachRecorder
 from lam.interface.user_defaults import current_user, load_defaults, save_defaults
 from lam.interface.password_vault import LocalPasswordVault
+from lam.interface.human_operator_benchmark import benchmark_from_last_run
+from lam.interface.human_operator_scenario_runner import (
+    run_human_operator_20_suite,
+    run_human_operator_killer_suite,
+)
 from lam.interface.reliability_suite import run_reliability_suite
+from lam.interface.world_model import build_ui_world_model
 
 
 @dataclass(slots=True)
@@ -47,6 +53,9 @@ class UiState:
     ai_backend: str = "deterministic-local"
     compression_mode: str = "normal"
     min_live_non_curated_citations: int = 3
+    artifact_reuse_mode: str = "reuse_if_recent"
+    artifact_reuse_max_age_hours: int = 72
+    use_domain_freshness_defaults: bool = True
     user_id: str = field(default_factory=current_user)
     saved_automations: Dict[str, str] = field(default_factory=dict)
     history: List[Dict[str, Any]] = field(default_factory=list)
@@ -59,6 +68,11 @@ class UiState:
     current_task_id: str = ""
     reliability_suite_task_id: str = ""
     reliability_suite_result: Dict[str, Any] = field(default_factory=dict)
+    benchmark_last_result: Dict[str, Any] = field(default_factory=dict)
+    human_suite_task_id: str = ""
+    human_suite_result: Dict[str, Any] = field(default_factory=dict)
+    killer_suite_task_id: str = ""
+    killer_suite_result: Dict[str, Any] = field(default_factory=dict)
     preflight_required: bool = True
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -66,6 +80,18 @@ class UiState:
         with self.lock:
             schedules = self.scheduler.list_jobs() if self.scheduler else []
             schedule_history = self.scheduler.list_history(limit=50) if self.scheduler else []
+            preflight = _preflight_status_locked(self)
+            current_task = dict(self.tasks.get(self.current_task_id, {})) if self.current_task_id else {}
+            world_model = build_ui_world_model(
+                control_granted=self.control_granted,
+                paused_for_credentials=self.paused_for_credentials,
+                pause_reason=self.pause_reason,
+                pending_auth_url=self.pending_auth_url,
+                pending_auth_session_id=self.pending_auth_session_id,
+                current_task=current_task,
+                history=self.history,
+                preflight=preflight,
+            )
             return {
                 "control_granted": self.control_granted,
                 "control_granted_at": self.control_granted_at,
@@ -80,6 +106,10 @@ class UiState:
                 "ai_backend": self.ai_backend,
                 "compression_mode": self.compression_mode,
                 "min_live_non_curated_citations": self.min_live_non_curated_citations,
+                "artifact_reuse_mode": self.artifact_reuse_mode,
+                "artifact_reuse_max_age_hours": self.artifact_reuse_max_age_hours,
+                "use_domain_freshness_defaults": self.use_domain_freshness_defaults,
+                "freshness_policy": _load_policy_freshness_defaults(),
                 "ai_backends": AI_BACKENDS,
                 "user_id": self.user_id,
                 "saved_automations": dict(self.saved_automations),
@@ -91,11 +121,17 @@ class UiState:
                 "schedule_history": schedule_history,
                 "vault_status": self.vault.status(),
                 "current_task_id": self.current_task_id,
-                "task": dict(self.tasks.get(self.current_task_id, {})) if self.current_task_id else {},
+                "task": current_task,
                 "reliability_suite_task_id": self.reliability_suite_task_id,
                 "reliability_suite_result": dict(self.reliability_suite_result),
+                "benchmark_last_result": dict(self.benchmark_last_result),
+                "human_suite_task_id": self.human_suite_task_id,
+                "human_suite_result": dict(self.human_suite_result),
+                "killer_suite_task_id": self.killer_suite_task_id,
+                "killer_suite_result": dict(self.killer_suite_result),
                 "preflight_required": self.preflight_required,
-                "preflight": _preflight_status_locked(self),
+                "preflight": preflight,
+                "world_model": world_model,
             }
 
 
@@ -159,6 +195,7 @@ HTML_PAGE = """<!doctype html>
         <button class="primary" onclick="grantControl()">Accept Control</button>
         <button class="warn" onclick="revokeControl()">Revoke Control</button>
         <button onclick="resumeAfterLogin()">Resume</button>
+        <button onclick="resetSessionState()">Reset Session</button>
         <label class="small"><input type="checkbox" id="stepMode" onchange="setStepMode(this.checked)"/> Step mode</label>
         <label class="small"><input type="checkbox" id="manualAuthPhase" onchange="setManualAuthPhase(this.checked)" checked/> Manual auth phase</label>
         <select id="aiBackend" onchange="setAiBackend(this.value)">
@@ -175,12 +212,43 @@ HTML_PAGE = """<!doctype html>
         <label class="small">min live cites:
           <input id="minLiveCites" type="number" min="1" max="20" value="3" style="width:80px" onchange="setMinLiveCites(this.value)"/>
         </label>
+        <select id="artifactReuseMode" onchange="setArtifactReuseMode(this.value)">
+          <option value="reuse">reuse outputs</option>
+          <option value="reuse_if_recent" selected>reuse if recent</option>
+          <option value="always_regenerate">always regenerate</option>
+        </select>
+        <label class="small">reuse hrs:
+          <input id="artifactReuseMaxAgeHours" type="number" min="1" max="720" value="72" style="width:90px" onchange="setArtifactReuseMaxAgeHours(this.value)"/>
+        </label>
+        <label class="small"><input type="checkbox" id="useDomainFreshnessDefaults" onchange="setUseDomainFreshnessDefaults(this.checked)" checked/> use domain freshness defaults</label>
+      </div>
+      <div class="row">
+        <select id="freshnessPolicyDomain" onchange="loadDomainFreshnessPolicy()">
+          <option value="web_research">web_research</option>
+          <option value="job_market">job_market</option>
+          <option value="competitor_analysis">competitor_analysis</option>
+          <option value="study_pack">study_pack</option>
+          <option value="artifact_generation">artifact_generation</option>
+          <option value="email_triage">email_triage</option>
+          <option value="desktop_sequence">desktop_sequence</option>
+        </select>
+        <select id="freshnessPolicyMode">
+          <option value="reuse">reuse</option>
+          <option value="reuse_if_recent">reuse_if_recent</option>
+          <option value="always_regenerate">always_regenerate</option>
+        </select>
+        <label class="small">domain hrs:
+          <input id="freshnessPolicyHours" type="number" min="1" max="720" value="72" style="width:90px"/>
+        </label>
+        <button onclick="saveDomainFreshnessPolicy()">Save Domain Policy</button>
+        <button onclick="loadDomainFreshnessPolicy()">Reload Domain Policy</button>
       </div>
       <div class="row">
         <input id="instruction" class="wide" type="text" placeholder="open chatgpt app then click New chat then type &quot;hello&quot; then press enter"/>
         <button class="primary" onclick="runInstruction()">Run</button>
         <button onclick="previewInstruction()">Preview</button>
       </div>
+      <div class="small" id="freshnessPreview">Freshness preview: waiting for instruction.</div>
       <div class="row">
         <input id="automationName" type="text" placeholder="Automation name"/>
         <button onclick="saveAutomation()">Save</button>
@@ -199,6 +267,13 @@ HTML_PAGE = """<!doctype html>
       <div class="row"><strong>Progress</strong> <span class="small" id="progressLabel">Idle</span></div>
       <div class="progress-wrap"><div id="progressBar" class="progress-bar"></div></div>
       <div class="progress-log mono" id="progressLog">No active task.</div>
+    </div>
+
+    <div class="panel">
+      <div><strong>World Model</strong></div>
+      <div class="small" id="worldModelNarration">Environment narration will appear here.</div>
+      <div class="small" id="worldModelNoticed" style="margin-top:6px;">What I noticed will appear here.</div>
+      <div class="json-box" id="worldModelBox">No world model yet.</div>
     </div>
 
     <div class="grid2">
@@ -275,10 +350,14 @@ HTML_PAGE = """<!doctype html>
       <div class="row">
         <div><strong>Run Summary</strong></div>
         <button onclick="runReliabilitySuite()">Run Reliability Suite</button>
+        <button onclick="scoreLastRunBenchmark()">Score Last Run (Human Benchmark)</button>
+        <button onclick="runHuman20Suite()">Run Human 20-Test Suite</button>
+        <button onclick="runKiller5Suite()">Run Killer 5 Suite</button>
         <label class="small"><input type="checkbox" id="suiteIncludeDesktopSmoke"/> include desktop smoke (Notepad)</label>
         <button onclick="runNotepadSmoke()">Run Notepad Hello World Test</button>
         <label class="small"><input type="checkbox" id="suiteIncludePytest"/> include pytest</label>
         <input id="suitePytestArgs" type="text" placeholder="pytest args (optional)"/>
+        <button onclick="regenerateFresh()">Regenerate Fresh</button>
         <button onclick="copyRawJson()">Copy Raw JSON</button>
         <label class="small"><input type="checkbox" id="showStrictRules" onchange="toggleStrictRules(this.checked)"/> Strict rule diagnostics</label>
         <label class="small"><input type="checkbox" id="showDetails" onchange="toggleDetails(this.checked)"/> Show technical details</label>
@@ -374,9 +453,14 @@ function renderSummary(r){
 
   const cards=[];
   if(r?.plan?.domain){ cards.push({t:"Planner",m:`${r.plan.domain} (${r.plan.steps?.length||0} steps)`}); }
+  if(r?.playbook?.name){ cards.push({t:"Playbook",m:r.playbook.name}); }
   if(r?.query){ cards.push({t:"Query",m:r.query}); }
   if(count){ cards.push({t:"Results",m:String(count)}); }
   if(r?.opened_url){ cards.push({t:"Opened",m:r.opened_url}); }
+  const elegance = r?.summary?.elegance_budget || r?.critics?.elegance_budget || {};
+  if(typeof elegance?.remaining === "number"){
+    cards.push({t:"Elegance",m:`${elegance.remaining}/${elegance.total} remaining`});
+  }
   if(isReliability && r?.summary){
     cards.push({t:"Checks",m:String(r.summary.total || 0)});
     cards.push({t:"Passed",m:String(r.summary.passed || 0)});
@@ -389,6 +473,12 @@ function renderSummary(r){
   if(r?.artifacts){
     const lines = Object.entries(r.artifacts).slice(0,3).map(([k,v])=>`${k}: ${v}`);
     cards.push({t:"Artifacts",m:lines.join(" | ")});
+  }
+  const freshnessMode = String(r?.summary?.artifact_reuse_mode || "").trim();
+  const reusedOutputs = r?.summary?.reused_existing_outputs;
+  if(freshnessMode){
+    const reusedLabel = (typeof reusedOutputs === "boolean") ? (reusedOutputs ? "reused" : "regenerated") : "n/a";
+    cards.push({t:"Freshness",m:`${freshnessMode} • ${reusedLabel}`});
   }
   (r?.canvas?.cards||[]).slice(0,4).forEach(c=>cards.push({t:c.title||"Item",m:`${c.price||""} ${c.source?`• ${c.source}`:""}`.trim()}));
   if(cards.length===0){ cards.push({t:"Status",m:ok?"Completed":"Needs input"}); }
@@ -403,6 +493,7 @@ function renderSummary(r){
   }
 
   const activity=[];
+  if(Array.isArray(r?.narration)){ r.narration.forEach(x=>activity.push(`• ${x}`)); }
   if(isReliability && Array.isArray(r?.checks)){
     r.checks.forEach(item=>{
       const status = String(item?.status || "unknown").toUpperCase();
@@ -415,11 +506,39 @@ function renderSummary(r){
     }
   }
   if(Array.isArray(r?.decision_log)){ r.decision_log.forEach(x=>activity.push(`• ${x}`)); }
+  if(freshnessMode){
+    activity.push(`• Freshness policy: ${freshnessMode}`);
+    if(typeof reusedOutputs === "boolean"){ activity.push(`• Output handling: ${reusedOutputs ? "reused existing artifacts" : "regenerated artifacts"}`); }
+  }
+  if(Array.isArray(elegance?.events) && elegance.events.length){
+    elegance.events.slice(-4).forEach(ev=>activity.push(`• elegance: -${ev.cost} (${ev.reason})`));
+  }
   if(r?.source_status){ Object.entries(r.source_status).slice(0,10).forEach(([k,v])=>activity.push(`• ${k}: ${v}`)); }
   if(r?.pause_reason){ activity.push(`• ${r.pause_reason}`); }
   if(activity.length===0){ activity.push(ok?"• Finished successfully.":"• Check details for error context."); }
   document.getElementById("activityLog").innerText = activity.join("\\n");
   renderStrictRules(r||{});
+}
+function renderWorldModel(model){
+  const wm = model || {};
+  const narration = Array.isArray(wm?.narration) ? wm.narration : [];
+  const noticed = Array.isArray(wm?.what_i_noticed) ? wm.what_i_noticed : [];
+  const signals = wm?.signals || {};
+  const compact = {
+    signals,
+    workspace: wm.workspace || {},
+    task: wm.task || {},
+    recent: wm.recent || {},
+    candidate_targets: Array.isArray(wm?.candidate_targets) ? wm.candidate_targets : [],
+    created_outputs: Array.isArray(wm?.created_outputs) ? wm.created_outputs.slice(0,8) : [],
+  };
+  document.getElementById("worldModelNarration").innerText = narration.length
+    ? narration.join(" ")
+    : "No environment narration available.";
+  document.getElementById("worldModelNoticed").innerText = noticed.length
+    ? `What I noticed: ${noticed.join(" | ")}`
+    : "What I noticed: no notable environment signals yet.";
+  document.getElementById("worldModelBox").innerText = JSON.stringify(compact, null, 2);
 }
 function escapeHtml(s){ return String(s||"").replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
 function toUri(path){
@@ -454,6 +573,9 @@ async function refreshState(){
   document.getElementById("aiBackend").value=s.ai_backend||"deterministic-local";
   document.getElementById("compressionMode").value=s.compression_mode||"normal";
   document.getElementById("minLiveCites").value=String(s.min_live_non_curated_citations||3);
+  document.getElementById("artifactReuseMode").value=s.artifact_reuse_mode||"reuse_if_recent";
+  document.getElementById("artifactReuseMaxAgeHours").value=String(s.artifact_reuse_max_age_hours||72);
+  document.getElementById("useDomainFreshnessDefaults").checked=!!s.use_domain_freshness_defaults;
   const teach=s.teach||{};
   document.getElementById("teachState").innerText=`${teach.active?'Recording':'Idle'} • events: ${teach.event_count||0}${s.global_teach_active?' • global hooks active':''}`;
   const jobs=(s.schedules||[]).length, recent=(s.schedule_history||[]).length;
@@ -461,15 +583,24 @@ async function refreshState(){
   const vs=s.vault_status||{};
   document.getElementById("vaultState").innerText=`Vault: ${vs.entries||0} entries • ${vs.dpapi_available?'DPAPI secured':'local encryption fallback'}`;
   renderTask(s.task||{});
+  renderWorldModel(s.world_model||{});
 }
 function renderHistory(){
   const el=document.getElementById("history"); el.innerHTML="";
   [...ui.history].reverse().forEach((item,idx)=>{
     const d=document.createElement("div"); d.className="history-item";
     const canRerun = !!(item && item.instruction);
-    d.innerHTML=`<div style="font-weight:600">${item.instruction||item.mode||"Run"}</div><div class="small">${item.app_name||""} ${item.opened_url||""}</div>${canRerun?`<div class="row" style="margin-top:6px"><button onclick="rerunHistory(${idx}); event.stopPropagation();">Re-run</button></div>`:''}`;
+    const policySelectId = `rerunPolicy_${idx}`;
+    d.innerHTML=`<div style="font-weight:600">${item.instruction||item.mode||"Run"}</div><div class="small">${item.app_name||""} ${item.opened_url||""}</div>${canRerun?`<div class="row" style="margin-top:6px"><button onclick="rerunHistory(${idx}); event.stopPropagation();">Re-run</button><select id="${policySelectId}" onclick="event.stopPropagation();" onchange="event.stopPropagation();" title="Freshness policy"><option value="reuse_if_recent">reuse if recent</option><option value="reuse">reuse</option><option value="always_regenerate">always regenerate</option></select></div>`:''}`;
     d.onclick=()=>{ renderSummary(item); setRaw(item); };
     el.appendChild(d);
+    if(canRerun){
+      const select=document.getElementById(policySelectId);
+      if(select){
+        const current = document.getElementById("artifactReuseMode");
+        select.value = (current && current.value) ? current.value : "reuse_if_recent";
+      }
+    }
   });
 }
 async function rerunHistory(revIndex){
@@ -479,9 +610,13 @@ async function rerunHistory(revIndex){
   const ai_backend=document.getElementById("aiBackend").value;
   const min_live_non_curated_citations=parseInt(document.getElementById("minLiveCites").value||"3",10);
   const manual_auth_phase=!!document.getElementById("manualAuthPhase").checked;
-  const r=await fetch("/api/instruct_async",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({instruction:item.instruction,ai_backend,min_live_non_curated_citations,manual_auth_phase})}).then(r=>r.json());
+  const use_domain_freshness_defaults=!!document.getElementById("useDomainFreshnessDefaults").checked;
+  const selector = document.getElementById(`rerunPolicy_${revIndex}`);
+  const artifact_reuse_mode=(selector && selector.value) ? selector.value : (document.getElementById("artifactReuseMode").value||"reuse_if_recent");
+  const artifact_reuse_max_age_hours=parseInt(document.getElementById("artifactReuseMaxAgeHours").value||"72",10);
+  const r=await fetch("/api/instruct_async",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({instruction:item.instruction,ai_backend,min_live_non_curated_citations,manual_auth_phase,use_domain_freshness_defaults,artifact_reuse_mode,artifact_reuse_max_age_hours})}).then(r=>r.json());
   if(!r.ok){ showResponse(r); await refreshState(); return; }
-  startTaskPolling(r.task_id, { instruction:item.instruction, ai_backend, min_live_non_curated_citations, manual_auth_phase, confirm_risky:false });
+  startTaskPolling(r.task_id, { instruction:item.instruction, ai_backend, min_live_non_curated_citations, manual_auth_phase, use_domain_freshness_defaults, artifact_reuse_mode, artifact_reuse_max_age_hours, confirm_risky:false });
 }
 async function grantControl(){
   const r=await fetch("/api/control",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({accept:true})}).then(r=>r.json());
@@ -498,6 +633,43 @@ async function setManualAuthPhase(v){ await fetch("/api/settings",{method:"POST"
 async function setAiBackend(v){ await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ai_backend:v})}); await refreshState(); }
 async function setCompressionMode(v){ await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({compression_mode:v})}); await refreshState(); }
 async function setMinLiveCites(v){ const n=Math.max(1,Math.min(20,parseInt(v||"3",10)||3)); await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({min_live_non_curated_citations:n})}); await refreshState(); }
+async function setArtifactReuseMode(v){ await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({artifact_reuse_mode:v})}); await refreshState(); }
+async function setArtifactReuseMaxAgeHours(v){ const n=Math.max(1,Math.min(720,parseInt(v||"72",10)||72)); await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({artifact_reuse_max_age_hours:n})}); await refreshState(); }
+async function setUseDomainFreshnessDefaults(v){ await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({use_domain_freshness_defaults:!!v})}); await refreshState(); }
+async function refreshFreshnessPreview(){
+  const instruction=(document.getElementById("instruction").value||"").trim();
+  if(!instruction){
+    document.getElementById("freshnessPreview").innerText="Freshness preview: waiting for instruction.";
+    return;
+  }
+  const artifact_reuse_mode=document.getElementById("artifactReuseMode").value||"reuse_if_recent";
+  const artifact_reuse_max_age_hours=parseInt(document.getElementById("artifactReuseMaxAgeHours").value||"72",10);
+  const use_domain_freshness_defaults=!!document.getElementById("useDomainFreshnessDefaults").checked;
+  const r=await fetch("/api/policy/freshness/preview",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({instruction,artifact_reuse_mode,artifact_reuse_max_age_hours,use_domain_freshness_defaults})}).then(r=>r.json());
+  if(r?.ok){
+    document.getElementById("freshnessPreview").innerText=`Freshness preview: domain=${r.domain} • mode=${r.mode} • hrs=${r.max_age_hours} • source=${r.source}`;
+  } else {
+    document.getElementById("freshnessPreview").innerText="Freshness preview: unavailable.";
+  }
+}
+async function loadDomainFreshnessPolicy(){
+  const domain=document.getElementById("freshnessPolicyDomain").value;
+  const r=await fetch("/api/policy/freshness/get",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({domain})}).then(r=>r.json());
+  if(r?.ok){
+    document.getElementById("freshnessPolicyMode").value=r.mode||"reuse_if_recent";
+    document.getElementById("freshnessPolicyHours").value=String(r.max_age_hours||72);
+  } else {
+    showResponse(r||{ok:false,error:"Failed to load freshness policy"});
+  }
+}
+async function saveDomainFreshnessPolicy(){
+  const domain=document.getElementById("freshnessPolicyDomain").value;
+  const mode=document.getElementById("freshnessPolicyMode").value;
+  const max_age_hours=Math.max(1,Math.min(720,parseInt(document.getElementById("freshnessPolicyHours").value||"72",10)||72));
+  const r=await fetch("/api/policy/freshness/set",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({domain,mode,max_age_hours})}).then(r=>r.json());
+  showResponse(r);
+  await refreshState();
+}
 async function resumeAfterLogin(){
   const r=await fetch("/api/session/resume",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(r=>r.json());
   if(r?.task_id){
@@ -514,14 +686,23 @@ async function focusAuthTarget(){
   handleResult(r);
   await refreshState();
 }
+async function resetSessionState(){
+  const r=await fetch("/api/session/reset",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(r=>r.json());
+  handleResult(r);
+  await refreshState();
+}
 async function runInstruction(){
   const instruction=document.getElementById("instruction").value.trim(); if(!instruction) return;
   const ai_backend=document.getElementById("aiBackend").value;
   const min_live_non_curated_citations=parseInt(document.getElementById("minLiveCites").value||"3",10);
   const manual_auth_phase=!!document.getElementById("manualAuthPhase").checked;
-  const r=await fetch("/api/instruct_async",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({instruction,ai_backend,min_live_non_curated_citations,manual_auth_phase})}).then(r=>r.json());
+  const use_domain_freshness_defaults=!!document.getElementById("useDomainFreshnessDefaults").checked;
+  const artifact_reuse_mode=document.getElementById("artifactReuseMode").value||"reuse_if_recent";
+  const artifact_reuse_max_age_hours=parseInt(document.getElementById("artifactReuseMaxAgeHours").value||"72",10);
+  await refreshFreshnessPreview();
+  const r=await fetch("/api/instruct_async",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({instruction,ai_backend,min_live_non_curated_citations,manual_auth_phase,use_domain_freshness_defaults,artifact_reuse_mode,artifact_reuse_max_age_hours})}).then(r=>r.json());
   if(!r.ok){ showResponse(r); await refreshState(); return; }
-  startTaskPolling(r.task_id, { instruction, ai_backend, min_live_non_curated_citations, manual_auth_phase, confirm_risky:false });
+  startTaskPolling(r.task_id, { instruction, ai_backend, min_live_non_curated_citations, manual_auth_phase, use_domain_freshness_defaults, artifact_reuse_mode, artifact_reuse_max_age_hours, confirm_risky:false });
 }
 async function previewInstruction(){ const instruction=document.getElementById("instruction").value.trim(); if(!instruction)return; const r=await fetch("/api/preview",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({instruction})}).then(r=>r.json()); showResponse(r); await refreshState(); }
 async function saveAutomation(){ const name=document.getElementById("automationName").value.trim(); const instruction=document.getElementById("instruction").value.trim(); const r=await fetch("/api/automation/save",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name,instruction})}).then(r=>r.json()); showResponse(r); await refreshState(); }
@@ -530,9 +711,27 @@ async function runAutomation(){
   const ai_backend=document.getElementById("aiBackend").value;
   const min_live_non_curated_citations=parseInt(document.getElementById("minLiveCites").value||"3",10);
   const manual_auth_phase=!!document.getElementById("manualAuthPhase").checked;
-  const r=await fetch("/api/automation/run_async",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name,ai_backend,min_live_non_curated_citations,manual_auth_phase})}).then(r=>r.json());
+  const use_domain_freshness_defaults=!!document.getElementById("useDomainFreshnessDefaults").checked;
+  const artifact_reuse_mode=document.getElementById("artifactReuseMode").value||"reuse_if_recent";
+  const artifact_reuse_max_age_hours=parseInt(document.getElementById("artifactReuseMaxAgeHours").value||"72",10);
+  const r=await fetch("/api/automation/run_async",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name,ai_backend,min_live_non_curated_citations,manual_auth_phase,use_domain_freshness_defaults,artifact_reuse_mode,artifact_reuse_max_age_hours})}).then(r=>r.json());
   if(!r.ok){ showResponse(r); await refreshState(); return; }
-  startTaskPolling(r.task_id, { instruction:r.instruction||"", ai_backend, min_live_non_curated_citations, manual_auth_phase, confirm_risky:false });
+  startTaskPolling(r.task_id, { instruction:r.instruction||"", ai_backend, min_live_non_curated_citations, manual_auth_phase, use_domain_freshness_defaults, artifact_reuse_mode, artifact_reuse_max_age_hours, confirm_risky:false });
+}
+async function regenerateFresh(){
+  const fromInput=document.getElementById("instruction").value.trim();
+  const fromLast=String(lastRaw?.instruction||"").trim();
+  const instruction=fromInput||fromLast;
+  if(!instruction){ showResponse({ok:false,error:"No instruction available to regenerate."}); return; }
+  const ai_backend=document.getElementById("aiBackend").value;
+  const min_live_non_curated_citations=parseInt(document.getElementById("minLiveCites").value||"3",10);
+  const manual_auth_phase=!!document.getElementById("manualAuthPhase").checked;
+  const use_domain_freshness_defaults=!!document.getElementById("useDomainFreshnessDefaults").checked;
+  const artifact_reuse_mode="always_regenerate";
+  const artifact_reuse_max_age_hours=parseInt(document.getElementById("artifactReuseMaxAgeHours").value||"72",10);
+  const r=await fetch("/api/instruct_async",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({instruction,ai_backend,min_live_non_curated_citations,manual_auth_phase,use_domain_freshness_defaults,artifact_reuse_mode,artifact_reuse_max_age_hours})}).then(r=>r.json());
+  if(!r.ok){ showResponse(r); await refreshState(); return; }
+  startTaskPolling(r.task_id, { instruction, ai_backend, min_live_non_curated_citations, manual_auth_phase, use_domain_freshness_defaults, artifact_reuse_mode, artifact_reuse_max_age_hours, confirm_risky:false });
 }
 async function runReliabilitySuite(){
   const include_pytest = !!document.getElementById("suiteIncludePytest").checked;
@@ -541,6 +740,23 @@ async function runReliabilitySuite(){
   const pytest_args = rawArgs ? rawArgs.split(/\\s+/).filter(Boolean) : [];
   const r=await fetch("/api/reliability/run",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({include_pytest,include_desktop_smoke,pytest_args})}).then(r=>r.json());
   if(!r.ok){ showResponse(r); return; }
+  showResponse(r);
+  startTaskPolling(r.task_id, { confirm_risky:false });
+}
+async function scoreLastRunBenchmark(){
+  const r=await fetch("/api/benchmark/score_last_run",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(r=>r.json());
+  showResponse(r);
+  await refreshState();
+}
+async function runHuman20Suite(){
+  const r=await fetch("/api/benchmark/run_20_suite",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(r=>r.json());
+  if(!r.ok){ showResponse(r); await refreshState(); return; }
+  showResponse(r);
+  startTaskPolling(r.task_id, { confirm_risky:false });
+}
+async function runKiller5Suite(){
+  const r=await fetch("/api/benchmark/run_killer_suite",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(r=>r.json());
+  if(!r.ok){ showResponse(r); await refreshState(); return; }
   showResponse(r);
   startTaskPolling(r.task_id, { confirm_risky:false });
 }
@@ -675,6 +891,12 @@ window.onload=async()=>{
   toggleStrictRules(strictRulesVisible);
   renderHistory();
   await refreshState();
+  const instructionInput=document.getElementById("instruction");
+  if(instructionInput){
+    instructionInput.addEventListener("input", ()=>{ void refreshFreshnessPreview(); });
+  }
+  await refreshFreshnessPreview();
+  await loadDomainFreshnessPolicy();
   await vaultList();
 };
 </script>
@@ -751,8 +973,64 @@ class _Handler(BaseHTTPRequestHandler):
                     self.state.min_live_non_curated_citations = max(1, min(20, int(min_live)))
                 except Exception:
                     pass
+                reuse_mode = str(payload.get("artifact_reuse_mode", self.state.artifact_reuse_mode)).strip().lower()
+                if reuse_mode not in {"reuse", "reuse_if_recent", "always_regenerate"}:
+                    reuse_mode = self.state.artifact_reuse_mode
+                self.state.artifact_reuse_mode = reuse_mode
+                reuse_hours = payload.get("artifact_reuse_max_age_hours", self.state.artifact_reuse_max_age_hours)
+                try:
+                    self.state.artifact_reuse_max_age_hours = max(1, min(720, int(reuse_hours)))
+                except Exception:
+                    pass
+                self.state.use_domain_freshness_defaults = bool(
+                    payload.get("use_domain_freshness_defaults", self.state.use_domain_freshness_defaults)
+                )
                 _save_user_defaults_locked(self.state)
             self._send_json(200, self.state.snapshot())
+            return
+
+        if self.path == "/api/policy/freshness/get":
+            domain = str(payload.get("domain", "")).strip()
+            defaults = _load_policy_freshness_defaults()
+            domains = defaults.get("domains", {}) if isinstance(defaults.get("domains"), dict) else {}
+            cfg = domains.get(domain, {}) if isinstance(domains.get(domain), dict) else {}
+            mode = str(cfg.get("artifact_reuse_mode", "reuse_if_recent"))
+            hours = int(cfg.get("artifact_reuse_max_age_hours", 72))
+            self._send_json(200, {"ok": True, "domain": domain, "mode": mode, "max_age_hours": hours, "enabled": bool(defaults.get("enabled", True))})
+            return
+
+        if self.path == "/api/policy/freshness/preview":
+            instruction = str(payload.get("instruction", "")).strip()
+            requested_mode = str(payload.get("artifact_reuse_mode", self.state.artifact_reuse_mode))
+            requested_hours = payload.get("artifact_reuse_max_age_hours", self.state.artifact_reuse_max_age_hours)
+            use_defaults = bool(payload.get("use_domain_freshness_defaults", self.state.use_domain_freshness_defaults))
+            mode, hours, domain, source = _resolve_domain_freshness_defaults(
+                instruction=instruction,
+                requested_mode=requested_mode,
+                requested_hours=requested_hours,
+                use_domain_defaults=use_defaults,
+            )
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "instruction": instruction,
+                    "domain": domain,
+                    "mode": mode,
+                    "max_age_hours": hours,
+                    "source": source,
+                    "use_domain_freshness_defaults": use_defaults,
+                },
+            )
+            return
+
+        if self.path == "/api/policy/freshness/set":
+            domain = str(payload.get("domain", "")).strip()
+            mode = str(payload.get("mode", "")).strip().lower()
+            max_age_hours = payload.get("max_age_hours", 72)
+            result = _set_policy_freshness_domain(domain=domain, mode=mode, max_age_hours=max_age_hours)
+            status = 200 if bool(result.get("ok", False)) else 400
+            self._send_json(status, result)
             return
 
         if self.path == "/api/history/clear":
@@ -897,6 +1175,62 @@ class _Handler(BaseHTTPRequestHandler):
             )
             return
 
+        if self.path == "/api/benchmark/score_last_run":
+            with self.state.lock:
+                latest = dict(self.state.history[-1] or {}) if self.state.history else {}
+            if not latest:
+                self._send_json(
+                    400,
+                    {
+                        "ok": False,
+                        "error": "No run result available to benchmark.",
+                        "mode": "human_operator_benchmark",
+                    },
+                )
+                return
+            bench = benchmark_from_last_run(result=latest)
+            with self.state.lock:
+                self.state.benchmark_last_result = dict(bench)
+                self.state.history.append(bench)
+                self.state.history = self.state.history[-300:]
+                _save_history(self.state.history)
+            self._send_json(200, bench)
+            return
+
+        if self.path == "/api/benchmark/run_20_suite":
+            task_id = _start_human_operator_20_suite_task(self.state)
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "task_id": task_id,
+                    "mode": "human_operator_20_test_suite",
+                    "canvas": {
+                        "title": "Human 20-Test Suite Started",
+                        "subtitle": "Running scenarios sequentially with hard stop on first failure.",
+                        "cards": [],
+                    },
+                },
+            )
+            return
+
+        if self.path == "/api/benchmark/run_killer_suite":
+            task_id = _start_human_operator_killer_suite_task(self.state)
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "task_id": task_id,
+                    "mode": "human_operator_killer_5_suite",
+                    "canvas": {
+                        "title": "Human Killer 5 Suite Started",
+                        "subtitle": "Running K1..K5 sequentially with hard stop on first failure.",
+                        "cards": [],
+                    },
+                },
+            )
+            return
+
         if self.path == "/api/smoke/notepad":
             with self.state.lock:
                 granted = self.state.control_granted
@@ -1016,6 +1350,13 @@ class _Handler(BaseHTTPRequestHandler):
             ai_backend = normalize_backend(str(payload.get("ai_backend", "")))
             min_live = int(payload.get("min_live_non_curated_citations", 3))
             manual_auth_phase = bool(payload.get("manual_auth_phase", self.state.manual_auth_phase))
+            artifact_reuse_mode = str(payload.get("artifact_reuse_mode", self.state.artifact_reuse_mode)).strip().lower()
+            if artifact_reuse_mode not in {"reuse", "reuse_if_recent", "always_regenerate"}:
+                artifact_reuse_mode = self.state.artifact_reuse_mode
+            try:
+                artifact_reuse_max_age_hours = max(1, min(720, int(payload.get("artifact_reuse_max_age_hours", self.state.artifact_reuse_max_age_hours))))
+            except Exception:
+                artifact_reuse_max_age_hours = self.state.artifact_reuse_max_age_hours
             with self.state.lock:
                 if not instruction:
                     instruction = self.state.saved_automations.get(name, "")
@@ -1033,6 +1374,9 @@ class _Handler(BaseHTTPRequestHandler):
                 ai_backend=ai_backend,
                 min_live_non_curated_citations=min_live,
                 manual_auth_phase=manual_auth_phase,
+                use_domain_freshness_defaults=bool(payload.get("use_domain_freshness_defaults", self.state.use_domain_freshness_defaults)),
+                artifact_reuse_mode=artifact_reuse_mode,
+                artifact_reuse_max_age_hours=artifact_reuse_max_age_hours,
             )
             self._send_json(200, {"ok": True, "task_id": task_id, "instruction": instruction})
             return
@@ -1104,6 +1448,9 @@ class _Handler(BaseHTTPRequestHandler):
                     ai_backend=self.state.ai_backend,
                     min_live_non_curated_citations=self.state.min_live_non_curated_citations,
                     manual_auth_phase=False,
+                    use_domain_freshness_defaults=self.state.use_domain_freshness_defaults,
+                    artifact_reuse_mode=self.state.artifact_reuse_mode,
+                    artifact_reuse_max_age_hours=self.state.artifact_reuse_max_age_hours,
                     auth_session_id=auth_session_id,
                 )
                 self._send_json(200, {"ok": True, "task_id": task_id, "instruction": auth_instruction})
@@ -1115,7 +1462,7 @@ class _Handler(BaseHTTPRequestHandler):
             with self.state.lock:
                 auth_session_id = str(self.state.pending_auth_session_id or "")
                 auth_url = str(self.state.pending_auth_url or "https://mail.google.com/")
-            focused = focus_auth_session(auth_session_id=auth_session_id, fallback_url=auth_url)
+            focused = focus_auth_session(auth_session_id=auth_session_id, fallback_url=auth_url, allow_reopen=True)
             if focused.get("ok"):
                 self._send_json(
                     200,
@@ -1149,12 +1496,42 @@ class _Handler(BaseHTTPRequestHandler):
             )
             return
 
+        if self.path == "/api/session/reset":
+            with self.state.lock:
+                self.state.paused_for_credentials = False
+                self.state.pause_reason = ""
+                self.state.pending_plan = {}
+                self.state.pending_auth_instruction = ""
+                self.state.pending_auth_url = ""
+                self.state.pending_auth_session_id = ""
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "mode": "session_reset",
+                    "message": "Paused/auth session state cleared.",
+                    "canvas": {
+                        "title": "Session Reset",
+                        "subtitle": "Auth checkpoint state cleared.",
+                        "cards": [],
+                    },
+                },
+            )
+            return
+
         if self.path == "/api/instruct_async":
             instruction = str(payload.get("instruction", "")).strip()
             confirm_risky = bool(payload.get("confirm_risky", False))
             ai_backend = normalize_backend(str(payload.get("ai_backend", "")))
             min_live = int(payload.get("min_live_non_curated_citations", 3))
             manual_auth_phase = bool(payload.get("manual_auth_phase", self.state.manual_auth_phase))
+            artifact_reuse_mode = str(payload.get("artifact_reuse_mode", self.state.artifact_reuse_mode)).strip().lower()
+            if artifact_reuse_mode not in {"reuse", "reuse_if_recent", "always_regenerate"}:
+                artifact_reuse_mode = self.state.artifact_reuse_mode
+            try:
+                artifact_reuse_max_age_hours = max(1, min(720, int(payload.get("artifact_reuse_max_age_hours", self.state.artifact_reuse_max_age_hours))))
+            except Exception:
+                artifact_reuse_max_age_hours = self.state.artifact_reuse_max_age_hours
             with self.state.lock:
                 preflight_error = _preflight_gate_error_locked(self.state)
             if preflight_error:
@@ -1167,6 +1544,9 @@ class _Handler(BaseHTTPRequestHandler):
                 ai_backend=ai_backend,
                 min_live_non_curated_citations=min_live,
                 manual_auth_phase=manual_auth_phase,
+                use_domain_freshness_defaults=bool(payload.get("use_domain_freshness_defaults", self.state.use_domain_freshness_defaults)),
+                artifact_reuse_mode=artifact_reuse_mode,
+                artifact_reuse_max_age_hours=artifact_reuse_max_age_hours,
             )
             self._send_json(200, {"ok": True, "task_id": task_id})
             return
@@ -1183,6 +1563,22 @@ class _Handler(BaseHTTPRequestHandler):
                 auth_session_id = str(self.state.pending_auth_session_id or "")
                 ai_backend = normalize_backend(str(payload.get("ai_backend", self.state.ai_backend)))
                 min_live = max(1, min(20, int(payload.get("min_live_non_curated_citations", self.state.min_live_non_curated_citations))))
+                artifact_reuse_mode = str(payload.get("artifact_reuse_mode", self.state.artifact_reuse_mode)).strip().lower()
+                if artifact_reuse_mode not in {"reuse", "reuse_if_recent", "always_regenerate"}:
+                    artifact_reuse_mode = self.state.artifact_reuse_mode
+                try:
+                    artifact_reuse_max_age_hours = max(1, min(720, int(payload.get("artifact_reuse_max_age_hours", self.state.artifact_reuse_max_age_hours))))
+                except Exception:
+                    artifact_reuse_max_age_hours = self.state.artifact_reuse_max_age_hours
+                use_domain_freshness_defaults = bool(
+                    payload.get("use_domain_freshness_defaults", self.state.use_domain_freshness_defaults)
+                )
+            artifact_reuse_mode, artifact_reuse_max_age_hours, _domain, _source = _resolve_domain_freshness_defaults(
+                instruction=instruction,
+                requested_mode=artifact_reuse_mode,
+                requested_hours=artifact_reuse_max_age_hours,
+                use_domain_defaults=use_domain_freshness_defaults,
+            )
             if preflight_error:
                 self._send_json(412, _preflight_block_response(preflight_error))
                 return
@@ -1198,6 +1594,8 @@ class _Handler(BaseHTTPRequestHandler):
                 min_live_non_curated_citations=min_live,
                 manual_auth_phase=manual_auth_phase,
                 auth_session_id=auth_session_id,
+                artifact_reuse_mode=artifact_reuse_mode,
+                artifact_reuse_max_age_hours=artifact_reuse_max_age_hours,
             )
             with self.state.lock:
                 if result.get("ok"):
@@ -1264,12 +1662,21 @@ def run_ui_server(host: str = "127.0.0.1", port: int = 8795, open_browser: bool 
             manual_auth_phase = state.manual_auth_phase
             ai_backend = state.ai_backend
             min_live = state.min_live_non_curated_citations
+            reuse_mode = state.artifact_reuse_mode
+            reuse_hours = state.artifact_reuse_max_age_hours
+            use_domain_defaults = state.use_domain_freshness_defaults
         if not granted:
             return {"ok": False, "error": "Control not granted; scheduled run skipped."}
         if preflight_error:
             return _preflight_block_response(preflight_error)
         if not instruction:
             return {"ok": False, "error": f"Automation '{job.automation_name}' not found."}
+        reuse_mode, reuse_hours, _domain, _source = _resolve_domain_freshness_defaults(
+            instruction=instruction,
+            requested_mode=reuse_mode,
+            requested_hours=reuse_hours,
+            use_domain_defaults=use_domain_defaults,
+        )
         result = execute_instruction(
             instruction=instruction,
             control_granted=True,
@@ -1278,6 +1685,8 @@ def run_ui_server(host: str = "127.0.0.1", port: int = 8795, open_browser: bool 
             ai_backend=ai_backend,
             min_live_non_curated_citations=min_live,
             manual_auth_phase=manual_auth_phase,
+            artifact_reuse_mode=reuse_mode,
+            artifact_reuse_max_age_hours=reuse_hours,
         )
         with state.lock:
             if result.get("ok"):
@@ -1367,18 +1776,30 @@ def _apply_user_defaults(state: UiState) -> None:
     compression_mode = str(defaults.get("compression_mode", state.compression_mode)).strip().lower()
     policy_default = _load_policy_min_live_non_curated_citations()
     min_live = defaults.get("min_live_non_curated_citations", policy_default)
+    artifact_reuse_mode = str(defaults.get("artifact_reuse_mode", state.artifact_reuse_mode)).strip().lower()
+    artifact_reuse_max_age_hours = defaults.get("artifact_reuse_max_age_hours", state.artifact_reuse_max_age_hours)
+    use_domain_freshness_defaults = bool(defaults.get("use_domain_freshness_defaults", state.use_domain_freshness_defaults))
     try:
         min_live_val = max(1, min(20, int(min_live)))
     except Exception:
         min_live_val = policy_default
     if compression_mode not in {"aggressive", "normal", "strict"}:
         compression_mode = "normal"
+    if artifact_reuse_mode not in {"reuse", "reuse_if_recent", "always_regenerate"}:
+        artifact_reuse_mode = "reuse_if_recent"
+    try:
+        reuse_hours_val = max(1, min(720, int(artifact_reuse_max_age_hours)))
+    except Exception:
+        reuse_hours_val = 72
     with state.lock:
         state.step_mode = step_mode
         state.manual_auth_phase = manual_auth_phase
         state.ai_backend = ai_backend
         state.compression_mode = compression_mode
         state.min_live_non_curated_citations = min_live_val
+        state.artifact_reuse_mode = artifact_reuse_mode
+        state.artifact_reuse_max_age_hours = reuse_hours_val
+        state.use_domain_freshness_defaults = use_domain_freshness_defaults
         state.recorder.set_compression_mode(compression_mode)
 
 
@@ -1390,6 +1811,9 @@ def _save_user_defaults_locked(state: UiState) -> None:
             "ai_backend": state.ai_backend,
             "compression_mode": state.compression_mode,
             "min_live_non_curated_citations": state.min_live_non_curated_citations,
+            "artifact_reuse_mode": state.artifact_reuse_mode,
+            "artifact_reuse_max_age_hours": state.artifact_reuse_max_age_hours,
+            "use_domain_freshness_defaults": state.use_domain_freshness_defaults,
         },
         user=state.user_id,
     )
@@ -1407,16 +1831,144 @@ def _load_policy_min_live_non_curated_citations(default_value: int = 3) -> int:
         return default_value
 
 
+def _load_policy_yaml() -> Dict[str, Any]:
+    policy_path = Path("config/policy.yaml")
+    if not policy_path.exists():
+        return {}
+    try:
+        raw = yaml.safe_load(policy_path.read_text(encoding="utf-8")) or {}
+        return raw if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_policy_yaml(raw: Dict[str, Any]) -> None:
+    policy_path = Path("config/policy.yaml")
+    policy_path.parent.mkdir(parents=True, exist_ok=True)
+    policy_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+
+
+def _load_policy_freshness_defaults() -> Dict[str, Any]:
+    raw = _load_policy_yaml()
+    policies = raw.get("policies", {}) if isinstance(raw.get("policies"), dict) else {}
+    defaults = policies.get("freshness_defaults", {}) if isinstance(policies.get("freshness_defaults"), dict) else {}
+    enabled = bool(defaults.get("enabled", True))
+    domains = defaults.get("domains", {}) if isinstance(defaults.get("domains"), dict) else {}
+    out_domains: Dict[str, Dict[str, Any]] = {}
+    for domain, cfg in domains.items():
+        if not isinstance(cfg, dict):
+            continue
+        mode = str(cfg.get("artifact_reuse_mode", "reuse_if_recent")).strip().lower()
+        if mode not in {"reuse", "reuse_if_recent", "always_regenerate"}:
+            mode = "reuse_if_recent"
+        try:
+            hours = max(1, min(720, int(cfg.get("artifact_reuse_max_age_hours", 72))))
+        except Exception:
+            hours = 72
+        out_domains[str(domain)] = {"artifact_reuse_mode": mode, "artifact_reuse_max_age_hours": hours}
+    return {"enabled": enabled, "domains": out_domains}
+
+
+def _set_policy_freshness_domain(domain: str, mode: str, max_age_hours: int) -> Dict[str, Any]:
+    d = str(domain or "").strip()
+    if not d:
+        return {"ok": False, "error": "domain is required"}
+    m = str(mode or "").strip().lower()
+    if m not in {"reuse", "reuse_if_recent", "always_regenerate"}:
+        return {"ok": False, "error": "invalid mode"}
+    try:
+        hours = max(1, min(720, int(max_age_hours)))
+    except Exception:
+        return {"ok": False, "error": "invalid max_age_hours"}
+    raw = _load_policy_yaml()
+    policies = raw.get("policies")
+    if not isinstance(policies, dict):
+        policies = {}
+        raw["policies"] = policies
+    freshness = policies.get("freshness_defaults")
+    if not isinstance(freshness, dict):
+        freshness = {"enabled": True, "domains": {}}
+        policies["freshness_defaults"] = freshness
+    freshness["enabled"] = bool(freshness.get("enabled", True))
+    domains = freshness.get("domains")
+    if not isinstance(domains, dict):
+        domains = {}
+        freshness["domains"] = domains
+    domains[d] = {"artifact_reuse_mode": m, "artifact_reuse_max_age_hours": hours}
+    _save_policy_yaml(raw)
+    return {"ok": True, "domain": d, "mode": m, "max_age_hours": hours}
+
+
+def _infer_instruction_domain(instruction: str) -> str:
+    low = str(instruction or "").lower()
+    if any(x in low for x in ["gmail", "inbox", "email", "draft replies"]):
+        return "email_triage"
+    if any(x in low for x in ["job", "linkedin", "indeed", "salary"]):
+        return "job_market"
+    if any(x in low for x in ["competitor", "executive summary", "epic systems"]):
+        return "competitor_analysis"
+    if any(x in low for x in ["study", "flashcard", "quiz", "permit exam"]):
+        return "study_pack"
+    if any(x in low for x in ["document", "ppt", "powerpoint", "visual", "dashboard"]):
+        return "artifact_generation"
+    if any(x in low for x in ["open ", "click ", "type ", "notepad", "installed app"]):
+        return "desktop_sequence"
+    return "web_research"
+
+
+def _resolve_domain_freshness_defaults(
+    instruction: str,
+    requested_mode: str,
+    requested_hours: int,
+    use_domain_defaults: bool,
+) -> tuple[str, int, str, str]:
+    mode = str(requested_mode or "reuse_if_recent").strip().lower()
+    if mode not in {"reuse", "reuse_if_recent", "always_regenerate"}:
+        mode = "reuse_if_recent"
+    try:
+        hours = max(1, min(720, int(requested_hours)))
+    except Exception:
+        hours = 72
+    domain = _infer_instruction_domain(instruction)
+    if not use_domain_defaults:
+        return mode, hours, domain, "manual_override"
+    defaults = _load_policy_freshness_defaults()
+    if not bool(defaults.get("enabled", True)):
+        return mode, hours, domain, "policy_disabled"
+    domains = defaults.get("domains", {}) if isinstance(defaults.get("domains"), dict) else {}
+    cfg = domains.get(domain, {}) if isinstance(domains.get(domain), dict) else {}
+    if not cfg:
+        return mode, hours, domain, "domain_policy_missing"
+    pmode = str(cfg.get("artifact_reuse_mode", mode)).strip().lower()
+    if pmode not in {"reuse", "reuse_if_recent", "always_regenerate"}:
+        pmode = mode
+    try:
+        phours = max(1, min(720, int(cfg.get("artifact_reuse_max_age_hours", hours))))
+    except Exception:
+        phours = hours
+    return pmode, phours, domain, "domain_default"
+
+
 def _preflight_status_locked(state: UiState) -> Dict[str, Any]:
     required = bool(state.preflight_required)
-    latest = dict(state.reliability_suite_result or {})
     if not required:
         return {"required": False, "green": True, "reason": "Preflight gate disabled."}
-    if not latest:
+    reliability = dict(state.reliability_suite_result or {})
+    core20 = dict(state.human_suite_result or {})
+    killer5 = dict(state.killer_suite_result or {})
+    if not reliability:
         return {"required": True, "green": False, "reason": "Run Reliability Suite first."}
-    if not bool(latest.get("ok", False)):
+    if not bool(reliability.get("ok", False)):
         return {"required": True, "green": False, "reason": "Latest reliability suite is not green."}
-    finished_at = float(latest.get("finished_at", 0.0) or 0.0)
+    if not core20:
+        return {"required": True, "green": False, "reason": "Run Human 20-Test Suite first."}
+    if not bool(core20.get("ok", False)) or str(core20.get("suite", "")) != "core20":
+        return {"required": True, "green": False, "reason": "Latest Human 20-Test Suite is not green."}
+    if not killer5:
+        return {"required": True, "green": False, "reason": "Run Killer 5 Suite first."}
+    if not bool(killer5.get("ok", False)) or str(killer5.get("suite", "")) != "killer5":
+        return {"required": True, "green": False, "reason": "Latest Killer 5 Suite is not green."}
+    finished_at = float(reliability.get("finished_at", 0.0) or 0.0)
     return {"required": True, "green": True, "reason": "Preflight green.", "finished_at": finished_at}
 
 
@@ -1490,6 +2042,9 @@ def _start_instruction_task(
     ai_backend: str,
     min_live_non_curated_citations: int = 3,
     manual_auth_phase: bool = True,
+    use_domain_freshness_defaults: bool = True,
+    artifact_reuse_mode: str = "reuse_if_recent",
+    artifact_reuse_max_age_hours: int = 72,
     auth_session_id: str = "",
 ) -> str:
     task_id = uuid.uuid4().hex
@@ -1527,6 +2082,17 @@ def _start_instruction_task(
             step_mode = state.step_mode
             backend = normalize_backend(str(ai_backend or state.ai_backend))
             min_live = max(1, min(20, int(min_live_non_curated_citations or state.min_live_non_curated_citations)))
+            reuse_mode = str(artifact_reuse_mode or state.artifact_reuse_mode).strip().lower()
+            if reuse_mode not in {"reuse", "reuse_if_recent", "always_regenerate"}:
+                reuse_mode = state.artifact_reuse_mode
+            reuse_hours = max(1, min(720, int(artifact_reuse_max_age_hours or state.artifact_reuse_max_age_hours)))
+            use_domain_defaults = bool(use_domain_freshness_defaults if use_domain_freshness_defaults is not None else state.use_domain_freshness_defaults)
+            reuse_mode, reuse_hours, _domain, _source = _resolve_domain_freshness_defaults(
+                instruction=instruction,
+                requested_mode=reuse_mode,
+                requested_hours=reuse_hours,
+                use_domain_defaults=use_domain_defaults,
+            )
         if paused:
             with state.lock:
                 task = state.tasks.get(task_id, {})
@@ -1550,6 +2116,8 @@ def _start_instruction_task(
                 min_live_non_curated_citations=min_live,
                 manual_auth_phase=manual_auth_phase,
                 auth_session_id=auth_session_id,
+                artifact_reuse_mode=reuse_mode,
+                artifact_reuse_max_age_hours=reuse_hours,
                 progress_cb=_progress,
             )
             with state.lock:
@@ -1665,6 +2233,146 @@ def _start_reliability_suite_task(
                         "status": "error",
                         "progress": 100,
                         "message": "Reliability suite failed",
+                        "error": str(exc),
+                        "finished_ts": time.time(),
+                    }
+                )
+
+    threading.Thread(target=_runner, daemon=True).start()
+    return task_id
+
+
+def _start_human_operator_20_suite_task(state: UiState) -> str:
+    task_id = uuid.uuid4().hex
+    now = time.time()
+    with state.lock:
+        state.tasks[task_id] = {
+            "id": task_id,
+            "status": "running",
+            "progress": 0,
+            "message": "Running human operator 20-test suite",
+            "events": [{"ts": now, "progress": 0, "message": "Starting human operator 20-test suite"}],
+            "result": {},
+            "error": "",
+            "started_ts": now,
+            "finished_ts": 0.0,
+        }
+        state.current_task_id = task_id
+        state.human_suite_task_id = task_id
+        state.human_suite_result = {}
+        state.tasks = _trim_tasks(state.tasks)
+
+    def _runner() -> None:
+        try:
+            with state.lock:
+                task = state.tasks.get(task_id, {})
+                events = task.get("events", [])
+                events.append({"ts": time.time(), "progress": 20, "message": "Executing scenarios S01..S20"})
+                task["events"] = events[-120:]
+                task["progress"] = 20
+                task["message"] = "Executing scenarios S01..S20"
+            result = run_human_operator_20_suite(
+                scenarios_path="config/human_operator_scenarios.json",
+                artifacts_root="test_artifacts/human_operator_core20_suite",
+                stop_on_fail=True,
+            )
+            with state.lock:
+                task = state.tasks.get(task_id, {})
+                task.update(
+                    {
+                        "status": "done",
+                        "progress": 100,
+                        "message": "Human operator suite completed",
+                        "result": result,
+                        "error": "",
+                        "finished_ts": time.time(),
+                    }
+                )
+                events = task.get("events", [])
+                events.append({"ts": time.time(), "progress": 100, "message": "Human operator suite completed"})
+                task["events"] = events[-120:]
+                state.human_suite_result = result
+                state.history.append(result)
+                state.history = state.history[-300:]
+                _save_history(state.history)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            with state.lock:
+                task = state.tasks.get(task_id, {})
+                task.update(
+                    {
+                        "status": "error",
+                        "progress": 100,
+                        "message": "Human operator suite failed",
+                        "error": str(exc),
+                        "finished_ts": time.time(),
+                    }
+                )
+
+    threading.Thread(target=_runner, daemon=True).start()
+    return task_id
+
+
+def _start_human_operator_killer_suite_task(state: UiState) -> str:
+    task_id = uuid.uuid4().hex
+    now = time.time()
+    with state.lock:
+        state.tasks[task_id] = {
+            "id": task_id,
+            "status": "running",
+            "progress": 0,
+            "message": "Running human operator killer 5 suite",
+            "events": [{"ts": now, "progress": 0, "message": "Starting human operator killer 5 suite"}],
+            "result": {},
+            "error": "",
+            "started_ts": now,
+            "finished_ts": 0.0,
+        }
+        state.current_task_id = task_id
+        state.killer_suite_task_id = task_id
+        state.killer_suite_result = {}
+        state.tasks = _trim_tasks(state.tasks)
+
+    def _runner() -> None:
+        try:
+            with state.lock:
+                task = state.tasks.get(task_id, {})
+                events = task.get("events", [])
+                events.append({"ts": time.time(), "progress": 20, "message": "Executing scenarios K1..K5"})
+                task["events"] = events[-120:]
+                task["progress"] = 20
+                task["message"] = "Executing scenarios K1..K5"
+            result = run_human_operator_killer_suite(
+                scenarios_path="config/human_operator_scenarios.json",
+                artifacts_root="test_artifacts/human_operator_killer_suite",
+                stop_on_fail=True,
+            )
+            with state.lock:
+                task = state.tasks.get(task_id, {})
+                task.update(
+                    {
+                        "status": "done",
+                        "progress": 100,
+                        "message": "Human operator killer suite completed",
+                        "result": result,
+                        "error": "",
+                        "finished_ts": time.time(),
+                    }
+                )
+                events = task.get("events", [])
+                events.append({"ts": time.time(), "progress": 100, "message": "Human operator killer suite completed"})
+                task["events"] = events[-120:]
+                state.killer_suite_result = result
+                state.history.append(result)
+                state.history = state.history[-300:]
+                _save_history(state.history)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            with state.lock:
+                task = state.tasks.get(task_id, {})
+                task.update(
+                    {
+                        "status": "error",
+                        "progress": 100,
+                        "message": "Human operator killer suite failed",
                         "error": str(exc),
                         "finished_ts": time.time(),
                     }

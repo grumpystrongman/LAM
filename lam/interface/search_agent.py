@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import csv
@@ -15,18 +15,40 @@ import urllib.parse
 import urllib.request
 import webbrowser
 import xml.etree.ElementTree as ET
-from datetime import datetime
+import imaplib
+from email import message_from_bytes
+from email.message import EmailMessage
+from email.header import decode_header
+from email.utils import parseaddr, parsedate_to_datetime
+from imaplib import Time2Internaldate
+from datetime import datetime, timedelta
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from lam.interface.ai_backend import backend_metadata, normalize_backend
-from lam.interface.app_launcher import normalize_app_name, open_installed_app
+from lam.interface.app_launcher import is_app_running, normalize_app_name, open_installed_app
 from lam.interface.app_learner import get_guidance
 from lam.interface.desktop_sequence import assess_risk, build_plan, execute_plan
+from lam.interface.domain_playbooks import (
+    build_step_obligations,
+    evaluate_step_obligations,
+    select_playbook,
+    validate_plan_steps,
+    validate_transition_graph,
+)
+from lam.interface.human_judgment import (
+    ActionCritic,
+    EleganceBudget,
+    NegativeMemory,
+    QualityCritic,
+    assess_result_quality,
+)
 from lam.interface.local_vector_store import LocalVectorStore
 from lam.interface.operator_contract import attach_operator_contract
 from lam.interface.password_vault import LocalPasswordVault
+from lam.interface.session_manager import SessionManager
+from lam.interface.world_model import build_run_world_model
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 MIN_LIVE_NON_CURATED_CITATIONS = 3
@@ -63,6 +85,27 @@ COMMUNICATION_SOCIAL_KEYWORDS = {
     "reddit",
 }
 
+HUMAN_JUDGMENT_SUPERLATIVE_TOKENS = {
+    "best",
+    "most expensive",
+    "cheapest",
+    "closest",
+    "fastest",
+    "latest",
+    "top",
+    "highest",
+    "highest-rated",
+    "most relevant",
+}
+
+HUMAN_JUDGMENT_LOCALITY_TOKENS = {
+    "near me",
+    "locally",
+    "local",
+    "around here",
+    "in ",
+}
+
 
 @dataclass(slots=True)
 class SearchResult:
@@ -85,6 +128,15 @@ class JobListing:
     salary_max: Optional[float]
     currency: str
     snippet: str = ""
+
+
+@dataclass(slots=True)
+class JobSearchConstraints:
+    require_vp_avp: bool
+    require_remote_or_hybrid: bool
+    min_base_salary_usd: Optional[float]
+    min_total_comp_usd: Optional[float]
+    allowed_regions: List[str]
 
 
 @dataclass(slots=True)
@@ -111,6 +163,101 @@ class EmailActionItem:
 
 
 _EMAIL_AUTH_SESSIONS: Dict[str, Dict[str, Any]] = {}
+ARTIFACT_REUSE_MODES = {"reuse", "reuse_if_recent", "always_regenerate"}
+
+
+def _artifact_reuse_index_path() -> Path:
+    path = Path("data/interface/artifact_reuse_index.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _load_artifact_reuse_index() -> Dict[str, Any]:
+    path = _artifact_reuse_index_path()
+    if not path.exists():
+        return {"entries": []}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            raw.setdefault("entries", [])
+            return raw
+    except Exception:
+        pass
+    return {"entries": []}
+
+
+def _save_artifact_reuse_index(index: Dict[str, Any]) -> None:
+    path = _artifact_reuse_index_path()
+    path.write_text(json.dumps(index, indent=2), encoding="utf-8")
+
+
+def _artifact_instruction_key(instruction: str) -> str:
+    normalized = re.sub(r"\s+", " ", str(instruction or "").strip().lower())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _remember_artifacts_for_reuse(kind: str, instruction: str, artifacts: Dict[str, str]) -> None:
+    if not isinstance(artifacts, dict) or not artifacts:
+        return
+    index = _load_artifact_reuse_index()
+    entries = [x for x in index.get("entries", []) if isinstance(x, dict)]
+    key = _artifact_instruction_key(instruction)
+    filtered: List[Dict[str, Any]] = []
+    for item in entries:
+        if str(item.get("kind", "")) == str(kind) and str(item.get("instruction_key", "")) == key:
+            continue
+        filtered.append(item)
+    filtered.append(
+        {
+            "ts": time.time(),
+            "kind": str(kind),
+            "instruction_key": key,
+            "instruction": str(instruction)[:500],
+            "artifacts": {k: str(v) for k, v in artifacts.items() if isinstance(v, str)},
+        }
+    )
+    index["entries"] = filtered[-300:]
+    _save_artifact_reuse_index(index)
+
+
+def _find_reusable_artifacts(kind: str, instruction: str, required_keys: List[str], max_age_hours: int = 24) -> Dict[str, str]:
+    index = _load_artifact_reuse_index()
+    entries = [x for x in index.get("entries", []) if isinstance(x, dict)]
+    key = _artifact_instruction_key(instruction)
+    now = time.time()
+    for item in reversed(entries):
+        if str(item.get("kind", "")) != str(kind):
+            continue
+        if str(item.get("instruction_key", "")) != key:
+            continue
+        ts = float(item.get("ts", 0.0) or 0.0)
+        if ts <= 0 or (now - ts) > max_age_hours * 3600:
+            continue
+        artifacts = item.get("artifacts", {})
+        if not isinstance(artifacts, dict):
+            continue
+        if required_keys and any(str(k) not in artifacts for k in required_keys):
+            continue
+        paths_ok = True
+        for value in artifacts.values():
+            if not isinstance(value, str):
+                paths_ok = False
+                break
+            if value.startswith(("http://", "https://")):
+                continue
+            if not Path(value).exists():
+                paths_ok = False
+                break
+        if paths_ok:
+            return {k: str(v) for k, v in artifacts.items() if isinstance(v, str)}
+    return {}
+
+
+def _normalize_artifact_reuse_mode(mode: str) -> str:
+    value = str(mode or "").strip().lower()
+    if value not in ARTIFACT_REUSE_MODES:
+        return "reuse_if_recent"
+    return value
 
 
 def _fetch_text(url: str) -> str:
@@ -487,18 +634,73 @@ def _write_simple_pptx(pptx_path: Path, title: str, subtitle: str, bullets: List
     prs.save(str(pptx_path))
 
 
-def _run_artifact_generation(plan: Dict[str, Any], instruction: str, progress_cb: Optional[Callable[[int, str], None]] = None) -> Dict[str, Any]:
+def _run_artifact_generation(
+    plan: Dict[str, Any],
+    instruction: str,
+    progress_cb: Optional[Callable[[int, str], None]] = None,
+    artifact_reuse_mode: str = "reuse_if_recent",
+    artifact_reuse_max_age_hours: int = 72,
+) -> Dict[str, Any]:
     _emit_progress(progress_cb, 20, "Generating requested artifacts")
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = Path("data/reports/artifact_generation") / ts
-    out_dir.mkdir(parents=True, exist_ok=True)
-
     deliverables = {str(x).lower() for x in (plan.get("deliverables") or [])}
     objective = str(plan.get("objective", instruction)).strip()
     title = objective[:100] if objective else "Generated Artifact"
     bullets = [seg.strip().capitalize() for seg in re.split(r"[.;]", objective) if seg.strip()]
     if not bullets:
         bullets = ["Generated from user instruction."]
+    required_keys: List[str] = []
+    if "document" in deliverables or "executive_summary" in deliverables:
+        required_keys.append("document_md")
+    if "powerpoint" in deliverables:
+        required_keys.append("powerpoint_pptx")
+    if "visual" in deliverables:
+        required_keys.append("visual_html")
+    reuse_mode = _normalize_artifact_reuse_mode(artifact_reuse_mode)
+    max_age = max(1, min(24 * 30, int(artifact_reuse_max_age_hours or 72)))
+    reusable: Dict[str, str] = {}
+    if reuse_mode != "always_regenerate":
+        age_limit = 24 * 30 if reuse_mode == "reuse" else max_age
+        reusable = _find_reusable_artifacts(
+            kind="artifact_generation",
+            instruction=instruction,
+            required_keys=required_keys,
+            max_age_hours=age_limit,
+        )
+    if reusable:
+        open_target = reusable.get("visual_html") or reusable.get("document_md") or reusable.get("powerpoint_pptx", "")
+        opened_uri = ""
+        nav: Dict[str, Any] = {}
+        if open_target:
+            opened_uri, nav = _open_target_with_reuse(
+                target_url=Path(open_target).resolve().as_uri(),
+                recent_actions=[f"open_tab:{Path(open_target).resolve().as_uri()}"],
+            )
+        _emit_progress(progress_cb, 100, "Completed")
+        return {
+            "ok": True,
+            "mode": "artifact_generation",
+            "query": objective,
+            "results_count": 0,
+            "results": [],
+            "artifacts": reusable,
+            "summary": {
+                "outputs_generated": sorted(reusable.keys()),
+                "reused_existing_outputs": True,
+                "artifact_reuse_mode": reuse_mode,
+                "artifact_reuse_max_age_hours": max_age,
+                "action_critic": nav.get("decision", {}),
+            },
+            "opened_url": opened_uri,
+            "canvas": {
+                "title": "Artifacts Reused",
+                "subtitle": objective[:120],
+                "cards": [{"title": k, "price": "reused", "source": "artifact", "url": Path(v).resolve().as_uri()} for k, v in reusable.items()],
+            },
+        }
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = Path("data/reports/artifact_generation") / ts
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     artifacts: Dict[str, str] = {}
     if "document" in deliverables or "executive_summary" in deliverables:
@@ -530,11 +732,15 @@ def _run_artifact_generation(plan: Dict[str, Any], instruction: str, progress_cb
         )
         artifacts["visual_html"] = str(visual_path.resolve())
 
+    _remember_artifacts_for_reuse(kind="artifact_generation", instruction=instruction, artifacts=artifacts)
     open_target = artifacts.get("visual_html") or artifacts.get("document_md") or artifacts.get("powerpoint_pptx", "")
     opened_uri = ""
+    nav: Dict[str, Any] = {}
     if open_target:
-        opened_uri = Path(open_target).resolve().as_uri()
-        webbrowser.open(opened_uri, new=2)
+        opened_uri, nav = _open_target_with_reuse(
+            target_url=Path(open_target).resolve().as_uri(),
+            recent_actions=[f"open_tab:{Path(open_target).resolve().as_uri()}"],
+        )
 
     _emit_progress(progress_cb, 100, "Completed")
     return {
@@ -544,12 +750,61 @@ def _run_artifact_generation(plan: Dict[str, Any], instruction: str, progress_cb
         "results_count": 0,
         "results": [],
         "artifacts": artifacts,
-        "summary": {"outputs_generated": sorted(artifacts.keys())},
+        "summary": {
+            "outputs_generated": sorted(artifacts.keys()),
+            "reused_existing_outputs": False,
+            "artifact_reuse_mode": reuse_mode,
+            "artifact_reuse_max_age_hours": max_age,
+            "action_critic": nav.get("decision", {}),
+        },
         "opened_url": opened_uri,
         "canvas": {
             "title": "Artifacts Generated",
             "subtitle": objective[:120],
             "cards": [{"title": k, "price": "saved", "source": "artifact", "url": Path(v).resolve().as_uri()} for k, v in artifacts.items()],
+        },
+    }
+
+
+def _ensure_elegance_budget(summary: Dict[str, Any], elegance: EleganceBudget) -> Dict[str, Any]:
+    out = dict(summary or {})
+    out["elegance_budget"] = elegance.snapshot()
+    return out
+
+
+def _apply_freshness_metadata(summary: Dict[str, Any], artifact_reuse_mode: str, artifact_reuse_max_age_hours: int) -> Dict[str, Any]:
+    out = dict(summary or {})
+    out.setdefault("artifact_reuse_mode", _normalize_artifact_reuse_mode(artifact_reuse_mode))
+    try:
+        out.setdefault("artifact_reuse_max_age_hours", max(1, min(24 * 30, int(artifact_reuse_max_age_hours))))
+    except Exception:
+        out.setdefault("artifact_reuse_max_age_hours", 72)
+    return out
+
+
+def _enforce_elegance_budget_gate(
+    *,
+    elegance: EleganceBudget,
+    mode: str,
+    instruction: str,
+) -> Optional[Dict[str, Any]]:
+    if elegance.consumed <= elegance.total:
+        return None
+    snap = elegance.snapshot()
+    return {
+        "ok": False,
+        "mode": mode,
+        "instruction": instruction,
+        "error": "elegance_budget_exceeded",
+        "error_code": "elegance_budget_exceeded",
+        "summary": {
+            "error": "elegance_budget_exceeded",
+            "elegance_budget": snap,
+        },
+        "canvas": {
+            "title": "Run Blocked",
+            "subtitle": "Elegance budget exceeded; path is too wasteful.",
+            "cards": [],
         },
     }
 
@@ -572,16 +827,129 @@ def _verification_block(ok: bool, plan_steps: List[Dict[str, Any]], result: Dict
     return {"passed": all(bool(c["pass"]) for c in checks), "checks": checks, "evidence": evidence}
 
 
+def _resolve_navigation_target(
+    *,
+    target_url: str,
+    recent_actions: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    target = str(target_url or "").strip()
+    if not target:
+        return {"url": "", "reused": False, "opened": False, "decision": {"score": 0.0, "reasons": ["missing_target"]}}
+    host = urllib.parse.urlparse(target).netloc.lower()
+    manager = SessionManager()
+    reusable = manager.find_reusable_authenticated_tab(host) if host else ""
+    if not reusable:
+        reusable = manager.find_reusable_url(target)
+    already_open = bool(reusable and reusable == target)
+    ctx: Dict[str, Any] = {"recent_actions": list(recent_actions or [])[-5:]}
+    if reusable:
+        ctx["reusable_target"] = reusable
+    decision = ActionCritic().evaluate(
+        next_action="open_tab",
+        target=target,
+        already_open=already_open,
+        context=ctx,
+    )
+    if reusable and not decision.allow and any(
+        r in {"shortest_path_reuse_existing_state", "redundant_open"} for r in decision.reasons
+    ):
+        return {
+            "url": reusable,
+            "reused": True,
+            "opened": False,
+            "decision": {"score": decision.score, "reasons": decision.reasons, "elegance_cost": decision.elegance_cost},
+        }
+    try:
+        webbrowser.open(target, new=2)
+        manager.remember_tab(url=target, title="Navigation Target", authenticated=False)
+        return {
+            "url": target,
+            "reused": False,
+            "opened": True,
+            "decision": {"score": decision.score, "reasons": decision.reasons, "elegance_cost": decision.elegance_cost},
+        }
+    except Exception:
+        return {
+            "url": target,
+            "reused": False,
+            "opened": False,
+            "decision": {"score": decision.score, "reasons": decision.reasons, "elegance_cost": decision.elegance_cost},
+        }
+
+
+def _open_target_with_reuse(target_url: str, recent_actions: Optional[List[str]] = None) -> tuple[str, Dict[str, Any]]:
+    nav = _resolve_navigation_target(target_url=target_url, recent_actions=recent_actions)
+    opened = str(nav.get("url", "") or target_url or "")
+    return opened, nav
+
+
 def _finalize_operator_result(result: Dict[str, Any], instruction: str, plan_steps: List[Dict[str, Any]]) -> Dict[str, Any]:
     out = dict(result)
     out["planned_steps"] = _summarize_plan_steps(plan_steps)
     out["undo_plan"] = _build_undo_plan(plan_steps)
+    plan = out.get("plan", {}) if isinstance(out.get("plan"), dict) else {}
+    domain = str(plan.get("domain", out.get("mode", "general") or "general"))
+    playbook = select_playbook(domain=domain, instruction=instruction)
+    out["playbook"] = playbook
+    out["narration"] = _build_run_narration(out=out, playbook=playbook)
+    summary = out.get("summary", {}) if isinstance(out.get("summary"), dict) else {}
+    out["critics"] = {
+        "action": summary.get("action_critic", {}),
+        "quality": summary.get("judgment", {}),
+        "elegance_budget": summary.get("elegance_budget", {}),
+    }
+    out["world_model"] = build_run_world_model(
+        instruction=instruction,
+        mode=str(out.get("mode", "unknown")),
+        domain=domain,
+        playbook=playbook,
+        opened_url=str(out.get("opened_url", "")),
+        paused_for_credentials=bool(out.get("paused_for_credentials", False)),
+        pause_reason=str(out.get("pause_reason", "")),
+        auth_session_id=str(out.get("auth_session_id", "")),
+        artifacts=out.get("artifacts", {}) if isinstance(out.get("artifacts"), dict) else {},
+        summary=out.get("summary", {}) if isinstance(out.get("summary"), dict) else {},
+        source_status=out.get("source_status", {}) if isinstance(out.get("source_status"), dict) else {},
+        decision_log=out.get("decision_log", []) if isinstance(out.get("decision_log"), list) else [],
+        results_count=int(out.get("results_count", 0) or 0),
+        playbook_validation=plan.get("playbook_validation", {}) if isinstance(plan.get("playbook_validation"), dict) else {},
+        playbook_graph_validation=plan.get("playbook_graph_validation", {}) if isinstance(plan.get("playbook_graph_validation"), dict) else {},
+        playbook_step_obligations=plan.get("playbook_step_obligations", {}) if isinstance(plan.get("playbook_step_obligations"), dict) else {},
+    )
     out["operator_contract"] = {
         "instruction": instruction,
         "model": "plan_validate_execute_verify_report",
         "least_privilege": True,
     }
     return attach_operator_contract(instruction=instruction, result=out, plan_steps=plan_steps)
+
+
+def _build_run_narration(out: Dict[str, Any], playbook: Dict[str, Any]) -> List[str]:
+    lines: List[str] = []
+    pb_name = str(playbook.get("name", "General Operator Playbook")).strip()
+    if pb_name:
+        lines.append(f"Selected playbook: {pb_name}.")
+    opened_url = str(out.get("opened_url", "")).strip()
+    if opened_url:
+        lines.append(f"Working target: {opened_url}.")
+    summary = out.get("summary", {}) if isinstance(out.get("summary"), dict) else {}
+    if bool(summary.get("auth_session_reused", False)):
+        lines.append("Reused existing authenticated session state.")
+    if bool(out.get("paused_for_credentials", False)):
+        reason = str(out.get("pause_reason", "")).strip() or "User authentication is required."
+        lines.append(f"Paused for user action: {reason}")
+    artifacts = out.get("artifacts", {}) if isinstance(out.get("artifacts"), dict) else {}
+    if artifacts:
+        lines.append(f"Created {len(artifacts)} artifact(s): {', '.join(sorted(artifacts.keys())[:4])}.")
+    if isinstance(out.get("decision_log"), list) and out.get("decision_log"):
+        lines.append(f"Planner decisions: {len(out.get('decision_log', []))} recorded.")
+    source_status = out.get("source_status", {}) if isinstance(out.get("source_status"), dict) else {}
+    if source_status:
+        first_key = next(iter(source_status.keys()))
+        lines.append(f"Primary source status: {first_key}={source_status.get(first_key)}.")
+    if not lines:
+        lines.append("Execution completed with no notable environment events.")
+    return lines[:8]
 
 
 def execute_instruction(
@@ -593,11 +961,18 @@ def execute_instruction(
     min_live_non_curated_citations: Optional[int] = None,
     manual_auth_phase: bool = False,
     auth_session_id: Optional[str] = None,
+    artifact_reuse_mode: str = "reuse_if_recent",
+    artifact_reuse_max_age_hours: int = 72,
     progress_cb: Optional[Callable[[int, str], None]] = None,
 ) -> Dict[str, Any]:
     _emit_progress(progress_cb, 2, "Understanding your request")
     ai_meta = backend_metadata(ai_backend)
     ai_backend = normalize_backend(ai_backend)
+    freshness_mode = _normalize_artifact_reuse_mode(artifact_reuse_mode)
+    try:
+        freshness_hours = max(1, min(24 * 30, int(artifact_reuse_max_age_hours)))
+    except Exception:
+        freshness_hours = 72
     if not control_granted:
         return {
             "ok": False,
@@ -616,6 +991,9 @@ def execute_instruction(
         _emit_progress(progress_cb, 8, "Building deterministic artifact plan")
         plan = _build_artifact_generation_plan(normalized)
         plan_steps = [dict(x) for x in plan.get("steps", [])]
+        elegance = EleganceBudget(total=70)
+        if len(plan_steps) > 4:
+            elegance.consume(len(plan_steps) - 4, "artifact_plan_complexity")
         requested_outputs = _requested_outputs(normalized)
         represented_outputs = _plan_represented_outputs(plan, plan_steps)
         if requested_outputs and any(x not in represented_outputs for x in requested_outputs):
@@ -626,7 +1004,20 @@ def execute_instruction(
                 requested_outputs=requested_outputs,
                 represented_outputs=represented_outputs,
             )
-        execution = _run_artifact_generation(plan=plan, instruction=instruction, progress_cb=progress_cb)
+        execution = _run_artifact_generation(
+            plan=plan,
+            instruction=instruction,
+            progress_cb=progress_cb,
+            artifact_reuse_mode=freshness_mode,
+            artifact_reuse_max_age_hours=freshness_hours,
+        )
+        summary = execution.get("summary", {}) if isinstance(execution.get("summary"), dict) else {}
+        summary = _apply_freshness_metadata(summary, freshness_mode, freshness_hours)
+        execution["summary"] = _ensure_elegance_budget(summary, elegance)
+        budget_block = _enforce_elegance_budget_gate(elegance=elegance, mode="artifact_generation", instruction=instruction)
+        if budget_block:
+            budget_block["plan"] = plan
+            return _finalize_operator_result(budget_block, instruction=instruction, plan_steps=plan_steps)
         execution["ai"] = ai_meta
         execution["plan"] = plan
         return _finalize_operator_result(execution, instruction=instruction, plan_steps=plan_steps)
@@ -635,6 +1026,9 @@ def execute_instruction(
         _emit_progress(progress_cb, 8, "Building execution plan")
         plan = _build_native_plan(normalized)
         plan_steps = [dict(x) for x in plan.get("steps", [])]
+        elegance = EleganceBudget(total=80)
+        if len(plan_steps) > 5:
+            elegance.consume(len(plan_steps) - 5, "native_plan_complexity")
         requested_outputs = _requested_outputs(normalized)
         represented_outputs = _plan_represented_outputs(plan, plan_steps)
         if requested_outputs and any(x not in represented_outputs for x in requested_outputs):
@@ -676,6 +1070,15 @@ def execute_instruction(
             manual_auth_phase=manual_auth_phase,
             auth_session_id=auth_session_id,
         )
+        ex_summary = execution.get("summary", {}) if isinstance(execution.get("summary"), dict) else {}
+        ex_summary = _apply_freshness_metadata(ex_summary, freshness_mode, freshness_hours)
+        execution["summary"] = _ensure_elegance_budget(ex_summary, elegance)
+        budget_block = _enforce_elegance_budget_gate(elegance=elegance, mode="autonomous_plan_execute", instruction=instruction)
+        if budget_block:
+            budget_block["plan"] = plan
+            budget_block["ai"] = ai_meta
+            _emit_progress(progress_cb, 100, "Completed")
+            return _finalize_operator_result(budget_block, instruction=instruction, plan_steps=plan_steps)
         execution["ai"] = ai_meta
         _emit_progress(progress_cb, 100, "Completed")
         return _finalize_operator_result(execution, instruction=instruction, plan_steps=plan_steps)
@@ -684,6 +1087,9 @@ def execute_instruction(
         _emit_progress(progress_cb, 12, "Building desktop action sequence")
         plan = build_plan(normalized)
         plan_steps = [dict(x) for x in plan.get("steps", [])]
+        elegance = EleganceBudget(total=65)
+        if len(plan_steps) > 6:
+            elegance.consume(len(plan_steps) - 6, "desktop_plan_complexity")
         requested_outputs = _requested_outputs(normalized)
         represented_outputs = _plan_represented_outputs(plan, plan_steps)
         if requested_outputs and any(x not in represented_outputs for x in requested_outputs):
@@ -761,6 +1167,16 @@ def execute_instruction(
                 ],
             },
         }
+        response_summary = {
+            "executed_steps": len(run.trace),
+            "elegance_budget": elegance.snapshot(),
+        }
+        response["summary"] = _apply_freshness_metadata(response_summary, freshness_mode, freshness_hours)
+        budget_block = _enforce_elegance_budget_gate(elegance=elegance, mode="desktop_sequence", instruction=instruction)
+        if budget_block:
+            budget_block["plan"] = plan
+            budget_block["ai"] = ai_meta
+            return _finalize_operator_result(budget_block, instruction=instruction, plan_steps=plan_steps)
         return _finalize_operator_result(response, instruction=instruction, plan_steps=plan_steps)
 
     open_match = re.search(r"\bopen\s+(.+?)(?:\s+app)?\b", normalized, flags=re.IGNORECASE)
@@ -768,7 +1184,21 @@ def execute_instruction(
         _emit_progress(progress_cb, 15, "Opening installed application")
         target = open_match.group(1).strip()
         plan_steps = [{"action": "open_app", "app": normalize_app_name(target)}]
-        ok, launched = open_installed_app(target)
+        running, running_ref = is_app_running(target)
+        app_name = normalize_app_name(target)
+        app_target = app_name or target
+        action_decision = ActionCritic().evaluate(
+            next_action="open_app",
+            target=app_target,
+            already_open=running,
+            context={"reusable_target": app_target if running else "", "recent_actions": [f"open_app:{app_target}"]},
+        )
+        launched = ""
+        if running and not action_decision.allow:
+            ok = True
+            launched = f"already_running:{running_ref or app_target}"
+        else:
+            ok, launched = open_installed_app(target)
         app_name = normalize_app_name(target)
         store = LocalVectorStore()
         guidance = get_guidance(app_name=app_name, user_goal=normalized, store=store)
@@ -780,6 +1210,15 @@ def execute_instruction(
                 "ai": ai_meta,
                 "app_name": app_name,
                 "launched": launched,
+                "summary": _apply_freshness_metadata({
+                    "reused_running_app": bool(running and launched.startswith("already_running:")),
+                    "running_ref": running_ref,
+                    "action_critic": {
+                        "score": action_decision.score,
+                        "reasons": action_decision.reasons,
+                        "elegance_cost": action_decision.elegance_cost,
+                    },
+                }, freshness_mode, freshness_hours),
                 "paused_for_credentials": True,
                 "pause_reason": "If a login prompt appears, enter credentials and click Resume.",
                 "guidance": guidance,
@@ -844,9 +1283,13 @@ def execute_instruction(
     best = _best_price(ranked)
 
     opened_url = ""
+    nav = {"url": "", "reused": False, "opened": False, "decision": {"score": 0.0, "reasons": ["no_result"], "elegance_cost": 0}}
     if best:
-        opened_url = best.url
-        webbrowser.open(best.url, new=2)
+        nav = _resolve_navigation_target(
+            target_url=best.url,
+            recent_actions=[f"open_tab:{best.url}"],
+        )
+        opened_url = str(nav.get("url", "") or best.url)
         plan_steps[1]["target"] = {"url": opened_url}
     needs_credentials = _likely_requires_login(normalized, opened_url, best.title if best else "")
 
@@ -873,6 +1316,11 @@ def execute_instruction(
         },
         "paused_for_credentials": needs_credentials,
         "pause_reason": "Possible login prompt detected. Enter credentials manually and click Resume." if needs_credentials else "",
+        "summary": _apply_freshness_metadata({
+            "navigation_reused_existing_target": bool(nav.get("reused", False)),
+            "navigation_opened_new_target": bool(nav.get("opened", False)),
+            "action_critic": nav.get("decision", {}),
+        }, freshness_mode, freshness_hours),
     }
     _emit_progress(progress_cb, 100, "Completed")
     return _finalize_operator_result(json.loads(json.dumps(response)), instruction=instruction, plan_steps=plan_steps)
@@ -1069,10 +1517,12 @@ def _build_native_plan(instruction: str) -> Dict[str, Any]:
     else:
         sources = ["web_search", "source_pages"]
     objective = re.sub(r"\s+", " ", instruction).strip()
+    playbook = select_playbook(domain=domain, instruction=instruction)
     if domain == "email_triage":
-        return {
+        plan = {
             "planner": "native-v1",
             "domain": domain,
+            "playbook": playbook,
             "objective": objective,
             "deliverables": ["spreadsheet", "draft_reply"],
             "sources": sources,
@@ -1089,9 +1539,15 @@ def _build_native_plan(instruction: str) -> Dict[str, Any]:
                 {"kind": "present", "name": "Open report dashboard for review", "target": {"id": "artifact:email_triage_report"}},
             ],
         }
-    return {
+        steps = list(plan.get("steps", []))
+        plan["playbook_validation"] = validate_plan_steps(domain=domain, steps=steps)
+        plan["playbook_graph_validation"] = validate_transition_graph(domain=domain, steps=steps)
+        plan["playbook_step_obligations"] = build_step_obligations(domain=domain, steps=steps)
+        return plan
+    plan = {
         "planner": "native-v1",
         "domain": domain,
+        "playbook": playbook,
         "objective": objective,
         "deliverables": deliverables,
         "sources": sources,
@@ -1108,6 +1564,11 @@ def _build_native_plan(instruction: str) -> Dict[str, Any]:
             {"kind": "present", "name": "Open dashboard and return actionable links", "target": {"id": "artifact:dashboard_html"}},
         ],
     }
+    steps = list(plan.get("steps", []))
+    plan["playbook_validation"] = validate_plan_steps(domain=domain, steps=steps)
+    plan["playbook_graph_validation"] = validate_transition_graph(domain=domain, steps=steps)
+    plan["playbook_step_obligations"] = build_step_obligations(domain=domain, steps=steps)
+    return plan
 
 
 def _execute_native_plan(
@@ -1118,7 +1579,53 @@ def _execute_native_plan(
     manual_auth_phase: bool = False,
     auth_session_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    return _run_reflective_planner(
+    validation = plan.get("playbook_validation", {}) if isinstance(plan, dict) else {}
+    if isinstance(validation, dict) and validation and not bool(validation.get("ok", True)):
+        return {
+            "ok": False,
+            "mode": "native_plan_invalid_playbook",
+            "query": str(plan.get("objective", instruction)),
+            "results_count": 0,
+            "results": [],
+            "artifacts": {},
+            "summary": {"error": "playbook_validation_failed", "errors": list(validation.get("errors", []))},
+            "source_status": {},
+            "opened_url": "",
+            "canvas": {
+                "title": "Run Blocked",
+                "subtitle": "Playbook validation failed before execution.",
+                "cards": [],
+            },
+            "paused_for_credentials": False,
+            "pause_reason": "",
+            "error": "playbook_validation_failed",
+            "error_code": "playbook_validation_failed",
+            "trace": [],
+        }
+    graph_validation = plan.get("playbook_graph_validation", {}) if isinstance(plan, dict) else {}
+    if isinstance(graph_validation, dict) and graph_validation and not bool(graph_validation.get("ok", True)):
+        return {
+            "ok": False,
+            "mode": "native_plan_invalid_playbook_graph",
+            "query": str(plan.get("objective", instruction)),
+            "results_count": 0,
+            "results": [],
+            "artifacts": {},
+            "summary": {"error": "playbook_graph_validation_failed", "errors": list(graph_validation.get("errors", []))},
+            "source_status": {},
+            "opened_url": "",
+            "canvas": {
+                "title": "Run Blocked",
+                "subtitle": "Playbook transition-graph validation failed before execution.",
+                "cards": [],
+            },
+            "paused_for_credentials": False,
+            "pause_reason": "",
+            "error": "playbook_graph_validation_failed",
+            "error_code": "playbook_graph_validation_failed",
+            "trace": [],
+        }
+    out = _run_reflective_planner(
         plan=plan,
         instruction=instruction,
         progress_cb=progress_cb,
@@ -1126,6 +1633,43 @@ def _execute_native_plan(
         manual_auth_phase=manual_auth_phase,
         auth_session_id=auth_session_id,
     )
+    obligations = plan.get("playbook_step_obligations", []) if isinstance(plan, dict) else []
+    if obligations and isinstance(obligations, list) and bool(out.get("ok", False)):
+        ob_eval = evaluate_step_obligations(
+            domain=str(plan.get("domain", "")),
+            steps=list(plan.get("steps", [])),
+            obligations=obligations,
+            result=out if isinstance(out, dict) else {},
+        )
+        out["playbook_obligation_evaluation"] = ob_eval
+        if not bool(ob_eval.get("ok", True)):
+            return {
+                "ok": False,
+                "mode": "native_plan_obligation_failed",
+                "query": str(plan.get("objective", instruction)),
+                "results_count": int(out.get("results_count", 0) or 0),
+                "results": out.get("results", []),
+                "artifacts": out.get("artifacts", {}),
+                "summary": {
+                    "error": "playbook_obligation_failed",
+                    "errors": list(ob_eval.get("errors", [])),
+                },
+                "source_status": out.get("source_status", {}),
+                "opened_url": str(out.get("opened_url", "")),
+                "canvas": {
+                    "title": "Run Blocked",
+                    "subtitle": "Per-step playbook policy obligations failed.",
+                    "cards": [],
+                },
+                "paused_for_credentials": bool(out.get("paused_for_credentials", False)),
+                "pause_reason": str(out.get("pause_reason", "")),
+                "error": "playbook_obligation_failed",
+                "error_code": "playbook_obligation_failed",
+                "trace": out.get("trace", []),
+                "auth_session_id": out.get("auth_session_id", ""),
+                "playbook_obligation_evaluation": ob_eval,
+            }
+    return out
 
 
 def _run_reflective_planner(
@@ -1139,13 +1683,31 @@ def _run_reflective_planner(
     min_live = _effective_min_live_non_curated_citations(min_live_non_curated_citations)
     objective = str(plan.get("objective", instruction))
     preferred = str(plan.get("domain", "web_research"))
-    accept_threshold = 0.60 if preferred == "competitor_analysis" else 0.72
-    attempt_order = _strategy_order(preferred=preferred)
+    if preferred == "competitor_analysis":
+        accept_threshold = 0.60
+    elif preferred == "job_market":
+        accept_threshold = 0.58
+    else:
+        accept_threshold = 0.72
+    attempt_order = _strategy_order(preferred=preferred, instruction=instruction)
+    elegance = EleganceBudget(total=90)
+    world_route_context = _world_route_context(instruction=instruction, preferred=preferred)
     best: Dict[str, Any] = {"score": -1.0, "result": {}}
     decision_log: List[str] = []
     accepted = False
 
     for attempt, strategy in enumerate(attempt_order, start=1):
+        allow_step, reason, cost = _world_route_step_gate(
+            strategy=strategy,
+            attempt=attempt,
+            instruction=instruction,
+            context=world_route_context,
+        )
+        if cost > 0:
+            elegance.consume(cost, f"route_gate:{reason}")
+        if not allow_step:
+            decision_log.append(f"Attempt {attempt} skipped by world route gate: {reason}")
+            continue
         _emit_progress(progress_cb, 18 + (attempt - 1) * 20, f"Planning attempt {attempt}: {strategy}")
         result = _run_strategy(
             strategy=strategy,
@@ -1194,6 +1756,15 @@ def _run_reflective_planner(
         decision_log.append(f"Attempt {attempt} used {strategy} -> quality score {score:.2f}")
         if score > float(best["score"]):
             best = {"score": score, "result": result}
+        if (
+            preferred == "job_market"
+            and strategy == "job_market"
+            and bool(result.get("ok", False))
+            and bool((result.get("artifacts", {}) or {}))
+        ):
+            decision_log.append("Accepted job_market attempt with artifact evidence.")
+            accepted = True
+            break
         if score >= accept_threshold:
             decision_log.append(f"Accepted attempt {attempt}; score passed threshold.")
             accepted = True
@@ -1234,6 +1805,30 @@ def _run_reflective_planner(
 
     paused_for_credentials = bool(chosen.get("paused_for_credentials", False))
     pause_reason = str(chosen.get("pause_reason", "")) if paused_for_credentials else ""
+    chosen_summary = chosen.get("summary", {}) if isinstance(chosen.get("summary"), dict) else {}
+    chosen_summary = _ensure_elegance_budget(chosen_summary, elegance)
+    chosen["summary"] = chosen_summary
+    budget_block = _enforce_elegance_budget_gate(
+        elegance=elegance,
+        mode="autonomous_plan_execute",
+        instruction=instruction,
+    )
+    if budget_block:
+        budget_block["plan"] = plan
+        budget_block["decision_log"] = decision_log
+        budget_block["query"] = chosen.get("query", "")
+        budget_block["results_count"] = chosen.get("results_count", 0)
+        budget_block["results"] = chosen.get("results", [])
+        budget_block["artifacts"] = chosen.get("artifacts", {})
+        budget_block["source_status"] = chosen.get("source_status", {})
+        budget_block["opened_url"] = chosen.get("opened_url", "")
+        budget_block["paused_for_credentials"] = paused_for_credentials
+        budget_block["pause_reason"] = pause_reason
+        budget_block["error"] = "elegance_budget_exceeded"
+        budget_block["error_code"] = "elegance_budget_exceeded"
+        budget_block["trace"] = chosen.get("trace", [])
+        budget_block["auth_session_id"] = chosen.get("auth_session_id", "")
+        return budget_block
     return {
         "ok": bool(chosen.get("ok", False)),
         "mode": "autonomous_plan_execute",
@@ -1261,11 +1856,45 @@ def _run_reflective_planner(
         "error_code": chosen.get("error_code", ""),
         "trace": chosen.get("trace", []),
         "auth_session_id": chosen.get("auth_session_id", ""),
+        "world_route": world_route_context,
     }
 
 
-def _strategy_order(preferred: str) -> List[str]:
+def _world_route_context(instruction: str, preferred: str) -> Dict[str, Any]:
+    low = str(instruction or "").lower()
+    mgr = SessionManager()
+    gmail_reusable = mgr.find_reusable_authenticated_tab("mail.google.com")
+    return {
+        "preferred": preferred,
+        "email_intent": bool(any(x in low for x in ["inbox", "gmail", "email"])),
+        "reusable_gmail_tab": gmail_reusable,
+    }
+
+
+def _world_route_step_gate(
+    *,
+    strategy: str,
+    attempt: int,
+    instruction: str,
+    context: Dict[str, Any],
+) -> tuple[bool, str, int]:
+    _ = instruction
+    strat = str(strategy or "").strip().lower()
+    if bool(context.get("email_intent", False)) and strat != "email_triage" and attempt <= 2:
+        return False, "domain_lock_email", 10
+    if bool(context.get("email_intent", False)) and str(context.get("reusable_gmail_tab", "")).strip() and strat != "email_triage":
+        return False, "reuse_session_prefers_email_triage", 8
+    return True, "ok", 0
+
+
+def _strategy_order(preferred: str, instruction: str = "") -> List[str]:
     all_strategies = ["email_triage", "study_pack", "job_market", "competitor_analysis", "generic_research"]
+    low = str(instruction or "").lower()
+    if any(x in low for x in ["gmail", "inbox", "email"]):
+        mgr = SessionManager()
+        reusable = mgr.find_reusable_authenticated_tab("mail.google.com")
+        if reusable:
+            return ["email_triage"] + [s for s in all_strategies if s != "email_triage"]
     if preferred == "email_triage":
         return ["email_triage"]
     if preferred == "study_pack":
@@ -1349,6 +1978,16 @@ def _score_result_against_objective(
     if wants_jobs:
         if "jobs_csv" not in artifacts and result.get("mode") != "job_market_research":
             score -= 0.3
+        job_constraints = _extract_job_constraints(objective)
+        rows = result.get("results") or []
+        if rows and job_constraints.require_vp_avp:
+            vp_hits = sum(1 for row in rows if _is_vp_avp_title(str(row.get("title", ""))))
+            if vp_hits == 0:
+                score -= 0.4
+        if rows and "ireland" not in objective.lower() and "us" in job_constraints.allowed_regions:
+            ireland_hits = sum(1 for row in rows if "ireland" in str(row.get("location", "")).lower())
+            if ireland_hits > 0:
+                score -= 0.25
     if wants_competitor:
         if "executive_summary_md" not in artifacts or "powerpoint_pptx" not in artifacts:
             score -= 0.45
@@ -1388,11 +2027,51 @@ def _run_email_triage_active_browser(
 ) -> Dict[str, Any]:
     profile_dir = Path("data/interface/browser_profile")
     profile_dir.mkdir(parents=True, exist_ok=True)
+    sessions = SessionManager()
     account = _extract_inbox_account(instruction)
     trace: List[Dict[str, Any]] = []
 
     # Manual-auth phase is explicit: open Gmail in controlled session and pause.
     if manual_auth_phase:
+        action_decision = ActionCritic().evaluate(
+            next_action="open_tab",
+            target="https://mail.google.com/",
+            already_open=False,
+            context={"recent_actions": ["open_tab:https://mail.google.com/"]},
+        )
+        if not action_decision.allow:
+            critic_reason = next((x for x in action_decision.reasons if x != "ok"), "blocked")
+            return {
+                "ok": False,
+                "mode": "email_triage",
+                "query": "newer_than:2d in:inbox",
+                "results_count": 0,
+                "results": [],
+                "artifacts": {},
+                "summary": {
+                    "error": "action_critic_blocked",
+                    "detail": critic_reason,
+                    "action_critic": {
+                        "score": action_decision.score,
+                        "reasons": action_decision.reasons,
+                        "elegance_cost": action_decision.elegance_cost,
+                    },
+                },
+                "source_status": {"gmail_ui": "critic_blocked"},
+                "opened_url": "",
+                "paused_for_credentials": False,
+                "pause_reason": "",
+                "error": "action_blocked",
+                "error_code": "action_blocked",
+                "auth_phase": "manual",
+                "auth_session_id": "",
+                "trace": [],
+                "canvas": {
+                    "title": "Action Blocked",
+                    "subtitle": f"Action critic rejected step: {critic_reason}",
+                    "cards": [],
+                },
+            }
         _emit_progress(progress_cb, 12, "Opening Gmail auth target")
         started = _start_email_auth_session(profile_dir=profile_dir)
         if not started.get("ok"):
@@ -1422,6 +2101,8 @@ def _run_email_triage_active_browser(
         sid = str(started.get("auth_session_id", ""))
         focused = focus_auth_session(sid, fallback_url="https://mail.google.com/")
         opened = str(focused.get("opened_url", "https://mail.google.com/"))
+        sessions.remember_tab(url=opened, title="Gmail Auth Target", authenticated=False)
+        sessions.record_auth_attempt(domain="mail.google.com", status="blocked", detail="manual_auth_phase")
         trace.append({"step": 0, "action": "open_auth_tab", "ok": True, "opened_url": opened})
         return {
             "ok": False,
@@ -1448,12 +2129,40 @@ def _run_email_triage_active_browser(
         }
 
     sid = str(auth_session_id or "").strip()
-    session = _EMAIL_AUTH_SESSIONS.get(sid, {})
+    session: Dict[str, Any] = _EMAIL_AUTH_SESSIONS.get(sid, {})
     if not session:
+        sid, session = _select_latest_auth_session(preferred_sid=sid)
+    if not session:
+        retry_decision = sessions.auth_retry_decision(domain="mail.google.com", max_failed_attempts=2)
+        if not retry_decision.allow_retry and not retry_decision.reusable_authenticated_tab:
+            return {
+                "ok": False,
+                "mode": "email_triage",
+                "query": "newer_than:2d in:inbox",
+                "results_count": 0,
+                "results": [],
+                "artifacts": {},
+                "summary": {"error": "credential_missing", "account": account, "detail": retry_decision.reason},
+                "source_status": {"gmail_ui": "auth_retry_budget_exhausted"},
+                "opened_url": "",
+                "paused_for_credentials": True,
+                "pause_reason": "Auth retry budget reached. Use existing signed-in Gmail tab and click Resume.",
+                "error": "credential_missing",
+                "error_code": "credential_missing",
+                "auth_session_id": "",
+                "trace": trace,
+                "canvas": {
+                    "title": "Paused For Auth Recovery",
+                    "subtitle": "Avoiding login loop. Use existing session, then Resume.",
+                    "cards": [],
+                },
+            }
         started = _start_email_auth_session(profile_dir=profile_dir)
         nsid = str(started.get("auth_session_id", ""))
-        focused = focus_auth_session(nsid, fallback_url="https://mail.google.com/")
+        focused = focus_auth_session(nsid, fallback_url="https://mail.google.com/", allow_reopen=False)
         opened = str(focused.get("opened_url", "https://mail.google.com/"))
+        sessions.remember_tab(url=opened, title="Gmail Auth Target", authenticated=False)
+        sessions.record_auth_attempt(domain="mail.google.com", status="blocked", detail="session_missing")
         return {
             "ok": False,
             "mode": "email_triage",
@@ -1478,50 +2187,67 @@ def _run_email_triage_active_browser(
         }
 
     session["auth_confirmed"] = True
-    focused = focus_auth_session(sid, fallback_url="https://mail.google.com/")
+    focused = focus_auth_session(sid, fallback_url="https://mail.google.com/", allow_reopen=False)
     opened = str(focused.get("opened_url", "https://mail.google.com/"))
+    sessions.remember_tab(url=opened, title="Gmail Resume Target", authenticated=False)
     trace.append({"step": 0, "action": "focus_auth_tab", "ok": bool(focused.get("ok", False)), "opened_url": opened})
 
     _emit_progress(progress_cb, 24, "Opening automation browser context")
-    page = None
+    page = session.get("page")
     context = None
     playwright = None
     browser = None
     items: List[EmailActionItem] = []
     try:
-        from playwright.sync_api import sync_playwright
-
-        playwright = sync_playwright().start()
-        try:
-            context = _launch_persistent_chrome_with_retry(playwright, profile_dir=profile_dir)
-        except Exception:
-            browser = playwright.chromium.launch(headless=False, args=["--start-maximized"])
-            context = browser.new_context()
-        page = _select_best_context_page(context, "https://mail.google.com/")
         if page is None:
-            page = context.new_page()
+            from playwright.sync_api import sync_playwright
+
+            playwright = sync_playwright().start()
+            context = _attach_or_launch_auth_context(
+                playwright=playwright,
+                profile_dir=profile_dir,
+                session=session,
+            )
+            if context is None:
+                return {
+                    "ok": False,
+                    "mode": "email_triage",
+                    "query": "newer_than:2d in:inbox",
+                    "results_count": 0,
+                    "results": [],
+                    "artifacts": {},
+                    "summary": {"error": "credential_missing", "account": account},
+                    "source_status": {"gmail_ui": "auth_profile_locked"},
+                    "opened_url": opened,
+                    "paused_for_credentials": True,
+                    "pause_reason": "Auth browser is busy/locked. Keep Gmail open in that tab and click Resume.",
+                    "error": "credential_missing",
+                    "error_code": "credential_missing",
+                    "auth_session_id": sid,
+                    "trace": trace,
+                    "canvas": {
+                        "title": "Paused For Auth Session Reuse",
+                        "subtitle": "Use existing Gmail tab. Do not close it, then click Resume.",
+                        "cards": [],
+                    },
+                }
+            page = _select_best_context_page(context, "https://mail.google.com/")
+            if page is None:
+                page = context.new_page()
+        else:
+            trace.append({"step": 0, "action": "reuse_live_gmail_page", "ok": True})
         try:
-            page.goto("https://mail.google.com/", timeout=30000)
+            # Try current tab state first to avoid unnecessary navigation churn.
+            warm_state = _gmail_wait_ready_state(page, timeout_ms=2500)
         except Exception:
-            try:
-                if context is not None:
-                    context.close()
-            except Exception:
-                pass
-            context = None
-            try:
-                if browser is not None:
-                    browser.close()
-            except Exception:
-                pass
-            browser = playwright.chromium.launch(headless=False, args=["--start-maximized"])
-            context = browser.new_context()
-            page = context.new_page()
+            warm_state = "unknown"
+        if warm_state != "mail":
             page.goto("https://mail.google.com/", timeout=30000)
 
         _emit_progress(progress_cb, 26, "Checking Gmail auth state")
         ready = _gmail_wait_ready_state(page, timeout_ms=12000)
         if ready == "login":
+            sessions.record_auth_attempt(domain="mail.google.com", status="failed", detail="gmail_login_required")
             _emit_progress(progress_cb, 30, "Attempting Gmail sign-in from local vault")
             login_attempt = _gmail_try_login_with_vault(page=page, account=account)
             trace.append(
@@ -1534,10 +2260,14 @@ def _run_email_triage_active_browser(
                 }
             )
             if login_attempt.get("ok"):
+                sessions.record_auth_attempt(domain="mail.google.com", status="ok", detail="vault_login_ok")
                 ready = _gmail_wait_ready_state(page, timeout_ms=18000)
             else:
+                sessions.record_auth_attempt(domain="mail.google.com", status="failed", detail=str(login_attempt.get("error", "")))
                 ready = "login"
         if ready == "login":
+            decision = sessions.auth_retry_decision(domain="mail.google.com", max_failed_attempts=2)
+            sessions.remember_tab(url=opened, title="Gmail Login Required", authenticated=False)
             return {
                 "ok": False,
                 "mode": "email_triage",
@@ -1549,7 +2279,11 @@ def _run_email_triage_active_browser(
                 "source_status": {"gmail_ui": "manual_auth_phase"},
                 "opened_url": opened,
                 "paused_for_credentials": True,
-                "pause_reason": "Complete Gmail sign-in in the opened tab, then click Resume.",
+                "pause_reason": (
+                    "Complete Gmail sign-in in the opened tab, then click Resume."
+                    if decision.allow_retry
+                    else "Authentication retry budget reached. Verify account state in existing tab before retry."
+                ),
                 "error": "credential_missing",
                 "error_code": "credential_missing",
                 "auth_session_id": sid,
@@ -1590,32 +2324,14 @@ def _run_email_triage_active_browser(
             except Exception:
                 current_url = ""
             if "workspace.google.com/intl" in current_url.lower():
-                return {
-                    "ok": False,
-                    "mode": "email_triage",
-                    "query": "newer_than:2d in:inbox",
-                    "results_count": 0,
-                    "results": [],
-                    "artifacts": {},
-                    "summary": {
-                        "error": "automation_blocked_by_google",
-                        "account": account,
-                        "detail": "Google returned a marketing/workspace page to automated browser context.",
-                    },
-                    "source_status": {"gmail_ui": "automation_blocked_by_google"},
-                    "opened_url": opened,
-                    "paused_for_credentials": False,
-                    "pause_reason": "",
-                    "error": "automation_blocked_by_google",
-                    "error_code": "automation_blocked_by_google",
-                    "auth_session_id": sid,
-                    "trace": trace,
-                    "canvas": {
-                        "title": "Automation Blocked By Google",
-                        "subtitle": "Automated Gmail browser context was blocked by Google. Use app-password IMAP mode or OAuth API mode.",
-                        "cards": [],
-                    },
-                }
+                sessions.record_auth_attempt(domain="mail.google.com", status="blocked", detail="workspace_redirect")
+                trace.append({"step": 0, "action": "browser_blocked_google_workspace", "ok": False, "url": current_url[:180]})
+                return _run_email_triage_imap_fallback(
+                    instruction=instruction,
+                    account=account,
+                    progress_cb=progress_cb,
+                    trace=trace,
+                )
             return {
                 "ok": False,
                 "mode": "email_triage",
@@ -1639,6 +2355,8 @@ def _run_email_triage_active_browser(
                 },
             }
 
+        sessions.remember_tab(url=str(page.url or "https://mail.google.com/"), title="Gmail Inbox", authenticated=True)
+        sessions.record_auth_attempt(domain="mail.google.com", status="ok", detail="inbox_ready")
         _emit_progress(progress_cb, 38, "Filtering inbox for last 48 hours")
         _gmail_filter_last_48h(page)
         trace.append({"step": 1, "action": "filter_last_48h", "ok": True, "query": "newer_than:2d in:inbox"})
@@ -1666,6 +2384,14 @@ def _run_email_triage_active_browser(
                     "draft_created": item.draft_created,
                 }
             )
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        trace.append({"step": 0, "action": "browser_triage_exception", "ok": False, "error": str(exc)})
+        return _run_email_triage_imap_fallback(
+            instruction=instruction,
+            account=account,
+            progress_cb=progress_cb,
+            trace=trace,
+        )
     finally:
         try:
             if context is not None:
@@ -1686,7 +2412,7 @@ def _run_email_triage_active_browser(
     _emit_progress(progress_cb, 78, "Writing spreadsheet and dashboard artifacts")
     artifacts = _write_email_triage_artifacts(instruction=instruction, account=account, items=items)
     opened_url = Path(artifacts.get("email_triage_html", artifacts.get("email_tasks_csv", ""))).resolve().as_uri()
-    webbrowser.open(opened_url, new=2)
+    opened_url, _nav = _open_target_with_reuse(target_url=opened_url, recent_actions=[f"open_tab:{opened_url}"])
     _emit_progress(progress_cb, 92, "Finalizing run report")
 
     action_items = [x for x in items if x.requires_action]
@@ -1704,6 +2430,7 @@ def _run_email_triage_active_browser(
             "drafts_created": sum(1 for x in action_items if x.draft_created),
             "active_browser_mode": False,
             "auth_session_reused": True,
+            "session_manager": sessions.snapshot(),
         },
         "source_status": {"gmail_ui": "ok"},
         "opened_url": opened_url,
@@ -1737,21 +2464,34 @@ def _extract_inbox_account(instruction: str) -> str:
 def _start_email_auth_session(profile_dir: Path) -> Dict[str, Any]:
     sid = uuid.uuid4().hex
     url = "https://mail.google.com/"
+    opened = _open_auth_browser(profile_dir=profile_dir, url=url, debug_port=9222)
+    if not opened.get("ok"):
+        try:
+            webbrowser.open(url, new=2)
+            opened = {"ok": True, "method": "default_browser", "url": url, "profile_dir": str(profile_dir.resolve()), "debug_port": 9222}
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            return {"ok": False, "error": str(exc)}
     try:
-        webbrowser.open(url, new=2)
         _EMAIL_AUTH_SESSIONS[sid] = {
             "mode": "manual_auth_tab",
             "url": url,
             "profile_dir": str(profile_dir.resolve()),
             "created_ts": time.time(),
             "auth_confirmed": False,
+            "opened_once": True,
+            "open_method": str(opened.get("method", "")),
+            "debug_port": int(opened.get("debug_port", 9222) or 9222),
         }
         return {"ok": True, "auth_session_id": sid}
     except Exception as exc:  # pylint: disable=broad-exception-caught
         return {"ok": False, "error": str(exc)}
 
 
-def focus_auth_session(auth_session_id: str, fallback_url: str = "https://mail.google.com/") -> Dict[str, Any]:
+def focus_auth_session(
+    auth_session_id: str,
+    fallback_url: str = "https://mail.google.com/",
+    allow_reopen: bool = False,
+) -> Dict[str, Any]:
     sid = str(auth_session_id or "").strip()
     sess = _EMAIL_AUTH_SESSIONS.get(sid, {}) if sid else {}
     if not sess:
@@ -1761,8 +2501,11 @@ def focus_auth_session(auth_session_id: str, fallback_url: str = "https://mail.g
             pass
         return {"ok": False, "error": "auth_session_not_found", "opened_url": fallback_url}
     target = str(sess.get("url", fallback_url) or fallback_url)
+    if sess.get("opened_once", False) and not allow_reopen:
+        return {"ok": True, "auth_session_id": sid, "opened_url": target, "already_open": True}
     try:
         webbrowser.open(target, new=2)
+        sess["opened_once"] = True
         return {"ok": True, "auth_session_id": sid, "opened_url": target}
     except Exception as exc:  # pylint: disable=broad-exception-caught
         return {"ok": False, "error": str(exc), "opened_url": target}
@@ -1808,8 +2551,8 @@ def _launch_persistent_chrome_with_retry(playwright: Any, profile_dir: Path) -> 
         except Exception as exc:  # pylint: disable=broad-exception-caught
             last_exc = exc
             if attempt == 0:
-                _terminate_profile_browser_processes(profile_dir=profile_dir)
-                time.sleep(0.6)
+                # Avoid killing a user's active auth session tab; retry once only.
+                time.sleep(0.4)
                 continue
             raise
     if last_exc:
@@ -1865,7 +2608,7 @@ def _is_profile_browser_running(profile_dir: Path) -> bool:
         return False
 
 
-def _open_auth_browser(profile_dir: Path, url: str) -> Dict[str, Any]:
+def _open_auth_browser(profile_dir: Path, url: str, debug_port: int = 9222) -> Dict[str, Any]:
     profile_abs = str(profile_dir.resolve())
     candidates: List[str] = []
     for key in ["PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"]:
@@ -1888,19 +2631,71 @@ def _open_auth_browser(profile_dir: Path, url: str) -> Dict[str, Any]:
     if exe:
         try:
             subprocess.Popen(
-                [exe, f"--user-data-dir={profile_abs}", "--profile-directory=Default", url],
+                [exe, f"--user-data-dir={profile_abs}", "--profile-directory=Default", f"--remote-debugging-port={int(debug_port)}", url],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 creationflags=0x00000008,  # DETACHED_PROCESS
             )
-            return {"ok": True, "method": "profile_browser", "exe": exe, "url": url, "profile_dir": profile_abs}
+            return {
+                "ok": True,
+                "method": "profile_browser",
+                "exe": exe,
+                "url": url,
+                "profile_dir": profile_abs,
+                "debug_port": int(debug_port),
+            }
         except Exception as exc:
-            return {"ok": False, "method": "profile_browser", "error": str(exc), "url": url, "profile_dir": profile_abs}
+            return {
+                "ok": False,
+                "method": "profile_browser",
+                "error": str(exc),
+                "url": url,
+                "profile_dir": profile_abs,
+                "debug_port": int(debug_port),
+            }
     try:
         webbrowser.open(url, new=2)
-        return {"ok": True, "method": "default_browser", "url": url, "profile_dir": profile_abs}
+        return {"ok": True, "method": "default_browser", "url": url, "profile_dir": profile_abs, "debug_port": int(debug_port)}
     except Exception as exc:
-        return {"ok": False, "method": "default_browser", "error": str(exc), "url": url, "profile_dir": profile_abs}
+        return {
+            "ok": False,
+            "method": "default_browser",
+            "error": str(exc),
+            "url": url,
+            "profile_dir": profile_abs,
+            "debug_port": int(debug_port),
+        }
+
+
+def _select_latest_auth_session(preferred_sid: str = "") -> tuple[str, Dict[str, Any]]:
+    sid = str(preferred_sid or "").strip()
+    if sid and sid in _EMAIL_AUTH_SESSIONS:
+        return sid, _EMAIL_AUTH_SESSIONS.get(sid, {})
+    if not _EMAIL_AUTH_SESSIONS:
+        return "", {}
+    ordered = sorted(
+        _EMAIL_AUTH_SESSIONS.items(),
+        key=lambda kv: float((kv[1] or {}).get("created_ts", 0.0)),
+        reverse=True,
+    )
+    best_sid, best = ordered[0]
+    return str(best_sid), dict(best or {})
+
+
+def _attach_or_launch_auth_context(playwright: Any, profile_dir: Path, session: Dict[str, Any]) -> Any:
+    debug_port = int(session.get("debug_port", 9222) or 9222)
+    try:
+        browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{debug_port}", timeout=3500)
+        contexts = list(getattr(browser, "contexts", []) or [])
+        if contexts:
+            return contexts[0]
+        return browser.new_context()
+    except Exception:
+        pass
+    try:
+        return _launch_persistent_chrome_with_retry(playwright, profile_dir=profile_dir)
+    except Exception:
+        return None
 
 
 def _gmail_login_required(page: Any) -> bool:
@@ -2137,6 +2932,262 @@ def _gmail_back_to_inbox(page: Any) -> None:
             return
 
 
+def _run_email_triage_imap_fallback(
+    *,
+    instruction: str,
+    account: str,
+    progress_cb: Optional[Callable[[int, str], None]] = None,
+    trace: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    _emit_progress(progress_cb, 62, "Falling back to Gmail IMAP mode")
+    creds = _resolve_gmail_vault_credentials(account=account)
+    if not creds.get("ok"):
+        return {
+            "ok": False,
+            "mode": "email_triage",
+            "query": "newer_than:2d in:inbox",
+            "results_count": 0,
+            "results": [],
+            "artifacts": {},
+            "summary": {"error": "imap_fallback_unavailable", "detail": str(creds.get("error", "vault_credentials_missing"))},
+            "source_status": {"gmail_imap": "vault_credentials_missing"},
+            "opened_url": "",
+            "paused_for_credentials": True,
+            "pause_reason": "Gmail IMAP fallback requires a vault Gmail entry with app password.",
+            "error": "credential_missing",
+            "error_code": "credential_missing",
+            "trace": trace or [],
+            "canvas": {
+                "title": "Paused For IMAP Credentials",
+                "subtitle": "Add Gmail app-password credentials in Local Password Vault, then Resume.",
+                "cards": [],
+            },
+        }
+
+    username = str(creds.get("username", ""))
+    password = str(creds.get("password", ""))
+    entry_id = str(creds.get("entry_id", ""))
+    items: List[EmailActionItem] = []
+    drafts_created = 0
+    fetch_count = 0
+
+    mailbox = None
+    try:
+        mailbox = imaplib.IMAP4_SSL("imap.gmail.com", 993)
+        mailbox.login(username, password)
+        mailbox.select("INBOX", readonly=False)
+        _emit_progress(progress_cb, 68, "Reading inbox messages (last 48h)")
+        message_ids = _imap_recent_message_ids(mailbox=mailbox, max_ids=30)
+        fetch_count = len(message_ids)
+        for msg_id in message_ids:
+            item = _imap_fetch_action_item(mailbox=mailbox, msg_id=msg_id)
+            if item is None:
+                continue
+            if item.requires_action:
+                ok = _imap_append_draft(mailbox=mailbox, username=username, item=item)
+                item.draft_created = ok
+                if ok:
+                    drafts_created += 1
+            items.append(item)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        return {
+            "ok": False,
+            "mode": "email_triage",
+            "query": "newer_than:2d in:inbox",
+            "results_count": 0,
+            "results": [],
+            "artifacts": {},
+            "summary": {"error": "imap_fallback_failed", "detail": str(exc)},
+            "source_status": {"gmail_imap": f"error:{type(exc).__name__}"},
+            "opened_url": "",
+            "paused_for_credentials": True,
+            "pause_reason": "Gmail IMAP fallback failed. Verify app password and IMAP access, then Resume.",
+            "error": "credential_missing",
+            "error_code": "credential_missing",
+            "trace": trace or [],
+            "canvas": {
+                "title": "IMAP Fallback Failed",
+                "subtitle": "Verify Gmail app-password and IMAP access.",
+                "cards": [],
+            },
+        }
+    finally:
+        try:
+            if mailbox is not None:
+                mailbox.logout()
+        except Exception:
+            pass
+        try:
+            if entry_id:
+                LocalPasswordVault().touch_used(entry_id)
+        except Exception:
+            pass
+
+    _emit_progress(progress_cb, 78, "Writing spreadsheet and dashboard artifacts")
+    artifacts = _write_email_triage_artifacts(instruction=instruction, account=username, items=items)
+    opened_url = Path(artifacts.get("email_triage_html", artifacts.get("email_tasks_csv", ""))).resolve().as_uri()
+    opened_url, _nav = _open_target_with_reuse(target_url=opened_url, recent_actions=[f"open_tab:{opened_url}"])
+
+    action_items = [x for x in items if x.requires_action]
+    return {
+        "ok": True,
+        "mode": "email_triage",
+        "query": "newer_than:2d in:inbox",
+        "results_count": len(items),
+        "results": [asdict(x) for x in items[:50]],
+        "artifacts": artifacts,
+        "summary": {
+            "account": username,
+            "messages_processed": len(items),
+            "messages_fetched": fetch_count,
+            "action_required": len(action_items),
+            "drafts_created": drafts_created,
+            "fallback_mode": "imap",
+        },
+        "source_status": {"gmail_ui": "fallback_imap", "gmail_imap": "ok"},
+        "opened_url": opened_url,
+        "paused_for_credentials": False,
+        "pause_reason": "",
+        "trace": trace or [],
+        "canvas": {
+            "title": "Inbox Triage Completed (IMAP Fallback)",
+            "subtitle": f"Processed {len(items)} messages; {len(action_items)} require action.",
+            "cards": [
+                {
+                    "title": x.subject[:90],
+                    "price": "drafted" if x.draft_created else ("needs action" if x.requires_action else "info"),
+                    "source": x.sender,
+                    "url": "",
+                }
+                for x in items[:6]
+            ],
+        },
+    }
+
+
+def _resolve_gmail_vault_credentials(account: str) -> Dict[str, Any]:
+    vault = LocalPasswordVault()
+    resolved = vault.find_entry_by_service("gmail")
+    if not resolved.get("ok"):
+        resolved = vault.find_entry_by_service("google")
+    if not resolved.get("ok"):
+        return {"ok": False, "error": "vault_entry_not_found"}
+    entry = resolved.get("entry", {}) or {}
+    username = str(entry.get("username", "")).strip()
+    password = str(entry.get("password", "")).strip()
+    if not username or not password:
+        return {"ok": False, "error": "vault_entry_missing_secret"}
+    if account and "@" in account and account.lower() != username.lower():
+        return {"ok": False, "error": "vault_account_mismatch"}
+    return {"ok": True, "username": username, "password": password, "entry_id": str(entry.get("id", ""))}
+
+
+def _imap_recent_message_ids(mailbox: Any, max_ids: int = 30) -> List[bytes]:
+    start_dt = datetime.now().astimezone() - timedelta(hours=48)
+    date_token = start_dt.strftime("%d-%b-%Y")
+    typ, data = mailbox.search(None, "SINCE", date_token)
+    if typ != "OK" or not data:
+        return []
+    ids = list((data[0] or b"").split())
+    if not ids:
+        return []
+    ids = ids[-max_ids:]
+    return list(reversed(ids))
+
+
+def _imap_fetch_action_item(mailbox: Any, msg_id: bytes) -> Optional[EmailActionItem]:
+    typ, data = mailbox.fetch(msg_id, "(RFC822)")
+    if typ != "OK" or not data:
+        return None
+    raw = b""
+    for chunk in data:
+        if isinstance(chunk, tuple) and len(chunk) >= 2 and isinstance(chunk[1], (bytes, bytearray)):
+            raw = bytes(chunk[1])
+            break
+    if not raw:
+        return None
+    msg = message_from_bytes(raw)
+    subject = _decode_mime_header(str(msg.get("Subject", ""))) or "(no subject)"
+    sender_full = str(msg.get("From", "")).strip()
+    sender_email = parseaddr(sender_full)[1] or sender_full or "unknown"
+    date_raw = str(msg.get("Date", "")).strip()
+    received_at = date_raw
+    try:
+        dt = parsedate_to_datetime(date_raw)
+        if dt is not None:
+            received_at = dt.isoformat(timespec="seconds")
+    except Exception:
+        pass
+    snippet = _imap_extract_snippet(msg, limit=450)
+    requires_action, reason = _classify_requires_action(subject=subject, snippet=snippet)
+    message_id = hashlib.sha256(f"{sender_email}|{subject}|{received_at}".encode("utf-8", errors="ignore")).hexdigest()[:16]
+    return EmailActionItem(
+        message_id=message_id,
+        sender=sender_email,
+        subject=subject,
+        received_at=received_at,
+        snippet=snippet,
+        requires_action=requires_action,
+        reason=reason,
+        draft_created=False,
+    )
+
+
+def _decode_mime_header(value: str) -> str:
+    parts = decode_header(value or "")
+    out: List[str] = []
+    for payload, enc in parts:
+        if isinstance(payload, bytes):
+            charset = enc or "utf-8"
+            try:
+                out.append(payload.decode(charset, errors="ignore"))
+            except Exception:
+                out.append(payload.decode("utf-8", errors="ignore"))
+        else:
+            out.append(str(payload))
+    return "".join(out).strip()
+
+
+def _imap_extract_snippet(msg: Any, limit: int = 450) -> str:
+    text = ""
+    try:
+        if msg.is_multipart():
+            for part in msg.walk():
+                ctype = str(part.get_content_type() or "").lower()
+                disp = str(part.get("Content-Disposition", "")).lower()
+                if ctype == "text/plain" and "attachment" not in disp:
+                    payload = part.get_payload(decode=True) or b""
+                    charset = part.get_content_charset() or "utf-8"
+                    text = payload.decode(charset, errors="ignore")
+                    if text.strip():
+                        break
+        else:
+            payload = msg.get_payload(decode=True) or b""
+            charset = msg.get_content_charset() or "utf-8"
+            text = payload.decode(charset, errors="ignore")
+    except Exception:
+        text = ""
+    text = re.sub(r"\s+", " ", text or "").strip()
+    return text[:limit]
+
+
+def _imap_append_draft(mailbox: Any, username: str, item: EmailActionItem) -> bool:
+    try:
+        em = EmailMessage()
+        em["From"] = username
+        em["To"] = item.sender
+        em["Subject"] = f"Re: {item.subject}"
+        em.set_content(_build_draft_text(item))
+        raw = em.as_bytes()
+        typ, _ = mailbox.append('"[Gmail]/Drafts"', "\\Draft", Time2Internaldate(time.time()), raw)
+        if typ == "OK":
+            return True
+        typ2, _ = mailbox.append("Drafts", "\\Draft", Time2Internaldate(time.time()), raw)
+        return typ2 == "OK"
+    except Exception:
+        return False
+
+
 def _write_email_triage_artifacts(instruction: str, account: str, items: List[EmailActionItem]) -> Dict[str, str]:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = Path("data/reports/email_triage") / ts
@@ -2220,12 +3271,18 @@ def _is_job_research_intent(instruction: str) -> bool:
     low = instruction.lower()
     job_terms = ["job", "position", "vp", "avp", "linkedin", "indeed", "salary", "remote"]
     analysis_terms = ["spreadsheet", "dashboard", "report", "analysis"]
-    return sum(1 for t in job_terms if t in low) >= 3 and any(t in low for t in analysis_terms)
+    strong_job_signal = sum(1 for t in job_terms if t in low) >= 3 and any(t in low for t in analysis_terms)
+    board_signal = any(t in low for t in ["job board", "job boards", "all the job boards", "jobsites", "job sites"])
+    comp_signal = any(t in low for t in ["total compensation", "compensation", "total comp", "more than", "above"])
+    leadership_signal = any(t in low for t in ["vp", "avp", "vice president", "analytics", "data and ai", "data and analytics"])
+    remote_signal = any(t in low for t in ["remote", "hybrid"])
+    return strong_job_signal or (board_signal and leadership_signal and (comp_signal or remote_signal))
 
 
 def _run_job_market_research(instruction: str, progress_cb: Optional[Callable[[int, str], None]] = None) -> Dict[str, Any]:
     role_query = _extract_role_query(instruction)
     region_labels = _extract_regions(instruction)
+    constraints = _extract_job_constraints(instruction)
     source_status: Dict[str, str] = {}
     collected: List[JobListing] = []
     _emit_progress(progress_cb, 18, f"Researching job sources for: {role_query}")
@@ -2280,17 +3337,27 @@ def _run_job_market_research(instruction: str, progress_cb: Optional[Callable[[i
     for job in collected:
         dedup[job.url] = job
     jobs_all = list(dedup.values())
-    jobs = [j for j in jobs_all if _is_target_job(j.title)]
-    if len(jobs) < 12:
+    strict_mode = _job_constraints_are_strict(constraints)
+    jobs = [j for j in jobs_all if _is_target_job(j.title, strict_vp_avp=constraints.require_vp_avp)]
+    jobs = [j for j in jobs if _job_matches_constraints(j, constraints)]
+    if (not strict_mode) and len(jobs) < 12:
         jobs = jobs_all
-    jobs.sort(key=lambda j: (_salary_rank(j), not j.remote, j.source, j.title))
+    jobs.sort(key=lambda j: (_salary_sort_key(j), 1 if j.remote else 0, j.source, j.title), reverse=True)
     _emit_progress(progress_cb, 84, "Generating spreadsheet, report, and dashboard")
     artifacts = _write_job_artifacts(instruction=instruction, jobs=jobs)
     summary = _job_summary(jobs)
+    summary["constraints"] = {
+        "strict_mode": strict_mode,
+        "require_vp_avp": constraints.require_vp_avp,
+        "require_remote_or_hybrid": constraints.require_remote_or_hybrid,
+        "min_base_salary_usd": constraints.min_base_salary_usd,
+        "min_total_comp_usd": constraints.min_total_comp_usd,
+        "allowed_regions": list(constraints.allowed_regions),
+    }
     top = jobs[:40]
     dashboard_uri = Path(artifacts["dashboard_html"]).resolve().as_uri() if artifacts.get("dashboard_html") else ""
     if dashboard_uri:
-        webbrowser.open(dashboard_uri, new=2)
+        dashboard_uri, _nav = _open_target_with_reuse(target_url=dashboard_uri, recent_actions=[f"open_tab:{dashboard_uri}"])
     return {
         "ok": True,
         "query": role_query,
@@ -2319,15 +3386,30 @@ def _run_job_market_research(instruction: str, progress_cb: Optional[Callable[[i
 def _run_generic_research(instruction: str, progress_cb: Optional[Callable[[int, str], None]] = None) -> Dict[str, Any]:
     query = _extract_generic_query(instruction)
     queries = _expand_queries(query, instruction=instruction)
+    constraints = _human_judgment_constraints(instruction=instruction, query=query)
+    memory = NegativeMemory()
+    quality_critic = QualityCritic()
+    elegance = EleganceBudget(total=100)
     collected: List[SearchResult] = []
     source_status: Dict[str, str] = {}
+    skipped_known_bad = 0
+    rejected_low_quality = 0
     _emit_progress(progress_cb, 18, f"Researching: {query}")
     for q in queries:
+        if q != query:
+            elegance.consume(3, "additional_query_refinement")
         _emit_progress(progress_cb, 24 + int((queries.index(q) / max(1, len(queries))) * 40), f"Searching web for: {q}")
         try:
             rows = _search_web(q, limit=12)
-            collected.extend(rows)
-            source_status[q] = f"ok:{len(rows)}"
+            keep_rows: List[SearchResult] = []
+            for row in rows:
+                if memory.is_bad_url(row.url):
+                    skipped_known_bad += 1
+                    elegance.consume(1, "skip_known_bad_url")
+                    continue
+                keep_rows.append(row)
+            collected.extend(keep_rows)
+            source_status[q] = f"ok:{len(keep_rows)}"
         except Exception as exc:
             source_status[q] = f"error:{type(exc).__name__}"
     dedup: Dict[str, SearchResult] = {}
@@ -2336,6 +3418,88 @@ def _run_generic_research(instruction: str, progress_cb: Optional[Callable[[int,
     ranked = list(dedup.values())
     _emit_progress(progress_cb, 72, "Ranking and summarizing findings")
     ranked.sort(key=lambda x: _relevance_score(x, query), reverse=True)
+    ranked = _apply_human_judgment_quality_gate(
+        ranked=ranked,
+        instruction=instruction,
+        query=query,
+        constraints=constraints,
+    )
+    if constraints.get("compare_required") and len(ranked) < 2:
+        elegance.consume(6, "quality_refinement_compare_required")
+        _emit_progress(progress_cb, 58, "Refining search terms due low decision quality")
+        extra_queries = _human_judgment_refine_queries(query=query, constraints=constraints)
+        for q in extra_queries:
+            try:
+                rows = _search_web(q, limit=8)
+                collected.extend(rows)
+                source_status[q] = f"ok:{len(rows)}"
+            except Exception as exc:
+                source_status[q] = f"error:{type(exc).__name__}"
+        dedup = {r.url: r for r in collected}
+        ranked = list(dedup.values())
+        ranked.sort(key=lambda x: _relevance_score(x, query), reverse=True)
+        ranked = _apply_human_judgment_quality_gate(
+            ranked=ranked,
+            instruction=instruction,
+            query=query,
+            constraints=constraints,
+        )
+
+    if constraints.get("compare_required") and len(ranked) < 2:
+        return {
+            "ok": False,
+            "query": query,
+            "results_count": len(ranked),
+            "results": [asdict(x) for x in ranked[:10]],
+            "artifacts": {},
+            "summary": {
+                "error": "decision_quality_insufficient",
+                "detail": "Superlative request requires candidate comparison, but too few high-quality candidates were found.",
+                "constraints": constraints,
+                "elegance_budget": elegance.snapshot(),
+            },
+            "source_status": source_status,
+            "opened_url": "",
+            "canvas": {
+                "title": "Research Blocked By Human Judgment Gate",
+                "subtitle": "Need at least 2 strong candidates for a superlative/compare request.",
+                "cards": [],
+            },
+        }
+    quality_samples: List[float] = []
+    for r in ranked[:8]:
+        qr = quality_critic.evaluate(
+            title=r.title,
+            url=r.url,
+            snippet=r.snippet,
+            query=query,
+            locality_terms=constraints.get("locality_terms", []),
+            evidence_count=1,
+        )
+        quality_samples.append(float(qr.score))
+    avg_quality = (sum(quality_samples) / len(quality_samples)) if quality_samples else 0.0
+    if avg_quality < 1.2:
+        elegance.consume(4, "quality_threshold_not_met")
+        return {
+            "ok": False,
+            "query": query,
+            "results_count": len(ranked),
+            "results": [asdict(x) for x in ranked[:10]],
+            "artifacts": {},
+            "summary": {
+                "error": "quality_threshold_not_met",
+                "avg_quality": round(avg_quality, 3),
+                "constraints": constraints,
+                "elegance_budget": elegance.snapshot(),
+            },
+            "source_status": source_status,
+            "opened_url": "",
+            "canvas": {
+                "title": "Research Blocked By Quality Gate",
+                "subtitle": "Candidate quality is too low to finalize safely.",
+                "cards": [],
+            },
+        }
     top_score = _relevance_score(ranked[0], query) if ranked else 0.0
     if top_score < 1.25:
         return {
@@ -2344,7 +3508,12 @@ def _run_generic_research(instruction: str, progress_cb: Optional[Callable[[int,
             "results_count": 0,
             "results": [asdict(x) for x in ranked[:10]],
             "artifacts": {},
-            "summary": {"error": "low_relevance", "top_score": round(top_score, 3), "query": query},
+            "summary": {
+                "error": "low_relevance",
+                "top_score": round(top_score, 3),
+                "query": query,
+                "elegance_budget": elegance.snapshot(),
+            },
             "source_status": source_status,
             "opened_url": "",
             "canvas": {
@@ -2353,16 +3522,60 @@ def _run_generic_research(instruction: str, progress_cb: Optional[Callable[[int,
                 "cards": [{"title": "Low relevance", "price": str(round(top_score, 3)), "source": "validator", "url": ""}],
             },
         }
+    if constraints.get("locality_required"):
+        local_hits = _count_locality_matches(ranked=ranked, locality_terms=constraints.get("locality_terms", []))
+        if local_hits <= 0:
+            return {
+                "ok": False,
+                "query": query,
+                "results_count": len(ranked),
+                "results": [asdict(x) for x in ranked[:10]],
+                "artifacts": {},
+                "summary": {
+                    "error": "locality_not_satisfied",
+                    "detail": "Request requires local relevance, but no strong locality-matching results were found.",
+                    "constraints": constraints,
+                    "elegance_budget": elegance.snapshot(),
+                },
+                "source_status": source_status,
+                "opened_url": "",
+                "canvas": {
+                    "title": "Research Blocked By Locality Gate",
+                    "subtitle": "Locality constraint was not satisfied by candidate results.",
+                    "cards": [],
+                },
+            }
+    # Persist negative memory for weak trailing results so future runs avoid them.
+    for r in ranked[10:]:
+        q = quality_critic.evaluate(
+            title=r.title,
+            url=r.url,
+            snippet=r.snippet,
+            query=query,
+            locality_terms=constraints.get("locality_terms", []),
+            evidence_count=0,
+        )
+        if q.level == "low":
+            memory.mark_bad_url(r.url, ",".join(q.reasons[:4]) or "low_quality")
+            rejected_low_quality += 1
+            elegance.consume(1, "reject_low_quality_candidate")
     _emit_progress(progress_cb, 84, "Building requested deliverables")
     artifacts = _write_generic_research_artifacts(instruction=instruction, query=query, results=ranked)
     summary = {
         "total": len(ranked),
         "sources": _count_by(r.source for r in ranked),
+        "constraints": constraints,
+        "judgment": {
+            "skipped_known_bad": skipped_known_bad,
+            "rejected_low_quality": rejected_low_quality,
+            "candidate_count": len(ranked),
+        },
+        "elegance_budget": elegance.snapshot(),
     }
     open_target = artifacts.get("primary_open_file") or artifacts.get("dashboard_html", "")
     opened_uri = Path(open_target).resolve().as_uri() if open_target else ""
     if opened_uri:
-        webbrowser.open(opened_uri, new=2)
+        opened_uri, _nav = _open_target_with_reuse(target_url=opened_uri, recent_actions=[f"open_tab:{opened_uri}"])
     return {
         "ok": True,
         "query": query,
@@ -2386,6 +3599,83 @@ def _run_generic_research(instruction: str, progress_cb: Optional[Callable[[int,
             ],
         },
     }
+
+
+def _human_judgment_constraints(instruction: str, query: str) -> Dict[str, Any]:
+    low = f"{instruction} {query}".lower()
+    compare_required = any(token in low for token in HUMAN_JUDGMENT_SUPERLATIVE_TOKENS)
+    locality_required = any(token in low for token in HUMAN_JUDGMENT_LOCALITY_TOKENS)
+    locality_terms: List[str] = []
+    m = re.search(r"\bin\s+([A-Za-z0-9 ,.-]{2,60})", instruction, flags=re.IGNORECASE)
+    if m:
+        locality_terms.append(re.sub(r"\s+", " ", m.group(1)).strip().lower())
+    if "near me" in low:
+        locality_terms.append("near me")
+    return {
+        "compare_required": compare_required,
+        "locality_required": locality_required,
+        "locality_terms": locality_terms[:5],
+    }
+
+
+def _human_judgment_refine_queries(query: str, constraints: Dict[str, Any]) -> List[str]:
+    out: List[str] = []
+    if constraints.get("compare_required"):
+        out.append(f"top options compare {query}")
+        out.append(f"price comparison {query}")
+    locality_terms = [str(x).strip() for x in (constraints.get("locality_terms") or []) if str(x).strip()]
+    for loc in locality_terms[:2]:
+        out.append(f"{query} {loc} inventory")
+        out.append(f"{query} {loc} price")
+    return list(dict.fromkeys([x for x in out if x]))
+
+
+def _apply_human_judgment_quality_gate(
+    *,
+    ranked: List[SearchResult],
+    instruction: str,
+    query: str,
+    constraints: Dict[str, Any],
+) -> List[SearchResult]:
+    _ = instruction
+    locality_terms = [str(x).lower() for x in (constraints.get("locality_terms") or []) if str(x).strip()]
+    scored: List[tuple[SearchResult, int]] = []
+    for r in ranked:
+        quality = assess_result_quality(
+            title=r.title,
+            url=r.url,
+            snippet=r.snippet,
+            query=query,
+            locality_terms=locality_terms,
+        )
+        score = int(quality.score)
+        if score <= 0:
+            continue
+        scored.append((r, score))
+    scored.sort(key=lambda x: (x[1], _relevance_score(x[0], query)), reverse=True)
+    return [r for r, _ in scored]
+
+
+def _quality_score_result(result: SearchResult, query: str, locality_terms: List[str]) -> int:
+    quality = assess_result_quality(
+        title=result.title,
+        url=result.url,
+        snippet=result.snippet,
+        query=query,
+        locality_terms=locality_terms,
+    )
+    return int(quality.score)
+
+
+def _count_locality_matches(ranked: List[SearchResult], locality_terms: List[str]) -> int:
+    if not locality_terms:
+        return 0
+    c = 0
+    for r in ranked:
+        hay = f"{str(r.title or '').lower()} {str(r.snippet or '').lower()} {str(r.url or '').lower()}"
+        if any(str(loc).lower() in hay for loc in locality_terms):
+            c += 1
+    return c
 
 
 def _run_competitor_analysis(
@@ -2506,7 +3796,7 @@ def _run_competitor_analysis(
     open_target = artifacts.get("primary_open_file") or artifacts.get("executive_summary_html") or artifacts.get("dashboard_html", "")
     opened_uri = Path(open_target).resolve().as_uri() if open_target else ""
     if opened_uri:
-        webbrowser.open(opened_uri, new=2)
+        opened_uri, _nav = _open_target_with_reuse(target_url=opened_uri, recent_actions=[f"open_tab:{opened_uri}"])
 
     cards = []
     for row in competitors[:6]:
@@ -2621,14 +3911,14 @@ def _curated_ehr_competitor_sources(target: str) -> List[SearchResult]:
 def _extract_competitor_target(instruction: str) -> str:
     m = re.search(r"competitors?\s+(?:to|for|of)\s+([A-Za-z0-9& .-]{2,80})", instruction, flags=re.IGNORECASE)
     if m:
-        return re.sub(r"\s+", " ", m.group(1)).strip(" .,\"'“”")
+        return re.sub(r"\s+", " ", m.group(1)).strip(" .,\"'â€œâ€")
     if "epic" in instruction.lower():
         return "Epic Systems"
     return "Target Company"
 
 
 def _extract_named_output_folder(instruction: str, default_name: str) -> str:
-    m = re.search(r'folder\s+called\s+["“”\']([^"“”\']{2,80})["“”\']', instruction, flags=re.IGNORECASE)
+    m = re.search(r'folder\s+called\s+["â€œâ€\']([^"â€œâ€\']{2,80})["â€œâ€\']', instruction, flags=re.IGNORECASE)
     if not m:
         return default_name
     return m.group(1).strip()
@@ -3025,10 +4315,10 @@ def _run_study_pack(instruction: str, progress_cb: Optional[Callable[[int, str],
     if use_notebooklm:
         _emit_progress(progress_cb, 90, "Opening NotebookLM workspace")
         notebooklm_url = "https://notebooklm.google.com/"
-        webbrowser.open(notebooklm_url, new=2)
+        notebooklm_url, _nav = _open_target_with_reuse(target_url=notebooklm_url, recent_actions=[f"open_tab:{notebooklm_url}"])
         pause_reason = "NotebookLM opened. If sign-in is required, complete login and continue."
     dashboard_uri = Path(artifacts["quiz_html"]).resolve().as_uri()
-    webbrowser.open(dashboard_uri, new=2)
+    dashboard_uri, _nav = _open_target_with_reuse(target_url=dashboard_uri, recent_actions=[f"open_tab:{dashboard_uri}"])
 
     return {
         "ok": True,
@@ -3064,8 +4354,13 @@ def _run_study_pack(instruction: str, progress_cb: Optional[Callable[[int, str],
 
 def _extract_role_query(instruction: str) -> str:
     low = instruction.lower()
-    if "data and ai" in low:
+    wants_vp_avp = bool(re.search(r"\b(avp|vp|vice president|assistant vice president)\b", low))
+    if "data and ai" in low or "data and analytics" in low or "analytics" in low:
+        if wants_vp_avp:
+            return "VP OR AVP Data and AI OR Data and Analytics OR Analytics"
         return "Data and AI OR Artificial Intelligence OR Data Analytics OR Machine Learning"
+    if wants_vp_avp:
+        return "VP OR AVP Data OR AI OR Analytics leadership roles"
     return "Data and AI roles OR Artificial Intelligence roles OR Data leadership roles"
 
 
@@ -3373,7 +4668,7 @@ def _normalize_fact_text(text: str) -> str:
     s = text.replace("\r", " ").replace("\n", " ")
     s = re.sub(r"\s+", " ", s)
     s = re.sub(r"\b([0-9]{1,2})-([0-9]{1,2})\b", " ", s)
-    s = re.sub(r"\s([•\-])\s", " ", s)
+    s = re.sub(r"\s([â€¢\-])\s", " ", s)
     return s.strip(" .")
 
 
@@ -3630,7 +4925,7 @@ function render(){{
  const q=(document.getElementById('q').value||'').toLowerCase();
  const cat=document.getElementById('cat').value;
  const filtered=cards.filter(c=>{{ if(cat && c.category!==cat) return false; return !q || (c.question+' '+c.answer).toLowerCase().includes(q); }});
-  document.getElementById('cards').innerHTML=filtered.slice(0,300).map((c,i)=>`<div class="card"><div class="meta">#${{i+1}} • ${{esc(c.category)}} • ${{esc(c.difficulty)}}</div><div><strong>${{esc(c.question)}}</strong></div>${{c.image_url?`<div style="margin-top:8px"><img src="${{c.image_url}}" alt="Study visual" style="max-width:100%;border:1px solid #e2e8f0;border-radius:8px"/></div>`:''}}<div style="margin-top:6px">${{esc(c.answer)}}</div><div class="meta" style="margin-top:6px">${{c.source_url?`Source: <a target="_blank" rel="noopener" href="${{c.source_url}}">${{esc(c.source_url)}}</a>`:''}}</div></div>`).join('');
+  document.getElementById('cards').innerHTML=filtered.slice(0,300).map((c,i)=>`<div class="card"><div class="meta">#${{i+1}} â€¢ ${{esc(c.category)}} â€¢ ${{esc(c.difficulty)}}</div><div><strong>${{esc(c.question)}}</strong></div>${{c.image_url?`<div style="margin-top:8px"><img src="${{c.image_url}}" alt="Study visual" style="max-width:100%;border:1px solid #e2e8f0;border-radius:8px"/></div>`:''}}<div style="margin-top:6px">${{esc(c.answer)}}</div><div class="meta" style="margin-top:6px">${{c.source_url?`Source: <a target="_blank" rel="noopener" href="${{c.source_url}}">${{esc(c.source_url)}}</a>`:''}}</div></div>`).join('');
  document.getElementById('sources').innerHTML=sources.map((s,i)=>`<div><a target="_blank" rel="noopener" href="${{s.url}}">${{i+1}}. ${{esc(s.title)}}</a></div>`).join('');
 }}
 render();
@@ -3675,9 +4970,12 @@ def _relevance_score(result: SearchResult, query: str) -> float:
     return overlap + source_bonus
 
 
-def _is_target_job(title: str) -> bool:
+def _is_target_job(title: str, strict_vp_avp: bool = False) -> bool:
     low = title.lower()
-    has_seniority = any(k in low for k in ["vp", "vice president", "avp", "head", "director", "chief"])
+    if strict_vp_avp:
+        has_seniority = _is_vp_avp_title(title)
+    else:
+        has_seniority = any(k in low for k in ["vp", "vice president", "avp", "head", "director", "chief"])
     has_domain = any(k in low for k in ["data", "ai", "artificial intelligence", "machine learning", "analytics"])
     return has_seniority and has_domain
 
@@ -4002,7 +5300,7 @@ def _scrape_builtin_jobs(role_query: str, region: str, limit: int = 30) -> List[
 
 def _extract_regions(instruction: str) -> List[str]:
     low = instruction.lower()
-    has_us = "us" in low or "united states" in low or "usa" in low
+    has_us = bool(re.search(r"\b(us|u\.s\.|united states|usa)\b", low))
     has_ireland = "ireland" in low
     if has_us and has_ireland:
         return ["us", "ireland"]
@@ -4010,7 +5308,111 @@ def _extract_regions(instruction: str) -> List[str]:
         return ["ireland"]
     if has_us:
         return ["us"]
-    return ["us", "ireland"]
+    return ["us"]
+
+
+def _extract_job_constraints(instruction: str) -> JobSearchConstraints:
+    low = instruction.lower()
+    require_vp_avp = bool(re.search(r"\b(avp|vp|vice president|assistant vice president)\b", low))
+    require_remote_or_hybrid = ("remote" in low) or ("hybrid" in low)
+    min_base_salary = _extract_job_threshold_k(
+        text=low,
+        patterns=[
+            r"(?:make|pay|salary|base|compensation)\s+(?:more than|above|over|at least)\s*\$?\s*([0-9]{2,3}(?:\.[0-9]+)?)\s*k",
+            r"(?:more than|above|over|at least)\s*\$?\s*([0-9]{2,3}(?:\.[0-9]+)?)\s*k",
+        ],
+    )
+    min_total_comp = _extract_job_threshold_k(
+        text=low,
+        patterns=[
+            r"total compensation\s*(?:above|over|more than|at least)\s*\$?\s*([0-9]{2,3}(?:\.[0-9]+)?)\s*k",
+            r"total comp(?:ensation)?\s*(?:above|over|more than|at least)\s*\$?\s*([0-9]{2,3}(?:\.[0-9]+)?)\s*k",
+        ],
+    )
+    return JobSearchConstraints(
+        require_vp_avp=require_vp_avp,
+        require_remote_or_hybrid=require_remote_or_hybrid,
+        min_base_salary_usd=min_base_salary,
+        min_total_comp_usd=min_total_comp,
+        allowed_regions=_extract_regions(instruction),
+    )
+
+
+def _extract_job_threshold_k(text: str, patterns: List[str]) -> Optional[float]:
+    for pattern in patterns:
+        m = re.search(pattern, text, flags=re.IGNORECASE)
+        if m:
+            try:
+                return float(m.group(1)) * 1000.0
+            except Exception:
+                continue
+    return None
+
+
+def _job_constraints_are_strict(constraints: JobSearchConstraints) -> bool:
+    return bool(
+        constraints.require_vp_avp
+        or constraints.require_remote_or_hybrid
+        or constraints.min_base_salary_usd is not None
+        or constraints.min_total_comp_usd is not None
+    )
+
+
+def _is_vp_avp_title(title: str) -> bool:
+    low = title.lower()
+    if "svp" in low:
+        return False
+    return bool(re.search(r"\b(avp|vp|vice president|assistant vice president)\b", low))
+
+
+def _job_matches_region(job: JobListing, allowed_regions: List[str]) -> bool:
+    if not allowed_regions:
+        return True
+    low = f"{job.location} {job.title} {job.snippet}".lower()
+    is_ireland = "ireland" in low or ", ie" in low
+    is_us = (
+        "united states" in low
+        or "usa" in low
+        or " u.s." in low
+        or bool(re.search(r",\s*[A-Z]{2}\b", job.location))
+    )
+    if is_ireland and "ireland" in allowed_regions:
+        return True
+    if is_us and "us" in allowed_regions:
+        return True
+    return False
+
+
+def _job_total_comp_estimate(job: JobListing) -> Optional[float]:
+    low = f"{job.title} {job.snippet} {job.salary_text}".lower()
+    match = re.search(r"(?:total compensation|total comp(?:ensation)?)[^0-9$]{0,30}(\$?\s*[0-9]{2,3}(?:\.[0-9]+)?\s*[kK])", low)
+    if match:
+        token = match.group(1)
+        value = _money_to_number(token)
+        if value is not None:
+            return value
+    return _salary_sort_key(job) if _salary_sort_key(job) > 0 else None
+
+
+def _job_matches_constraints(job: JobListing, constraints: JobSearchConstraints) -> bool:
+    if constraints.require_vp_avp and (not _is_vp_avp_title(job.title)):
+        return False
+    if constraints.require_remote_or_hybrid:
+        low = f"{job.title} {job.location} {job.snippet}".lower()
+        is_hybrid = "hybrid" in low
+        if not (job.remote or is_hybrid):
+            return False
+    if not _job_matches_region(job, constraints.allowed_regions):
+        return False
+    if constraints.min_base_salary_usd is not None:
+        base = _salary_sort_key(job)
+        if base <= 0 or base < constraints.min_base_salary_usd:
+            return False
+    if constraints.min_total_comp_usd is not None:
+        total_comp = _job_total_comp_estimate(job)
+        if total_comp is None or total_comp < constraints.min_total_comp_usd:
+            return False
+    return True
 
 
 def _to_job_listing(item: SearchResult, source: str, fallback_region: str) -> Optional[JobListing]:
@@ -4039,9 +5441,9 @@ def _to_job_listing(item: SearchResult, source: str, fallback_region: str) -> Op
 def _extract_salary(text: str) -> tuple[str, Optional[float], Optional[float], str]:
     cleaned = text.replace(",", "")
     usd_range = re.search(r"(\$[0-9]{2,3}(?:\.[0-9]{1,2})?\s*[kK]?)\s*-\s*(\$[0-9]{2,3}(?:\.[0-9]{1,2})?\s*[kK]?)", cleaned)
-    eur_range = re.search(r"(€[0-9]{2,3}(?:\.[0-9]{1,2})?\s*[kK]?)\s*-\s*(€[0-9]{2,3}(?:\.[0-9]{1,2})?\s*[kK]?)", cleaned)
+    eur_range = re.search(r"(â‚¬[0-9]{2,3}(?:\.[0-9]{1,2})?\s*[kK]?)\s*-\s*(â‚¬[0-9]{2,3}(?:\.[0-9]{1,2})?\s*[kK]?)", cleaned)
     single_usd = re.search(r"\$[0-9]{2,3}(?:\.[0-9]{1,2})?\s*[kK]?", cleaned)
-    single_eur = re.search(r"€[0-9]{2,3}(?:\.[0-9]{1,2})?\s*[kK]?", cleaned)
+    single_eur = re.search(r"â‚¬[0-9]{2,3}(?:\.[0-9]{1,2})?\s*[kK]?", cleaned)
 
     if usd_range:
         a, b = usd_range.group(1), usd_range.group(2)
@@ -4088,6 +5490,13 @@ def _salary_rank(job: JobListing) -> float:
         return float("inf")
     vals = [x for x in (job.salary_min, job.salary_max) if x is not None]
     return statistics.mean(vals) if vals else float("inf")
+
+
+def _salary_sort_key(job: JobListing) -> float:
+    if job.salary_min is None and job.salary_max is None:
+        return -1.0
+    vals = [x for x in (job.salary_min, job.salary_max) if x is not None]
+    return statistics.mean(vals) if vals else -1.0
 
 
 def _write_job_artifacts(instruction: str, jobs: List[JobListing]) -> Dict[str, str]:
@@ -4294,3 +5703,4 @@ def resume_pending_plan(pending: Dict[str, Any], step_mode: bool = False) -> Dic
     }
     resume_instruction = str(plan.get("instruction", "")).strip() or "Resume pending desktop sequence"
     return _finalize_operator_result(response, instruction=resume_instruction, plan_steps=plan_steps)
+

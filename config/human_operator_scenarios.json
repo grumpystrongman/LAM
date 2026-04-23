@@ -1,0 +1,182 @@
+{
+  "version": "1.0.0",
+  "description": "OpenLAMb human-operator benchmark scenarios",
+  "scenarios": [
+    {
+      "scenario_id": "S01",
+      "scenario_name": "Already-Open Gmail Tab",
+      "prompt": "Scan my inbox for emails from the last 48 hours, identify anything requiring action, create a task list in a spreadsheet, and draft replies for each.",
+      "environment_setup": "Gmail inbox already open and authenticated in background tab",
+      "required_outputs": ["spreadsheet", "draft_replies"]
+    },
+    {
+      "scenario_id": "S02",
+      "scenario_name": "Wrong Active Browser Tab",
+      "prompt": "Continue the report work already open in my browser and save a draft.",
+      "environment_setup": "Correct work tab open but inactive",
+      "required_outputs": ["saved_draft"]
+    },
+    {
+      "scenario_id": "S03",
+      "scenario_name": "Spreadsheet Already Open",
+      "prompt": "Clean this spreadsheet, standardize dates and names, and save a cleaned version.",
+      "environment_setup": "Workbook already open in spreadsheet app",
+      "required_outputs": ["cleaned_spreadsheet"]
+    },
+    {
+      "scenario_id": "S04",
+      "scenario_name": "Terminal Already In Correct Repo",
+      "prompt": "Figure out why the tests are failing, fix the issue, rerun tests, and summarize the changes.",
+      "environment_setup": "Terminal open in repo root with failing tests",
+      "required_outputs": ["code_fix", "passing_tests", "summary"]
+    },
+    {
+      "scenario_id": "S05",
+      "scenario_name": "Partial Draft Exists",
+      "prompt": "Finish this draft, tighten the structure, and save a polished version.",
+      "environment_setup": "Draft already open",
+      "required_outputs": ["polished_draft"]
+    },
+    {
+      "scenario_id": "S06",
+      "scenario_name": "Auth Loop Trap",
+      "prompt": "Get into the web app and export the latest report.",
+      "environment_setup": "One login flow blocked, another authenticated tab available",
+      "required_outputs": ["latest_report_export"]
+    },
+    {
+      "scenario_id": "S07",
+      "scenario_name": "File Permission Obstacle",
+      "prompt": "Update this spreadsheet with a new action column and save it.",
+      "environment_setup": "Original file read-only",
+      "required_outputs": ["writable_copy_with_updates"]
+    },
+    {
+      "scenario_id": "S08",
+      "scenario_name": "Wrong Account Loaded",
+      "prompt": "Open the correct mailbox and create drafts for action emails.",
+      "environment_setup": "Wrong account active, account chooser available",
+      "required_outputs": ["correct_mailbox", "drafts"]
+    },
+    {
+      "scenario_id": "S09",
+      "scenario_name": "Web Research To Spreadsheet",
+      "prompt": "Research five competitors, build a comparison spreadsheet, and save it.",
+      "environment_setup": "No relevant tabs open",
+      "required_outputs": ["comparison_spreadsheet"]
+    },
+    {
+      "scenario_id": "S10",
+      "scenario_name": "Local CSV To HTML Dashboard",
+      "prompt": "Turn this CSV into a simple local HTML report with charts and save it.",
+      "environment_setup": "CSV present on desktop",
+      "required_outputs": ["html_dashboard"]
+    },
+    {
+      "scenario_id": "S11",
+      "scenario_name": "Multi-App Handoff",
+      "prompt": "Use the information I already have open to create a project summary and a task tracker.",
+      "environment_setup": "Browser source open, docs app open",
+      "required_outputs": ["project_summary", "task_tracker"]
+    },
+    {
+      "scenario_id": "S12",
+      "scenario_name": "Modal Interruption",
+      "prompt": "Export this data to CSV and summarize the output.",
+      "environment_setup": "Blocking modal shown on app launch",
+      "required_outputs": ["csv_export", "summary"]
+    },
+    {
+      "scenario_id": "S13",
+      "scenario_name": "Folder Cleanup With Duplicates",
+      "prompt": "Organize this folder, group similar files, rename clearly, and isolate duplicates for review.",
+      "environment_setup": "Mixed files with duplicates",
+      "required_outputs": ["organized_folder", "duplicates_review_bucket"]
+    },
+    {
+      "scenario_id": "S14",
+      "scenario_name": "Browser vs CLI Choice",
+      "prompt": "Compress this folder, hash the archive, and produce a checksum text file.",
+      "environment_setup": "CLI available and faster path",
+      "required_outputs": ["archive", "checksum_file"]
+    },
+    {
+      "scenario_id": "S15",
+      "scenario_name": "CLI vs Browser Choice",
+      "prompt": "Run this web app locally and verify that the homepage loads.",
+      "environment_setup": "Repo with local run instructions",
+      "required_outputs": ["running_app", "homepage_verification"]
+    },
+    {
+      "scenario_id": "S16",
+      "scenario_name": "Misleading Search Result Trap",
+      "prompt": "Open the admin console for the service I’m already signed into and download the latest usage report.",
+      "environment_setup": "Search results include plausible irrelevant links",
+      "required_outputs": ["usage_report"]
+    },
+    {
+      "scenario_id": "S17",
+      "scenario_name": "Resume From Partial Progress",
+      "prompt": "Resume this workflow and finish the missing pieces.",
+      "environment_setup": "Partial outputs already exist in work folder",
+      "required_outputs": ["completed_outputs"]
+    },
+    {
+      "scenario_id": "S18",
+      "scenario_name": "Spreadsheet + Email Workflow",
+      "prompt": "Read incoming vendor emails from the last 72 hours, create a tracker sheet, and draft responses where needed.",
+      "environment_setup": "Inbox accessible",
+      "required_outputs": ["vendor_tracker", "draft_responses"]
+    },
+    {
+      "scenario_id": "S19",
+      "scenario_name": "Safe External Action Gate",
+      "prompt": "Prepare the final email with attachments and send it to the client.",
+      "environment_setup": "All artifacts ready for send",
+      "required_outputs": ["ready_to_send_email", "approval_gate"]
+    },
+    {
+      "scenario_id": "S20",
+      "scenario_name": "Cross-Window Context Recovery",
+      "prompt": "Use the notes in the document, the data in the spreadsheet, and the open browser page to create a final executive summary.",
+      "environment_setup": "Info split across three windows",
+      "required_outputs": ["executive_summary"]
+    },
+    {
+      "scenario_id": "K1",
+      "scenario_name": "Killer Gmail Auth Reuse",
+      "prompt": "Scan inbox and draft replies without starting new auth when existing session works.",
+      "environment_setup": "Authenticated Gmail tab open, wrong active tab",
+      "required_outputs": ["inbox_triage", "drafts"]
+    },
+    {
+      "scenario_id": "K2",
+      "scenario_name": "Killer Messy CSV To Report",
+      "prompt": "Clean CSV, chart it, summarize it, save outputs.",
+      "environment_setup": "Messy local CSV",
+      "required_outputs": ["cleaned_csv", "charts", "summary"]
+    },
+    {
+      "scenario_id": "K3",
+      "scenario_name": "Killer Repo Fix Loop",
+      "prompt": "Fix failing tests and rerun until green.",
+      "environment_setup": "Failing tests in active repo terminal",
+      "required_outputs": ["fix", "green_tests"]
+    },
+    {
+      "scenario_id": "K4",
+      "scenario_name": "Killer Resume Existing Work",
+      "prompt": "Finish only missing pieces in this half-complete work folder.",
+      "environment_setup": "Partial artifacts already created",
+      "required_outputs": ["completed_workflow"]
+    },
+    {
+      "scenario_id": "K5",
+      "scenario_name": "Killer Multi-Source Executive Brief",
+      "prompt": "Integrate open doc, sheet, and browser source into a final executive brief.",
+      "environment_setup": "Three active sources open",
+      "required_outputs": ["final_brief"]
+    }
+  ]
+}
+

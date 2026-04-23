@@ -25,6 +25,30 @@ abac:
 policies:
   competitor_analysis:
     min_live_non_curated_citations: 3
+  freshness_defaults:
+    enabled: true
+    domains:
+      web_research:
+        artifact_reuse_mode: always_regenerate
+        artifact_reuse_max_age_hours: 6
+      job_market:
+        artifact_reuse_mode: always_regenerate
+        artifact_reuse_max_age_hours: 12
+      competitor_analysis:
+        artifact_reuse_mode: always_regenerate
+        artifact_reuse_max_age_hours: 24
+      study_pack:
+        artifact_reuse_mode: reuse_if_recent
+        artifact_reuse_max_age_hours: 72
+      artifact_generation:
+        artifact_reuse_mode: reuse_if_recent
+        artifact_reuse_max_age_hours: 168
+      email_triage:
+        artifact_reuse_mode: reuse_if_recent
+        artifact_reuse_max_age_hours: 12
+      desktop_sequence:
+        artifact_reuse_mode: reuse_if_recent
+        artifact_reuse_max_age_hours: 24
   os_action_allowlist:
     - click
     - type

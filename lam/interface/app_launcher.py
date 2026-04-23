@@ -127,3 +127,37 @@ def list_installed_apps(query: str = "", limit: int = 40) -> List[Dict[str, str]
         if len(rows) >= limit:
             break
     return rows
+
+
+def is_app_running(app_name: str) -> Tuple[bool, str]:
+    key = normalize_app_name(app_name)
+    if not key:
+        return False, ""
+    probe = key
+    if probe.endswith(".exe"):
+        probe = probe[:-4]
+    cmd = (
+        "$name=$args[0]; "
+        "Get-Process -Name $name -ErrorAction SilentlyContinue | "
+        "Select-Object -First 1 ProcessName,Id | ConvertTo-Json -Compress"
+    )
+    try:
+        out = subprocess.check_output(  # noqa: S603
+            ["powershell", "-NoProfile", "-Command", cmd, "--%", probe],
+            text=True,
+            timeout=8,
+        )
+    except Exception:
+        return False, ""
+    out = out.strip()
+    if not out:
+        return False, ""
+    try:
+        import json
+
+        obj = json.loads(out)
+        pid = str(obj.get("Id", "")).strip()
+        proc = str(obj.get("ProcessName", "")).strip()
+        return bool(pid), f"{proc}:{pid}" if pid else proc
+    except Exception:
+        return False, ""
