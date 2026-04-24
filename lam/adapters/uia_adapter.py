@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import random
 import time
 from typing import Any, Dict, List, Optional
 
@@ -11,9 +12,10 @@ class UIAAdapter:
     Keyboard/mouse fallback is disabled unless explicitly permitted.
     """
 
-    def __init__(self, allow_input_fallback: bool = False, dry_run: bool = True) -> None:
+    def __init__(self, allow_input_fallback: bool = False, dry_run: bool = True, human_like: bool = False) -> None:
         self.allow_input_fallback = allow_input_fallback
         self.dry_run = dry_run
+        self.human_like = bool(human_like)
         self._trace: List[Dict[str, Any]] = []
         self._desktop = None
         self._keyboard = None
@@ -48,6 +50,7 @@ class UIAAdapter:
         self._trace.append({"action": "click", "selector": selector_bundle})
         if self.dry_run:
             return
+        self._human_pause(55, 180)
         element = self._find_element(selector_bundle)
         if hasattr(element, "click_input"):
             element.click_input()
@@ -58,6 +61,7 @@ class UIAAdapter:
         self._trace.append({"action": "type", "selector": selector_bundle, "text": text})
         if self.dry_run:
             return
+        self._human_pause(40, 120)
         if selector_bundle:
             element = self._find_element(selector_bundle)
             try:
@@ -75,6 +79,7 @@ class UIAAdapter:
         self._trace.append({"action": "hotkey", "keys": keys})
         if self.dry_run:
             return
+        self._human_pause(35, 110)
         if not self._keyboard:
             raise RuntimeError("UIA keyboard backend unavailable. Install pywinauto.")
         translated = self._translate_hotkey(keys)
@@ -142,6 +147,14 @@ class UIAAdapter:
             return
         if not self._mouse_click:
             raise RuntimeError("Mouse backend unavailable.")
+        if self.human_like:
+            try:
+                import pyautogui
+
+                pyautogui.moveTo(int(x), int(y), duration=random.uniform(0.12, 0.35))
+            except Exception:
+                pass
+        self._human_pause(45, 150)
         self._mouse_click(coords=(int(x), int(y)))
 
     def scroll(self, direction: str = "down", amount: int = 1) -> None:
@@ -234,6 +247,14 @@ class UIAAdapter:
             else:
                 out += mapping.get(part, part)
         return out
+
+    def _human_pause(self, min_ms: int = 50, max_ms: int = 140) -> None:
+        if not self.human_like:
+            return
+        low = max(1, int(min_ms))
+        high = max(low, int(max_ms))
+        delay = random.uniform(low / 1000.0, high / 1000.0)
+        time.sleep(delay)
 
     @staticmethod
     def _find_image_on_screen(image_path: str, confidence: float) -> Dict[str, Any]:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import html as html_lib
 import json
+import mimetypes
 import threading
 import time
 import uuid
@@ -10,7 +12,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import yaml
 
@@ -29,6 +31,7 @@ from lam.interface.selector_picker import capture_selector_at_cursor
 from lam.interface.teach_recorder import TeachRecorder
 from lam.interface.user_defaults import current_user, load_defaults, save_defaults
 from lam.interface.password_vault import LocalPasswordVault
+from lam.interface.browser_worker import normalize_browser_worker_mode
 from lam.interface.human_operator_benchmark import benchmark_from_last_run
 from lam.interface.human_operator_scenario_runner import (
     run_human_operator_20_suite,
@@ -50,6 +53,8 @@ class UiState:
     pending_auth_session_id: str = ""
     step_mode: bool = False
     manual_auth_phase: bool = True
+    browser_worker_mode: str = "local"
+    human_like_interaction: bool = True
     ai_backend: str = "deterministic-local"
     compression_mode: str = "normal"
     min_live_non_curated_citations: int = 3
@@ -66,6 +71,9 @@ class UiState:
     vault: LocalPasswordVault = field(default_factory=LocalPasswordVault)
     tasks: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     current_task_id: str = ""
+    auth_loop_signature: str = ""
+    auth_loop_count: int = 0
+    auth_loop_blocked: bool = False
     reliability_suite_task_id: str = ""
     reliability_suite_result: Dict[str, Any] = field(default_factory=dict)
     benchmark_last_result: Dict[str, Any] = field(default_factory=dict)
@@ -82,6 +90,10 @@ class UiState:
             schedule_history = self.scheduler.list_history(limit=50) if self.scheduler else []
             preflight = _preflight_status_locked(self)
             current_task = dict(self.tasks.get(self.current_task_id, {})) if self.current_task_id else {}
+            auth_recovery = _build_auth_recovery_recommendation_locked(
+                state=self,
+                current_task=current_task,
+            )
             world_model = build_ui_world_model(
                 control_granted=self.control_granted,
                 paused_for_credentials=self.paused_for_credentials,
@@ -103,6 +115,8 @@ class UiState:
                 "pending_auth_session_id": self.pending_auth_session_id,
                 "step_mode": self.step_mode,
                 "manual_auth_phase": self.manual_auth_phase,
+                "browser_worker_mode": self.browser_worker_mode,
+                "human_like_interaction": self.human_like_interaction,
                 "ai_backend": self.ai_backend,
                 "compression_mode": self.compression_mode,
                 "min_live_non_curated_citations": self.min_live_non_curated_citations,
@@ -122,6 +136,10 @@ class UiState:
                 "vault_status": self.vault.status(),
                 "current_task_id": self.current_task_id,
                 "task": current_task,
+                "auth_loop_count": self.auth_loop_count,
+                "auth_loop_blocked": self.auth_loop_blocked,
+                "auth_loop_signature": self.auth_loop_signature,
+                "auth_recovery": auth_recovery,
                 "reliability_suite_task_id": self.reliability_suite_task_id,
                 "reliability_suite_result": dict(self.reliability_suite_result),
                 "benchmark_last_result": dict(self.benchmark_last_result),
@@ -146,7 +164,17 @@ HTML_PAGE = """<!doctype html>
     body { margin:0; background:var(--bg); color:var(--ink); font-family:"Segoe UI",Tahoma,sans-serif; }
     .wrap { display:grid; grid-template-columns:360px 1fr; height:100vh; }
     .side { background:#0f172a; color:#d1d5db; padding:14px; overflow:auto; }
-    .brand { font-size:18px; font-weight:700; margin-bottom:10px; }
+    .brand-wrap { display:flex; align-items:center; gap:8px; }
+    .brand-logo {
+      width:22px;
+      height:22px;
+      border-radius:7px;
+      object-fit:cover;
+      border:1px solid #dbe3ef;
+      box-shadow:0 1px 3px rgba(15,23,42,0.08);
+      background:#fff;
+    }
+    .brand { font-size:18px; font-weight:700; margin-bottom:0; }
     .status { background:#111827; border:1px solid #1f2937; padding:10px; border-radius:10px; margin-bottom:12px; }
     @keyframes slowflash { 0% { opacity:1; } 50% { opacity:0.45; } 100% { opacity:1; } }
     .auth-alert { display:none; background:#7f1d1d; border:1px solid #ef4444; color:#fee2e2; padding:10px; border-radius:10px; margin-bottom:12px; animation: slowflash 2s ease-in-out infinite; }
@@ -177,27 +205,105 @@ HTML_PAGE = """<!doctype html>
     .strict-wrap { margin-top:8px; border:1px solid #e2e8f0; border-radius:10px; background:#f8fafc; padding:8px; }
     .strict-step { border:1px solid #e2e8f0; border-radius:8px; background:#fff; padding:8px; margin-top:6px; }
     .strict-rule { display:inline-block; border-radius:999px; padding:2px 8px; font-size:11px; margin-right:6px; margin-top:4px; background:#fee2e2; color:#991b1b; border:1px solid #fecaca; }
-    @media (max-width: 1180px) { .wrap { grid-template-columns:1fr; } .side { max-height:35vh; } .grid2{grid-template-columns:1fr;} .summary-grid{grid-template-columns:1fr;} }
+    .work-canvas-frame { width:100%; height:420px; border:1px solid #e2e8f0; border-radius:10px; background:#fff; }
+    .work-canvas-note { margin-top:6px; margin-bottom:8px; }
+    .assistant-feed { max-height:260px; overflow:auto; display:flex; flex-direction:column; gap:8px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; padding:10px; }
+    .assistant-msg { max-width:90%; border-radius:12px; padding:8px 10px; font-size:13px; line-height:1.35; }
+    .assistant-msg.agent { align-self:flex-start; background:#ffffff; border:1px solid #e2e8f0; color:#0f172a; }
+    .assistant-msg.user { align-self:flex-end; background:#0f766e; color:#ffffff; border:1px solid #0f766e; }
+    .assistant-msg.meta { align-self:center; background:#e2e8f0; color:#334155; border:1px solid #cbd5e1; font-size:12px; }
+    .auth-recovery { display:none; border:1px solid #fecaca; background:#fff7ed; border-radius:10px; padding:10px; }
+    .auth-recovery .code { font-family:Consolas,Menlo,monospace; font-size:12px; color:#7f1d1d; background:#fee2e2; border:1px solid #fecaca; border-radius:8px; padding:3px 8px; }
+    .auth-recovery .hint { font-size:12px; color:#7c2d12; margin-top:6px; }
+
+    /* Chat-first product layout overrides */
+    body { background:#f4f6fb; }
+    .wrap { grid-template-columns:260px 1fr; transition:grid-template-columns .18s ease; }
+    body.sidebar-compact .wrap { grid-template-columns:72px 1fr; }
+    .side { background:#f8fafc; color:#0f172a; border-right:1px solid #e2e8f0; }
+    body.sidebar-compact .side .brand-label,
+    body.sidebar-compact .side #history,
+    body.sidebar-compact .side .small { display:none; }
+    .status { background:#fff; border:1px solid #e2e8f0; color:#334155; }
+    .history-item { border:1px solid #e2e8f0; background:#fff; }
+    .history-item:hover { background:#eff6ff; }
+    .main { padding:14px; display:grid; grid-template-rows:auto auto 1fr; gap:10px; min-height:100vh; }
+    #chatControlPanel .advanced-control { display:none; }
+    #chatControlPanel { padding:10px; }
+    #chatControlPanel .chat-topbar { margin-top:0; justify-content:space-between; }
+    #chatControlPanel .chat-composer-row input.wide { min-width:0; width:100%; }
+    #chatControlPanel .chat-progress-log { display:none; }
+    #chatPanel { display:flex; flex-direction:column; min-height:0; }
+    #chatPanel .assistant-feed { flex:1; max-height:none; background:#fff; border:1px solid #e2e8f0; }
+    .main > #worldPanel, .main > #opsPanel, .main > #vaultPanel, .main > #runSummaryPanel, .main > #teachSchedulePanel { display:none; }
+    .canvas-toggle { background:#2563eb; color:#fff; border:1px solid #1d4ed8; }
+    #canvasPanel {
+      position:fixed;
+      top:0;
+      right:-540px;
+      width:540px;
+      height:100vh;
+      z-index:30;
+      border-left:1px solid #e2e8f0;
+      box-shadow:0 12px 40px rgba(15,23,42,0.16);
+      background:#fff;
+      transition:right .2s ease;
+      overflow:auto;
+      padding-bottom:18px;
+    }
+    body.canvas-open #canvasPanel { right:0; }
+    #canvasPanel .canvas-header { position:sticky; top:0; background:#fff; z-index:2; border-bottom:1px solid #e2e8f0; padding-bottom:8px; }
+    #canvasPanel .canvas-section { margin-top:10px; }
+    #canvasPanel .canvas-debug details { margin-top:8px; }
+    #developerDetailsMount .panel { display:none; }
+    #canvasPanel details[open] #developerDetailsMount .panel { display:block; margin-top:10px; }
+    .feedback-row { display:flex; gap:6px; flex-wrap:wrap; margin-top:8px; }
+    .feedback-row button { border:1px solid #e2e8f0; background:#fff; color:#334155; border-radius:999px; padding:4px 10px; font-size:12px; }
+    @media (max-width: 1180px) {
+      .wrap { grid-template-columns:1fr; }
+      .side { max-height:30vh; }
+      #canvasPanel { width:100%; right:-100%; }
+    }
   </style>
 </head>
 <body>
 <div class="wrap">
   <aside class="side">
-    <div class="brand">LAM Console</div>
+    <div class="row" style="margin-top:0;justify-content:space-between;">
+      <div class="brand-wrap">
+        <img class="brand-logo" src="/assets/openlamb-logo.png" alt="OpenLAMb logo"/>
+        <div class="brand brand-label">OpenLAMb</div>
+      </div>
+      <button onclick="toggleSidebarCompact()">Menu</button>
+    </div>
     <div class="status" id="statusBox">Control: not granted</div>
     <div class="auth-alert" id="authAlert"></div>
     <div class="small">History</div>
     <div id="history"></div>
   </aside>
   <main class="main">
-    <div class="panel">
-      <div class="row">
+    <div class="panel" id="chatControlPanel">
+      <div class="row chat-topbar">
+        <div class="row" style="margin-top:0;">
+          <button class="primary" onclick="grantControl()">Accept Control</button>
+          <button class="warn" onclick="revokeControl()">Revoke</button>
+          <button class="canvas-toggle" onclick="toggleCanvas(true)">Open Canvas</button>
+          <button onclick="newTaskFromUI()">New Task</button>
+        </div>
+        <div class="small">Delegate work in chat. Advanced controls are in Developer Details.</div>
+      </div>
+      <div class="row advanced-control">
         <button class="primary" onclick="grantControl()">Accept Control</button>
         <button class="warn" onclick="revokeControl()">Revoke Control</button>
         <button onclick="resumeAfterLogin()">Resume</button>
         <button onclick="resetSessionState()">Reset Session</button>
         <label class="small"><input type="checkbox" id="stepMode" onchange="setStepMode(this.checked)"/> Step mode</label>
         <label class="small"><input type="checkbox" id="manualAuthPhase" onchange="setManualAuthPhase(this.checked)" checked/> Manual auth phase</label>
+        <select id="browserWorkerMode" onchange="setBrowserWorkerMode(this.value)">
+          <option value="local">browser worker: local</option>
+          <option value="docker">browser worker: docker</option>
+        </select>
+        <label class="small"><input type="checkbox" id="humanLikeInteraction" onchange="setHumanLikeInteraction(this.checked)"/> Human-like interaction</label>
         <select id="aiBackend" onchange="setAiBackend(this.value)">
           <option value="deterministic-local">deterministic-local</option>
           <option value="openai-gpt-5.4">openai-gpt-5.4</option>
@@ -222,7 +328,7 @@ HTML_PAGE = """<!doctype html>
         </label>
         <label class="small"><input type="checkbox" id="useDomainFreshnessDefaults" onchange="setUseDomainFreshnessDefaults(this.checked)" checked/> use domain freshness defaults</label>
       </div>
-      <div class="row">
+      <div class="row advanced-control">
         <select id="freshnessPolicyDomain" onchange="loadDomainFreshnessPolicy()">
           <option value="web_research">web_research</option>
           <option value="job_market">job_market</option>
@@ -243,40 +349,90 @@ HTML_PAGE = """<!doctype html>
         <button onclick="saveDomainFreshnessPolicy()">Save Domain Policy</button>
         <button onclick="loadDomainFreshnessPolicy()">Reload Domain Policy</button>
       </div>
-      <div class="row">
+      <div class="row chat-composer-row">
         <input id="instruction" class="wide" type="text" placeholder="open chatgpt app then click New chat then type &quot;hello&quot; then press enter"/>
         <button class="primary" onclick="runInstruction()">Run</button>
         <button onclick="previewInstruction()">Preview</button>
       </div>
-      <div class="small" id="freshnessPreview">Freshness preview: waiting for instruction.</div>
-      <div class="row">
+      <div class="small advanced-control" id="freshnessPreview">Freshness preview: waiting for instruction.</div>
+      <div class="row advanced-control">
         <input id="automationName" type="text" placeholder="Automation name"/>
         <button onclick="saveAutomation()">Save</button>
         <button onclick="runAutomation()">Run Saved</button>
         <button onclick="exportHistory()">Export History</button>
         <button class="warn" onclick="clearHistory()">Clear History</button>
       </div>
-      <div class="row">
+      <div class="row advanced-control">
         <button onclick="useTemplate('open chatgpt app then click New chat then type \\'Daily summary\\' then press enter')">Template: ChatGPT Daily</button>
         <button onclick="useTemplate('search Amazon for best price on Abu Garcia Voltiq baitcasting reel')">Template: Amazon Price</button>
       </div>
-      <div class="row">
+      <div class="row advanced-control">
         <input id="appSearch" type="text" placeholder="Search installed apps"/>
         <button onclick="searchApps()">Find Apps</button>
       </div>
-      <div class="row"><strong>Progress</strong> <span class="small" id="progressLabel">Idle</span></div>
+      <div class="row chat-progress-head"><strong>Progress</strong> <span class="small" id="progressLabel">Idle</span></div>
       <div class="progress-wrap"><div id="progressBar" class="progress-bar"></div></div>
-      <div class="progress-log mono" id="progressLog">No active task.</div>
+      <div class="progress-log mono chat-progress-log" id="progressLog">No active task.</div>
     </div>
 
-    <div class="panel">
+    <div class="panel auth-recovery" id="authRecoveryPanel">
+      <div class="row" style="justify-content:space-between;">
+        <div><strong>Auth Recovery Wizard</strong></div>
+        <span class="code" id="authRecoveryCode">no_error</span>
+      </div>
+      <div class="small" id="authRecoveryModeLine">Current worker: local</div>
+      <div class="small" id="authRecoveryRecommendLine" style="margin-top:4px;">Recommendation pending.</div>
+      <div class="hint" id="authRecoveryReason">No auth issue detected.</div>
+      <div class="row" style="margin-top:8px;">
+        <button id="authRecoveryApplyBtn" onclick="applyAuthRecoveryRecommendation()">Apply Recommended Mode</button>
+        <button onclick="focusAuthTarget()">Focus Auth Tab</button>
+        <button onclick="resumeAfterLogin()">Resume</button>
+        <button class="warn" onclick="resetSessionState()">Reset Session</button>
+      </div>
+    </div>
+
+    <div class="panel" id="chatPanel">
+      <div class="row" style="justify-content:space-between;">
+        <div><strong>Assistant Feed</strong></div>
+        <div class="small">Live narration + final status</div>
+      </div>
+      <div class="assistant-feed" id="assistantFeed">
+        <div class="assistant-msg meta">Waiting for a task.</div>
+      </div>
+    </div>
+
+    <div class="panel" id="worldPanel">
       <div><strong>World Model</strong></div>
       <div class="small" id="worldModelNarration">Environment narration will appear here.</div>
       <div class="small" id="worldModelNoticed" style="margin-top:6px;">What I noticed will appear here.</div>
       <div class="json-box" id="worldModelBox">No world model yet.</div>
     </div>
 
-    <div class="grid2">
+    <div class="panel" id="canvasPanel">
+      <div class="row" style="justify-content:space-between;">
+        <div class="canvas-header"><strong>Canvas / Workbench</strong></div>
+        <div class="row" style="margin-top:0;">
+          <a id="workCanvasOpen" href="" target="_blank" rel="noopener" style="visibility:hidden;">Open In Tab</a>
+          <button onclick="toggleCanvas(false)">Close</button>
+        </div>
+      </div>
+      <div class="canvas-section">
+        <div class="small work-canvas-note" id="workCanvasNote">No active page.</div>
+        <iframe id="workCanvasFrame" class="work-canvas-frame" src="about:blank" title="Live work canvas"></iframe>
+      </div>
+      <div class="canvas-section" id="artifactCanvasSection">
+        <div class="small">Artifacts</div>
+        <div class="artifact-list" id="artifactListCanvas">No artifacts yet.</div>
+      </div>
+      <div class="canvas-section canvas-debug">
+        <details>
+          <summary>Developer Details</summary>
+          <div id="developerDetailsMount"></div>
+        </details>
+      </div>
+    </div>
+
+    <div class="grid2" id="teachSchedulePanel">
       <div class="panel">
         <div><strong>Teach Recorder</strong></div>
         <div class="row">
@@ -321,7 +477,7 @@ HTML_PAGE = """<!doctype html>
       </div>
     </div>
 
-    <div class="panel">
+    <div class="panel" id="vaultPanel">
       <div><strong>Local Password Vault (Local Only)</strong></div>
       <div class="row">
         <input id="vaultService" type="text" placeholder="Service (e.g. linkedin)"/>
@@ -346,7 +502,7 @@ HTML_PAGE = """<!doctype html>
       <div class="small" id="vaultList">No entries loaded.</div>
     </div>
 
-    <div class="panel">
+    <div class="panel" id="runSummaryPanel">
       <div class="row">
         <div><strong>Run Summary</strong></div>
         <button onclick="runReliabilitySuite()">Run Reliability Suite</button>
@@ -379,12 +535,55 @@ HTML_PAGE = """<!doctype html>
   </main>
 </div>
 <script>
-const ui = { history: JSON.parse(localStorage.getItem("lam_ui_history") || "[]") };
+const ui = { history: JSON.parse(localStorage.getItem("lam_ui_history") || "[]"), latestState: null };
 let progressPollTimer = null;
 let detailsVisible = false;
 let strictRulesVisible = false;
 let lastRaw = {};
+let lastCanvasUrl = "";
+let lastTaskFeedKey = "";
 function persistHistory(){ localStorage.setItem("lam_ui_history", JSON.stringify(ui.history.slice(-300))); }
+function toggleCanvas(forceOpen){
+  const shouldOpen = (forceOpen === undefined) ? !document.body.classList.contains("canvas-open") : !!forceOpen;
+  document.body.classList.toggle("canvas-open", shouldOpen);
+}
+function toggleSidebarCompact(){
+  document.body.classList.toggle("sidebar-compact");
+}
+function newTaskFromUI(){
+  document.getElementById("instruction").value = "";
+  const feed = document.getElementById("assistantFeed");
+  feed.innerHTML = `<div class="assistant-msg meta">Waiting for a task.</div>`;
+  document.getElementById("progressBar").style.width = "0%";
+  document.getElementById("progressLabel").innerText = "Idle";
+}
+function _appendAssistantFeed(html, kind){
+  const feed = document.getElementById("assistantFeed");
+  if(feed.children.length === 1 && (feed.textContent || "").toLowerCase().includes("waiting for a task")){
+    feed.innerHTML = "";
+  }
+  const node = document.createElement("div");
+  node.className = `assistant-msg ${kind||"agent"}`;
+  node.innerHTML = html;
+  feed.appendChild(node);
+  feed.scrollTop = feed.scrollHeight;
+}
+async function submitFeedback(reason){
+  try{
+    await fetch("/api/feedback",{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({
+        session_id:"",
+        task_id:"",
+        message_id:"",
+        rating:(reason==="thumbs_down"||reason==="wrong_path"||reason==="not_human_like")?-1:1,
+        reason,
+        comment:"",
+      })
+    });
+  }catch(_e){}
+}
 function toggleDetails(v){
   detailsVisible=!!v;
   localStorage.setItem("lam_details_visible", detailsVisible ? "1":"0");
@@ -435,8 +634,8 @@ function renderStrictRules(r){
   }
   body.innerHTML = failed.map(s=>{
     const rules=(s.failed_rules||[]).map(x=>`<span class="strict-rule">${escapeHtml(x)}</span>`).join("");
-    const msgs=(s.messages||[]).slice(0,4).map(m=>`<div>• ${escapeHtml(m)}</div>`).join("");
-    return `<div class="strict-step"><div><strong>Step ${Number(s.step_index)+1}</strong>: ${escapeHtml(s.action||"")}</div><div class="small">${escapeHtml(s.target||"")}</div><div style="margin-top:4px;">${rules}</div><div class="small" style="margin-top:6px;">${msgs||"• No details."}</div></div>`;
+    const msgs=(s.messages||[]).slice(0,4).map(m=>`<div>- ${escapeHtml(m)}</div>`).join("");
+    return `<div class="strict-step"><div><strong>Step ${Number(s.step_index)+1}</strong>: ${escapeHtml(s.action||"")}</div><div class="small">${escapeHtml(s.target||"")}</div><div style="margin-top:4px;">${rules}</div><div class="small" style="margin-top:6px;">${msgs||"- No details."}</div></div>`;
   }).join("");
 }
 function renderSummary(r){
@@ -446,7 +645,7 @@ function renderSummary(r){
   const count = r?.results_count || (Array.isArray(r?.results)?r.results.length:0);
   const head = ok ? (r?.canvas?.title || "Task completed") : "Action needs attention";
   const sub = ok
-    ? (r?.canvas?.subtitle || `${mode}${count?` • ${count} result(s)`:""}`)
+    ? (r?.canvas?.subtitle || `${mode}${count?` - ${count} result(s)`:""}`)
     : (r?.error || "The action could not be completed.");
   document.getElementById("summaryHead").innerText = head;
   document.getElementById("summarySub").innerText = sub;
@@ -478,22 +677,35 @@ function renderSummary(r){
   const reusedOutputs = r?.summary?.reused_existing_outputs;
   if(freshnessMode){
     const reusedLabel = (typeof reusedOutputs === "boolean") ? (reusedOutputs ? "reused" : "regenerated") : "n/a";
-    cards.push({t:"Freshness",m:`${freshnessMode} • ${reusedLabel}`});
+    cards.push({t:"Freshness",m:`${freshnessMode} | ${reusedLabel}`});
   }
-  (r?.canvas?.cards||[]).slice(0,4).forEach(c=>cards.push({t:c.title||"Item",m:`${c.price||""} ${c.source?`• ${c.source}`:""}`.trim()}));
+  (r?.canvas?.cards||[]).slice(0,4).forEach(c=>cards.push({t:c.title||"Item",m:`${c.price||""} ${c.source?`| ${c.source}`:""}`.trim()}));
   if(cards.length===0){ cards.push({t:"Status",m:ok?"Completed":"Needs input"}); }
-  document.getElementById("summaryCards").innerHTML = cards.slice(0,6).map(c=>`<div class="summary-card"><div class="t">${escapeHtml(c.t||"")}</div><div class="m">${escapeHtml(c.m||"")}</div></div>`).join("");
   const artifacts = r?.artifacts || {};
-  const entries = Object.entries(artifacts).filter(([k,v])=>typeof v==="string" && v.trim().length>0);
+  let entries = Object.entries(artifacts).filter(([k,v])=>typeof v==="string" && v.trim().length>0);
+  if(entries.length===0){
+    const recentOutputs = Array.isArray(ui?.latestState?.world_model?.created_outputs)
+      ? ui.latestState.world_model.created_outputs.filter(v=>typeof v==="string" && v.trim().length>0)
+      : [];
+    entries = recentOutputs.slice(0,6).map((path, idx)=>[`recent_output_${idx+1}`, path]);
+    if(entries.length){
+      cards.push({t:"Recent outputs", m:`${entries.length} file(s) available in session history`});
+    }
+  }
   if(entries.length){
-    const links = entries.map(([k,v])=>`<div><a href="${escapeHtml(toUri(v))}" target="_blank" rel="noopener">${escapeHtml(k)}</a></div>`).join("");
-    document.getElementById("artifactList").innerHTML = `<div class="small" style="margin-top:8px">Artifacts</div>${links}`;
+    const links = entries.map(([k,v])=>`<div><a href="${escapeHtml(artifactHref(v))}" target="_blank" rel="noopener">${escapeHtml(k)}</a></div>`).join("");
+    document.getElementById("artifactList").innerHTML = `<div class="small" style="margin-top:8px">Outputs</div>${links}`;
+    const canvasList = document.getElementById("artifactListCanvas");
+    if(canvasList){ canvasList.innerHTML = links; }
   } else {
     document.getElementById("artifactList").innerHTML = "";
+    const canvasList = document.getElementById("artifactListCanvas");
+    if(canvasList){ canvasList.innerText = "No artifacts yet."; }
   }
+  document.getElementById("summaryCards").innerHTML = cards.slice(0,6).map(c=>`<div class="summary-card"><div class="t">${escapeHtml(c.t||"")}</div><div class="m">${escapeHtml(c.m||"")}</div></div>`).join("");
 
   const activity=[];
-  if(Array.isArray(r?.narration)){ r.narration.forEach(x=>activity.push(`• ${x}`)); }
+  if(Array.isArray(r?.narration)){ r.narration.forEach(x=>activity.push(`- ${x}`)); }
   if(isReliability && Array.isArray(r?.checks)){
     r.checks.forEach(item=>{
       const status = String(item?.status || "unknown").toUpperCase();
@@ -505,19 +717,64 @@ function renderSummary(r){
       tail.slice(-5).forEach(line => activity.push(`  ${line}`));
     }
   }
-  if(Array.isArray(r?.decision_log)){ r.decision_log.forEach(x=>activity.push(`• ${x}`)); }
+  if(Array.isArray(r?.decision_log)){ r.decision_log.forEach(x=>activity.push(`- ${x}`)); }
   if(freshnessMode){
-    activity.push(`• Freshness policy: ${freshnessMode}`);
-    if(typeof reusedOutputs === "boolean"){ activity.push(`• Output handling: ${reusedOutputs ? "reused existing artifacts" : "regenerated artifacts"}`); }
+    activity.push(`- Freshness policy: ${freshnessMode}`);
+    if(typeof reusedOutputs === "boolean"){ activity.push(`- Output handling: ${reusedOutputs ? "reused existing artifacts" : "regenerated artifacts"}`); }
   }
   if(Array.isArray(elegance?.events) && elegance.events.length){
-    elegance.events.slice(-4).forEach(ev=>activity.push(`• elegance: -${ev.cost} (${ev.reason})`));
+    elegance.events.slice(-4).forEach(ev=>activity.push(`- elegance: -${ev.cost} (${ev.reason})`));
   }
-  if(r?.source_status){ Object.entries(r.source_status).slice(0,10).forEach(([k,v])=>activity.push(`• ${k}: ${v}`)); }
-  if(r?.pause_reason){ activity.push(`• ${r.pause_reason}`); }
-  if(activity.length===0){ activity.push(ok?"• Finished successfully.":"• Check details for error context."); }
+  if(r?.source_status){ Object.entries(r.source_status).slice(0,10).forEach(([k,v])=>activity.push(`- ${k}: ${v}`)); }
+  if(r?.pause_reason){ activity.push(`- ${r.pause_reason}`); }
+  if(activity.length===0){ activity.push(ok?"- Finished successfully.":"- Check details for error context."); }
   document.getElementById("activityLog").innerText = activity.join("\\n");
+  renderAssistantFeedFromResult(r||{});
+  updateWorkCanvas(String(r?.opened_url||""), r?.opened_url ? "Live page from latest result." : "No active page.");
+  if(r?.opened_url || entries.length || r?.paused_for_credentials){
+    toggleCanvas(true);
+  }
   renderStrictRules(r||{});
+}
+function _assistantMessageHtml(text, kind){
+  return `<div class="assistant-msg ${escapeHtml(kind||"agent")}">${escapeHtml(String(text||""))}</div>`;
+}
+function renderAssistantFeedFromResult(r){
+  const lines=[];
+  const mode = String(r?.mode||"");
+  if(mode){ lines.push(`<div class="small"><strong>${escapeHtml(mode)}</strong></div>`); }
+  const narration = Array.isArray(r?.narration) ? r.narration.slice(-4) : [];
+  narration.forEach(n=>lines.push(`<div>${escapeHtml(n)}</div>`));
+  const decisions = Array.isArray(r?.decision_log) ? r.decision_log.slice(-4) : [];
+  decisions.forEach(d=>lines.push(`<div>${escapeHtml(d)}</div>`));
+  const pauseReason = String(r?.pause_reason||"").trim();
+  if(pauseReason){ lines.push(`<div>${escapeHtml(pauseReason)}</div>`); }
+  const ok = !!r?.ok;
+  const doneLine = ok ? (r?.canvas?.title || "Task completed.") : (r?.error || "Task needs input.");
+  lines.push(`<div><strong>${escapeHtml(doneLine)}</strong></div>`);
+  lines.push(`<div class="feedback-row">
+    <button onclick="submitFeedback('thumbs_up')">thumbs up</button>
+    <button onclick="submitFeedback('thumbs_down')">thumbs down</button>
+    <button onclick="submitFeedback('too_slow')">too slow</button>
+    <button onclick="submitFeedback('wrong_path')">wrong path</button>
+    <button onclick="submitFeedback('not_human_like')">not human-like</button>
+    <button onclick="submitFeedback('great_result')">great result</button>
+  </div>`);
+  _appendAssistantFeed(lines.join(""), ok ? "agent" : "meta");
+}
+function renderAssistantFeedFromTask(task){
+  const events = Array.isArray(task?.events) ? task.events : [];
+  if(!events.length){
+    _appendAssistantFeed("Waiting for first task event.", "meta");
+    return;
+  }
+  const lines = [];
+  lines.push(`<div class="small"><strong>Task:</strong> ${escapeHtml(String(task?.status||"running"))}</div>`);
+  events.slice(-8).forEach(e=>{
+    const msg = `[${Number(e?.progress||0)}%] ${String(e?.message||"")}`;
+    lines.push(`<div>${escapeHtml(msg)}</div>`);
+  });
+  _appendAssistantFeed(lines.join(""), "agent");
 }
 function renderWorldModel(model){
   const wm = model || {};
@@ -541,20 +798,99 @@ function renderWorldModel(model){
   document.getElementById("worldModelBox").innerText = JSON.stringify(compact, null, 2);
 }
 function escapeHtml(s){ return String(s||"").replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function isLikelyLocalPath(path){
+  const p = String(path||"").trim();
+  if(!p){ return false; }
+  if(p.startsWith("http://") || p.startsWith("https://") || p.startsWith("file:///")){ return false; }
+  if(p.startsWith("data:") || p.startsWith("about:")){ return false; }
+  if(/^[A-Za-z0-9.-]+\\.[A-Za-z]{2,}(?:[/?#].*)?$/.test(p)){ return false; }
+  if(/^[A-Za-z]:[\\\\/]/.test(p)){ return true; }
+  if(p.startsWith("./") || p.startsWith("../") || p.startsWith("/")){ return true; }
+  return p.includes("\\\\") || p.includes("/");
+}
+function artifactHref(path){
+  const p = String(path||"").trim();
+  if(!p){ return ""; }
+  if(p.startsWith("http://") || p.startsWith("https://")){ return p; }
+  if(p.startsWith("file:///")){
+    try{
+      const withoutScheme = p.slice("file:///".length);
+      const normalized = decodeURIComponent(withoutScheme).replace(/\\//g, "\\\\");
+      return `/api/artifact?path=${encodeURIComponent(normalized)}`;
+    }catch(_e){
+      return `/api/artifact?path=${encodeURIComponent(p)}`;
+    }
+  }
+  return `/api/artifact?path=${encodeURIComponent(p)}`;
+}
 function toUri(path){
   const p = String(path||"");
-  if(p.startsWith("http://") || p.startsWith("https://") || p.startsWith("file:///")) return p;
-  const normalized = p.replace(/\\\\/g,"/");
-  if(/^[A-Za-z]:\\//.test(normalized)){ return `file:///${normalized}`; }
+  if(p.startsWith("http://") || p.startsWith("https://")) return p;
+  if(isLikelyLocalPath(p)) return artifactHref(p);
+  if(p.startsWith("file:///")) return artifactHref(p);
   return p;
+}
+function updateWorkCanvas(rawUrl, note){
+  const frame=document.getElementById("workCanvasFrame");
+  const link=document.getElementById("workCanvasOpen");
+  const noteEl=document.getElementById("workCanvasNote");
+  const url=toUri(rawUrl||"");
+  if(url){
+    if(lastCanvasUrl!==url){
+      frame.src=url;
+      lastCanvasUrl=url;
+    }
+    link.href=url;
+    link.style.visibility="visible";
+    noteEl.innerText = note || `Showing: ${url}`;
+    return;
+  }
+  if(lastCanvasUrl){
+    frame.src="about:blank";
+    lastCanvasUrl="";
+  }
+  link.removeAttribute("href");
+  link.style.visibility="hidden";
+  noteEl.innerText = note || "No active page.";
+}
+function renderAuthRecoveryWizard(s){
+  const panel=document.getElementById("authRecoveryPanel");
+  const rec=s?.auth_recovery||{};
+  const show = !!(rec?.show || s?.paused_for_credentials || s?.auth_loop_blocked);
+  if(!show){
+    panel.style.display="none";
+    return;
+  }
+  panel.style.display="block";
+  const code = String(rec?.error_code||"credential_missing");
+  const currentMode = String(rec?.current_mode || s?.browser_worker_mode || "local");
+  const recommendedMode = String(rec?.recommended_mode || currentMode || "local");
+  const confidence = String(rec?.confidence || "low").toUpperCase();
+  const reason = String(rec?.reason || s?.pause_reason || "Complete authentication, then resume once.");
+  document.getElementById("authRecoveryCode").innerText = code;
+  document.getElementById("authRecoveryModeLine").innerText = `Current worker: ${currentMode}`;
+  document.getElementById("authRecoveryRecommendLine").innerText = `Recommended worker: ${recommendedMode} (${confidence} confidence)`;
+  document.getElementById("authRecoveryReason").innerText = reason;
+  const btn=document.getElementById("authRecoveryApplyBtn");
+  btn.dataset.mode = recommendedMode;
+  btn.disabled = !recommendedMode || (recommendedMode === currentMode);
+}
+async function applyAuthRecoveryRecommendation(){
+  const btn=document.getElementById("authRecoveryApplyBtn");
+  const mode=String(btn?.dataset?.mode||"").trim().toLowerCase();
+  if(mode !== "local" && mode !== "docker"){ return; }
+  await setBrowserWorkerMode(mode);
 }
 async function refreshState(){
   const s=await fetch("/api/state").then(r=>r.json());
+  ui.latestState = s;
   let t=s.control_granted?"Control: granted":"Control: not granted";
   const preflight = s.preflight || {};
   if(preflight.required){
     t += preflight.green ? " | Preflight: GREEN" : " | Preflight: BLOCKED";
   }
+  if(s.browser_worker_mode){ t += ` | Worker: ${s.browser_worker_mode}`; }
+  if(s.human_like_interaction){ t += " | Human-like: ON"; }
   if(s.paused_for_credentials) t+=" | Paused";
   if(s.has_pending_plan) t+=" | Pending sequence";
   if(s.pause_reason) t+=" | "+s.pause_reason;
@@ -562,14 +898,19 @@ async function refreshState(){
   const auth=document.getElementById("authAlert");
   if(s.paused_for_credentials){
     const link = s.pending_auth_url ? `<div style="margin-top:6px;"><button onclick="focusAuthTarget()" style="background:#111827;color:#fee2e2;border:1px solid #ef4444;padding:6px 10px;border-radius:8px;cursor:pointer;">Focus auth tab</button></div>` : "";
+    const loopGuard = s.auth_loop_blocked
+      ? `<div class="small" style="color:#fecaca;margin-top:6px;">Loop guard active after ${Number(s.auth_loop_count||0)} repeated retries. Use Focus auth, then Resume once.</div>`
+      : "";
     auth.style.display="block";
-    auth.innerHTML = `<strong>Action Required: Authentication Needed</strong><div class="small" style="color:#fecaca;margin-top:4px;">${escapeHtml(s.pause_reason||"Complete sign-in, then click Resume.")}</div>${link}<div class="small" style="margin-top:6px;">After you finish auth, click <strong>Resume</strong>.</div>`;
+    auth.innerHTML = `<strong>Action Required: Authentication Needed</strong><div class="small" style="color:#fecaca;margin-top:4px;">${escapeHtml(s.pause_reason||"Complete sign-in, then click Resume.")}</div>${loopGuard}${link}<div class="small" style="margin-top:6px;">After you finish auth, click <strong>Resume</strong>.</div>`;
   } else {
     auth.style.display="none";
     auth.innerHTML="";
   }
   document.getElementById("stepMode").checked=!!s.step_mode;
   document.getElementById("manualAuthPhase").checked=!!s.manual_auth_phase;
+  document.getElementById("browserWorkerMode").value=s.browser_worker_mode||"local";
+  document.getElementById("humanLikeInteraction").checked=!!s.human_like_interaction;
   document.getElementById("aiBackend").value=s.ai_backend||"deterministic-local";
   document.getElementById("compressionMode").value=s.compression_mode||"normal";
   document.getElementById("minLiveCites").value=String(s.min_live_non_curated_citations||3);
@@ -577,13 +918,21 @@ async function refreshState(){
   document.getElementById("artifactReuseMaxAgeHours").value=String(s.artifact_reuse_max_age_hours||72);
   document.getElementById("useDomainFreshnessDefaults").checked=!!s.use_domain_freshness_defaults;
   const teach=s.teach||{};
-  document.getElementById("teachState").innerText=`${teach.active?'Recording':'Idle'} • events: ${teach.event_count||0}${s.global_teach_active?' • global hooks active':''}`;
+  document.getElementById("teachState").innerText=`${teach.active?'Recording':'Idle'} | events: ${teach.event_count||0}${s.global_teach_active?' | global hooks active':''}`;
   const jobs=(s.schedules||[]).length, recent=(s.schedule_history||[]).length;
-  document.getElementById("scheduleState").innerText=`${jobs} schedule(s) configured • ${recent} recent run(s)`;
+  document.getElementById("scheduleState").innerText=`${jobs} schedule(s) configured | ${recent} recent run(s)`;
   const vs=s.vault_status||{};
-  document.getElementById("vaultState").innerText=`Vault: ${vs.entries||0} entries • ${vs.dpapi_available?'DPAPI secured':'local encryption fallback'}`;
+  document.getElementById("vaultState").innerText=`Vault: ${vs.entries||0} entries | ${vs.dpapi_available?'DPAPI secured':'local encryption fallback'}`;
   renderTask(s.task||{});
   renderWorldModel(s.world_model||{});
+  const pausedUrl = s.paused_for_credentials ? String(s.pending_auth_url||"") : "";
+  const resultUrl = String(lastRaw?.opened_url||"");
+  const canvasUrl = pausedUrl || resultUrl;
+  const note = pausedUrl
+    ? "Auth target. Some sites block embedding; use Open In Tab if blank."
+    : (canvasUrl ? "Live page from latest result." : "No active page.");
+  updateWorkCanvas(canvasUrl, note);
+  renderAuthRecoveryWizard(s);
 }
 function renderHistory(){
   const el=document.getElementById("history"); el.innerHTML="";
@@ -610,26 +959,30 @@ async function rerunHistory(revIndex){
   const ai_backend=document.getElementById("aiBackend").value;
   const min_live_non_curated_citations=parseInt(document.getElementById("minLiveCites").value||"3",10);
   const manual_auth_phase=!!document.getElementById("manualAuthPhase").checked;
+  const browser_worker_mode=document.getElementById("browserWorkerMode").value||"local";
+  const human_like_interaction=!!document.getElementById("humanLikeInteraction").checked;
   const use_domain_freshness_defaults=!!document.getElementById("useDomainFreshnessDefaults").checked;
   const selector = document.getElementById(`rerunPolicy_${revIndex}`);
   const artifact_reuse_mode=(selector && selector.value) ? selector.value : (document.getElementById("artifactReuseMode").value||"reuse_if_recent");
   const artifact_reuse_max_age_hours=parseInt(document.getElementById("artifactReuseMaxAgeHours").value||"72",10);
-  const r=await fetch("/api/instruct_async",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({instruction:item.instruction,ai_backend,min_live_non_curated_citations,manual_auth_phase,use_domain_freshness_defaults,artifact_reuse_mode,artifact_reuse_max_age_hours})}).then(r=>r.json());
+  const r=await fetch("/api/instruct_async",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({instruction:item.instruction,ai_backend,min_live_non_curated_citations,manual_auth_phase,browser_worker_mode,human_like_interaction,use_domain_freshness_defaults,artifact_reuse_mode,artifact_reuse_max_age_hours})}).then(r=>r.json());
   if(!r.ok){ showResponse(r); await refreshState(); return; }
-  startTaskPolling(r.task_id, { instruction:item.instruction, ai_backend, min_live_non_curated_citations, manual_auth_phase, use_domain_freshness_defaults, artifact_reuse_mode, artifact_reuse_max_age_hours, confirm_risky:false });
+  startTaskPolling(r.task_id, { instruction:item.instruction, ai_backend, min_live_non_curated_citations, manual_auth_phase, browser_worker_mode, human_like_interaction, use_domain_freshness_defaults, artifact_reuse_mode, artifact_reuse_max_age_hours, confirm_risky:false });
 }
 async function grantControl(){
-  const r=await fetch("/api/control",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({accept:true})}).then(r=>r.json());
-  showResponse({ok:true,mode:"control",canvas:{title:"Control Granted",subtitle:"OpenLAMb can execute actions on this box",cards:[]},control_granted:r.control_granted});
+  await fetch("/api/control",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({accept:true})}).then(r=>r.json());
+  _appendAssistantFeed("Control granted. I can execute tasks now.", "meta");
   await refreshState();
 }
 async function revokeControl(){
-  const r=await fetch("/api/control",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({accept:false})}).then(r=>r.json());
-  showResponse({ok:true,mode:"control",canvas:{title:"Control Revoked",subtitle:"Execution is now blocked until re-enabled",cards:[]},control_granted:r.control_granted});
+  await fetch("/api/control",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({accept:false})}).then(r=>r.json());
+  _appendAssistantFeed("Control revoked.", "meta");
   await refreshState();
 }
 async function setStepMode(v){ await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({step_mode:!!v})}); await refreshState(); }
 async function setManualAuthPhase(v){ await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({manual_auth_phase:!!v})}); await refreshState(); }
+async function setBrowserWorkerMode(v){ await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({browser_worker_mode:v})}); await refreshState(); }
+async function setHumanLikeInteraction(v){ await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({human_like_interaction:!!v})}); await refreshState(); }
 async function setAiBackend(v){ await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ai_backend:v})}); await refreshState(); }
 async function setCompressionMode(v){ await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({compression_mode:v})}); await refreshState(); }
 async function setMinLiveCites(v){ const n=Math.max(1,Math.min(20,parseInt(v||"3",10)||3)); await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({min_live_non_curated_citations:n})}); await refreshState(); }
@@ -647,7 +1000,7 @@ async function refreshFreshnessPreview(){
   const use_domain_freshness_defaults=!!document.getElementById("useDomainFreshnessDefaults").checked;
   const r=await fetch("/api/policy/freshness/preview",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({instruction,artifact_reuse_mode,artifact_reuse_max_age_hours,use_domain_freshness_defaults})}).then(r=>r.json());
   if(r?.ok){
-    document.getElementById("freshnessPreview").innerText=`Freshness preview: domain=${r.domain} • mode=${r.mode} • hrs=${r.max_age_hours} • source=${r.source}`;
+    document.getElementById("freshnessPreview").innerText=`Freshness preview: domain=${r.domain} | mode=${r.mode} | hrs=${r.max_age_hours} | source=${r.source}`;
   } else {
     document.getElementById("freshnessPreview").innerText="Freshness preview: unavailable.";
   }
@@ -675,7 +1028,9 @@ async function resumeAfterLogin(){
   if(r?.task_id){
     const ai_backend=document.getElementById("aiBackend").value;
     const min_live_non_curated_citations=parseInt(document.getElementById("minLiveCites").value||"3",10);
-    startTaskPolling(r.task_id, { instruction:r.instruction||"", ai_backend, min_live_non_curated_citations, manual_auth_phase:false, confirm_risky:false });
+    const browser_worker_mode=document.getElementById("browserWorkerMode").value||"local";
+    const human_like_interaction=!!document.getElementById("humanLikeInteraction").checked;
+    startTaskPolling(r.task_id, { instruction:r.instruction||"", ai_backend, min_live_non_curated_citations, manual_auth_phase:false, browser_worker_mode, human_like_interaction, confirm_risky:false });
     await refreshState();
     return;
   }
@@ -693,16 +1048,20 @@ async function resetSessionState(){
 }
 async function runInstruction(){
   const instruction=document.getElementById("instruction").value.trim(); if(!instruction) return;
+  _appendAssistantFeed(escapeHtml(instruction), "user");
+  lastTaskFeedKey = "";
   const ai_backend=document.getElementById("aiBackend").value;
   const min_live_non_curated_citations=parseInt(document.getElementById("minLiveCites").value||"3",10);
   const manual_auth_phase=!!document.getElementById("manualAuthPhase").checked;
+  const browser_worker_mode=document.getElementById("browserWorkerMode").value||"local";
+  const human_like_interaction=!!document.getElementById("humanLikeInteraction").checked;
   const use_domain_freshness_defaults=!!document.getElementById("useDomainFreshnessDefaults").checked;
   const artifact_reuse_mode=document.getElementById("artifactReuseMode").value||"reuse_if_recent";
   const artifact_reuse_max_age_hours=parseInt(document.getElementById("artifactReuseMaxAgeHours").value||"72",10);
   await refreshFreshnessPreview();
-  const r=await fetch("/api/instruct_async",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({instruction,ai_backend,min_live_non_curated_citations,manual_auth_phase,use_domain_freshness_defaults,artifact_reuse_mode,artifact_reuse_max_age_hours})}).then(r=>r.json());
+  const r=await fetch("/api/instruct_async",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({instruction,ai_backend,min_live_non_curated_citations,manual_auth_phase,browser_worker_mode,human_like_interaction,use_domain_freshness_defaults,artifact_reuse_mode,artifact_reuse_max_age_hours})}).then(r=>r.json());
   if(!r.ok){ showResponse(r); await refreshState(); return; }
-  startTaskPolling(r.task_id, { instruction, ai_backend, min_live_non_curated_citations, manual_auth_phase, use_domain_freshness_defaults, artifact_reuse_mode, artifact_reuse_max_age_hours, confirm_risky:false });
+  startTaskPolling(r.task_id, { instruction, ai_backend, min_live_non_curated_citations, manual_auth_phase, browser_worker_mode, human_like_interaction, use_domain_freshness_defaults, artifact_reuse_mode, artifact_reuse_max_age_hours, confirm_risky:false });
 }
 async function previewInstruction(){ const instruction=document.getElementById("instruction").value.trim(); if(!instruction)return; const r=await fetch("/api/preview",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({instruction})}).then(r=>r.json()); showResponse(r); await refreshState(); }
 async function saveAutomation(){ const name=document.getElementById("automationName").value.trim(); const instruction=document.getElementById("instruction").value.trim(); const r=await fetch("/api/automation/save",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name,instruction})}).then(r=>r.json()); showResponse(r); await refreshState(); }
@@ -711,12 +1070,14 @@ async function runAutomation(){
   const ai_backend=document.getElementById("aiBackend").value;
   const min_live_non_curated_citations=parseInt(document.getElementById("minLiveCites").value||"3",10);
   const manual_auth_phase=!!document.getElementById("manualAuthPhase").checked;
+  const browser_worker_mode=document.getElementById("browserWorkerMode").value||"local";
+  const human_like_interaction=!!document.getElementById("humanLikeInteraction").checked;
   const use_domain_freshness_defaults=!!document.getElementById("useDomainFreshnessDefaults").checked;
   const artifact_reuse_mode=document.getElementById("artifactReuseMode").value||"reuse_if_recent";
   const artifact_reuse_max_age_hours=parseInt(document.getElementById("artifactReuseMaxAgeHours").value||"72",10);
-  const r=await fetch("/api/automation/run_async",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name,ai_backend,min_live_non_curated_citations,manual_auth_phase,use_domain_freshness_defaults,artifact_reuse_mode,artifact_reuse_max_age_hours})}).then(r=>r.json());
+  const r=await fetch("/api/automation/run_async",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name,ai_backend,min_live_non_curated_citations,manual_auth_phase,browser_worker_mode,human_like_interaction,use_domain_freshness_defaults,artifact_reuse_mode,artifact_reuse_max_age_hours})}).then(r=>r.json());
   if(!r.ok){ showResponse(r); await refreshState(); return; }
-  startTaskPolling(r.task_id, { instruction:r.instruction||"", ai_backend, min_live_non_curated_citations, manual_auth_phase, use_domain_freshness_defaults, artifact_reuse_mode, artifact_reuse_max_age_hours, confirm_risky:false });
+  startTaskPolling(r.task_id, { instruction:r.instruction||"", ai_backend, min_live_non_curated_citations, manual_auth_phase, browser_worker_mode, human_like_interaction, use_domain_freshness_defaults, artifact_reuse_mode, artifact_reuse_max_age_hours, confirm_risky:false });
 }
 async function regenerateFresh(){
   const fromInput=document.getElementById("instruction").value.trim();
@@ -726,12 +1087,14 @@ async function regenerateFresh(){
   const ai_backend=document.getElementById("aiBackend").value;
   const min_live_non_curated_citations=parseInt(document.getElementById("minLiveCites").value||"3",10);
   const manual_auth_phase=!!document.getElementById("manualAuthPhase").checked;
+  const browser_worker_mode=document.getElementById("browserWorkerMode").value||"local";
+  const human_like_interaction=!!document.getElementById("humanLikeInteraction").checked;
   const use_domain_freshness_defaults=!!document.getElementById("useDomainFreshnessDefaults").checked;
   const artifact_reuse_mode="always_regenerate";
   const artifact_reuse_max_age_hours=parseInt(document.getElementById("artifactReuseMaxAgeHours").value||"72",10);
-  const r=await fetch("/api/instruct_async",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({instruction,ai_backend,min_live_non_curated_citations,manual_auth_phase,use_domain_freshness_defaults,artifact_reuse_mode,artifact_reuse_max_age_hours})}).then(r=>r.json());
+  const r=await fetch("/api/instruct_async",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({instruction,ai_backend,min_live_non_curated_citations,manual_auth_phase,browser_worker_mode,human_like_interaction,use_domain_freshness_defaults,artifact_reuse_mode,artifact_reuse_max_age_hours})}).then(r=>r.json());
   if(!r.ok){ showResponse(r); await refreshState(); return; }
-  startTaskPolling(r.task_id, { instruction, ai_backend, min_live_non_curated_citations, manual_auth_phase, use_domain_freshness_defaults, artifact_reuse_mode, artifact_reuse_max_age_hours, confirm_risky:false });
+  startTaskPolling(r.task_id, { instruction, ai_backend, min_live_non_curated_citations, manual_auth_phase, browser_worker_mode, human_like_interaction, use_domain_freshness_defaults, artifact_reuse_mode, artifact_reuse_max_age_hours, confirm_risky:false });
 }
 async function runReliabilitySuite(){
   const include_pytest = !!document.getElementById("suiteIncludePytest").checked;
@@ -793,7 +1156,7 @@ async function vaultList(){
   const r=await fetch("/api/vault/list",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({query:q})}).then(r=>r.json());
   const entries=(r.entries||[]);
   if(!entries.length){ document.getElementById("vaultList").innerText="No matching entries."; return; }
-  document.getElementById("vaultList").innerText = entries.slice(0,8).map(e=>`${e.service} • ${e.username_masked}${e.favorite?' • ★':''}`).join("\\n");
+  document.getElementById("vaultList").innerText = entries.slice(0,8).map(e=>`${e.service} | ${e.username_masked}${e.favorite?' | favorite':''}`).join("\\n");
 }
 async function vaultGenerate(){
   const length=parseInt(document.getElementById("vaultLength").value||"20",10);
@@ -850,6 +1213,17 @@ function renderTask(task){
   document.getElementById("progressLog").innerText = events.length
     ? events.map(e=>`[${new Date((e.ts||0)*1000).toLocaleTimeString()}] ${e.progress||0}% - ${e.message||""}`).join("\\n")
     : "No active task.";
+  if(String(task.status||"") === "running"){
+    document.getElementById("summaryHead").innerText = "Working...";
+    document.getElementById("summarySub").innerText = task.message || "Executing plan";
+    const live = events.slice(-8).map(e=>`[${new Date((e.ts||0)*1000).toLocaleTimeString()}] ${e.message||""}`).join("\\n");
+    document.getElementById("activityLog").innerText = live || "Waiting for first task event.";
+    const feedKey = `${String(task.message||"")}|${pct}|${events.length}`;
+    if(feedKey !== lastTaskFeedKey){
+      lastTaskFeedKey = feedKey;
+      renderAssistantFeedFromTask(task||{});
+    }
+  }
 }
 function stopTaskPolling(){ if(progressPollTimer){ clearInterval(progressPollTimer); progressPollTimer=null; } }
 function startTaskPolling(taskId, rerunPayload){
@@ -883,16 +1257,37 @@ function startTaskPolling(taskId, rerunPayload){
   tick();
 }
 window.onload=async()=>{
+  const mount = document.getElementById("developerDetailsMount");
+  const worldPanel = document.getElementById("worldPanel");
+  const runPanel = document.getElementById("runSummaryPanel");
+  const devDetails = document.querySelector("#canvasPanel .canvas-debug details");
+  if(mount && worldPanel){ mount.appendChild(worldPanel); }
+  if(mount && runPanel){ mount.appendChild(runPanel); }
+  const syncDeveloperPanels = ()=>{
+    const show = !!(devDetails && devDetails.open);
+    if(worldPanel){ worldPanel.style.display = show ? "block" : "none"; }
+    if(runPanel){ runPanel.style.display = show ? "block" : "none"; }
+  };
+  if(devDetails){ devDetails.addEventListener("toggle", syncDeveloperPanels); }
+  syncDeveloperPanels();
   detailsVisible = localStorage.getItem("lam_details_visible")==="1";
   strictRulesVisible = localStorage.getItem("lam_strict_rules_visible")==="1";
-  document.getElementById("showDetails").checked = detailsVisible;
-  document.getElementById("showStrictRules").checked = strictRulesVisible;
+  const showDetailsBox = document.getElementById("showDetails");
+  const showStrictBox = document.getElementById("showStrictRules");
+  if(showDetailsBox){ showDetailsBox.checked = detailsVisible; }
+  if(showStrictBox){ showStrictBox.checked = strictRulesVisible; }
   toggleDetails(detailsVisible);
   toggleStrictRules(strictRulesVisible);
   renderHistory();
   await refreshState();
   const instructionInput=document.getElementById("instruction");
   if(instructionInput){
+    instructionInput.addEventListener("keydown", (e)=>{
+      if(e.key === "Enter" && !e.shiftKey){
+        e.preventDefault();
+        void runInstruction();
+      }
+    });
     instructionInput.addEventListener("input", ()=>{ void refreshFreshnessPreview(); });
   }
   await refreshFreshnessPreview();
@@ -915,6 +1310,13 @@ class _Handler(BaseHTTPRequestHandler):
         if path in {"/", "/index.html"}:
             self._send_text(200, HTML_PAGE, "text/html; charset=utf-8")
             return
+        if path == "/assets/openlamb-logo.png":
+            logo_path = Path("docs/assets/openlamb-logo.png")
+            if not logo_path.exists():
+                self._send_json(404, {"error": "not_found"})
+                return
+            self._send_bytes(200, logo_path.read_bytes(), "image/png")
+            return
         if path == "/api/state":
             self._send_json(200, self.state.snapshot())
             return
@@ -925,6 +1327,35 @@ class _Handler(BaseHTTPRequestHandler):
             snap = self.state.snapshot()
             data = json.dumps({"exported_at": time.time(), "history": snap["history"]}, indent=2)
             self._send_text(200, data, "application/json")
+            return
+        if path == "/api/artifact":
+            requested = (qs.get("path", [""])[0] or "").strip()
+            if not requested:
+                self._send_json(400, {"error": "missing_path"})
+                return
+            workspace_root = Path.cwd().resolve()
+            try:
+                requested_path = Path(requested)
+                resolved = (workspace_root / requested_path).resolve() if not requested_path.is_absolute() else requested_path.resolve()
+            except Exception:
+                self._send_json(400, {"error": "invalid_path"})
+                return
+            if not _is_path_within(resolved, workspace_root):
+                self._send_json(403, {"error": "path_outside_workspace"})
+                return
+            if not resolved.exists():
+                self._send_json(404, {"error": "not_found"})
+                return
+            if resolved.is_dir():
+                listing = _render_directory_listing_html(resolved, workspace_root)
+                self._send_text(200, listing, "text/html; charset=utf-8")
+                return
+            try:
+                payload = resolved.read_bytes()
+            except Exception:
+                self._send_json(500, {"error": "read_failed"})
+                return
+            self._send_bytes(200, payload, _guess_content_type(resolved))
             return
         if path == "/api/task":
             task_id = (qs.get("id", [""])[0] or "").strip()
@@ -962,6 +1393,12 @@ class _Handler(BaseHTTPRequestHandler):
             with self.state.lock:
                 self.state.step_mode = bool(payload.get("step_mode", self.state.step_mode))
                 self.state.manual_auth_phase = bool(payload.get("manual_auth_phase", self.state.manual_auth_phase))
+                self.state.browser_worker_mode = normalize_browser_worker_mode(
+                    str(payload.get("browser_worker_mode", self.state.browser_worker_mode))
+                )
+                self.state.human_like_interaction = bool(
+                    payload.get("human_like_interaction", self.state.human_like_interaction)
+                )
                 self.state.ai_backend = normalize_backend(str(payload.get("ai_backend", self.state.ai_backend)))
                 mode = str(payload.get("compression_mode", self.state.compression_mode)).strip().lower()
                 if mode not in {"aggressive", "normal", "strict"}:
@@ -1038,6 +1475,20 @@ class _Handler(BaseHTTPRequestHandler):
                 self.state.history = []
                 _save_history(self.state.history)
             self._send_json(200, {"ok": True, "cleared": True})
+            return
+
+        if self.path == "/api/feedback":
+            entry = {
+                "session_id": str(payload.get("session_id", "")),
+                "task_id": str(payload.get("task_id", "")),
+                "message_id": str(payload.get("message_id", "")),
+                "rating": int(payload.get("rating", 0) or 0),
+                "reason": str(payload.get("reason", "")),
+                "comment": str(payload.get("comment", "")),
+                "timestamp": float(payload.get("ts", time.time()) or time.time()),
+            }
+            _append_feedback(entry)
+            self._send_json(200, {"ok": True, "saved": True})
             return
 
         if self.path == "/api/apps/search":
@@ -1350,6 +1801,10 @@ class _Handler(BaseHTTPRequestHandler):
             ai_backend = normalize_backend(str(payload.get("ai_backend", "")))
             min_live = int(payload.get("min_live_non_curated_citations", 3))
             manual_auth_phase = bool(payload.get("manual_auth_phase", self.state.manual_auth_phase))
+            browser_worker_mode = normalize_browser_worker_mode(
+                str(payload.get("browser_worker_mode", self.state.browser_worker_mode))
+            )
+            human_like_interaction = bool(payload.get("human_like_interaction", self.state.human_like_interaction))
             artifact_reuse_mode = str(payload.get("artifact_reuse_mode", self.state.artifact_reuse_mode)).strip().lower()
             if artifact_reuse_mode not in {"reuse", "reuse_if_recent", "always_regenerate"}:
                 artifact_reuse_mode = self.state.artifact_reuse_mode
@@ -1374,6 +1829,8 @@ class _Handler(BaseHTTPRequestHandler):
                 ai_backend=ai_backend,
                 min_live_non_curated_citations=min_live,
                 manual_auth_phase=manual_auth_phase,
+                browser_worker_mode=browser_worker_mode,
+                human_like_interaction=human_like_interaction,
                 use_domain_freshness_defaults=bool(payload.get("use_domain_freshness_defaults", self.state.use_domain_freshness_defaults)),
                 artifact_reuse_mode=artifact_reuse_mode,
                 artifact_reuse_max_age_hours=artifact_reuse_max_age_hours,
@@ -1418,22 +1875,31 @@ class _Handler(BaseHTTPRequestHandler):
                 auth_url = str(self.state.pending_auth_url or "")
                 auth_session_id = str(self.state.pending_auth_session_id or "")
                 step_mode = self.state.step_mode
+                human_like_interaction = self.state.human_like_interaction
                 self.state.paused_for_credentials = False
                 self.state.pause_reason = ""
             if pending:
-                result = resume_pending_plan(pending, step_mode=step_mode)
+                result = resume_pending_plan(
+                    pending,
+                    step_mode=step_mode,
+                    human_like_interaction=human_like_interaction,
+                )
                 with self.state.lock:
                     self.state.pending_plan = result.get("pending_plan") or {}
                     self.state.paused_for_credentials = bool(result.get("paused_for_credentials", False))
                     self.state.pause_reason = str(result.get("pause_reason", "")) if self.state.paused_for_credentials else ""
                     if self.state.paused_for_credentials:
                         self.state.pending_auth_instruction = auth_instruction or self.state.pending_auth_instruction
-                        self.state.pending_auth_url = str(result.get("opened_url", "") or auth_url)
+                        next_auth_url = str(result.get("opened_url", "") or auth_url)
+                        if _looks_like_gmail_auth_instruction(self.state.pending_auth_instruction):
+                            next_auth_url = _sanitize_gmail_auth_url(next_auth_url)
+                        self.state.pending_auth_url = next_auth_url
                         self.state.pending_auth_session_id = str(result.get("auth_session_id", "") or auth_session_id)
                     else:
                         self.state.pending_auth_instruction = ""
                         self.state.pending_auth_url = ""
                         self.state.pending_auth_session_id = ""
+                    _apply_auth_loop_tracking_locked(self.state, result)
                     if result.get("ok"):
                         self.state.history.append(result)
                         self.state.history = self.state.history[-300:]
@@ -1441,6 +1907,13 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json(200, result)
                 return
             if auth_instruction:
+                with self.state.lock:
+                    if self.state.auth_loop_blocked:
+                        blocked = _auth_loop_block_response(self.state)
+                        self.state.paused_for_credentials = True
+                        self.state.pause_reason = str(blocked.get("pause_reason", ""))
+                        self._send_json(429, blocked)
+                        return
                 task_id = _start_instruction_task(
                     state=self.state,
                     instruction=auth_instruction,
@@ -1448,6 +1921,8 @@ class _Handler(BaseHTTPRequestHandler):
                     ai_backend=self.state.ai_backend,
                     min_live_non_curated_citations=self.state.min_live_non_curated_citations,
                     manual_auth_phase=False,
+                    browser_worker_mode=self.state.browser_worker_mode,
+                    human_like_interaction=self.state.human_like_interaction,
                     use_domain_freshness_defaults=self.state.use_domain_freshness_defaults,
                     artifact_reuse_mode=self.state.artifact_reuse_mode,
                     artifact_reuse_max_age_hours=self.state.artifact_reuse_max_age_hours,
@@ -1462,6 +1937,10 @@ class _Handler(BaseHTTPRequestHandler):
             with self.state.lock:
                 auth_session_id = str(self.state.pending_auth_session_id or "")
                 auth_url = str(self.state.pending_auth_url or "https://mail.google.com/")
+                auth_instruction = str(self.state.pending_auth_instruction or "")
+                # User took explicit recovery action; allow another resume attempt.
+                self.state.auth_loop_blocked = False
+            auth_url = _sanitize_focus_auth_url(auth_url, instruction=auth_instruction)
             focused = focus_auth_session(auth_session_id=auth_session_id, fallback_url=auth_url, allow_reopen=True)
             if focused.get("ok"):
                 self._send_json(
@@ -1504,6 +1983,9 @@ class _Handler(BaseHTTPRequestHandler):
                 self.state.pending_auth_instruction = ""
                 self.state.pending_auth_url = ""
                 self.state.pending_auth_session_id = ""
+                self.state.auth_loop_signature = ""
+                self.state.auth_loop_count = 0
+                self.state.auth_loop_blocked = False
             self._send_json(
                 200,
                 {
@@ -1525,6 +2007,10 @@ class _Handler(BaseHTTPRequestHandler):
             ai_backend = normalize_backend(str(payload.get("ai_backend", "")))
             min_live = int(payload.get("min_live_non_curated_citations", 3))
             manual_auth_phase = bool(payload.get("manual_auth_phase", self.state.manual_auth_phase))
+            browser_worker_mode = normalize_browser_worker_mode(
+                str(payload.get("browser_worker_mode", self.state.browser_worker_mode))
+            )
+            human_like_interaction = bool(payload.get("human_like_interaction", self.state.human_like_interaction))
             artifact_reuse_mode = str(payload.get("artifact_reuse_mode", self.state.artifact_reuse_mode)).strip().lower()
             if artifact_reuse_mode not in {"reuse", "reuse_if_recent", "always_regenerate"}:
                 artifact_reuse_mode = self.state.artifact_reuse_mode
@@ -1544,6 +2030,8 @@ class _Handler(BaseHTTPRequestHandler):
                 ai_backend=ai_backend,
                 min_live_non_curated_citations=min_live,
                 manual_auth_phase=manual_auth_phase,
+                browser_worker_mode=browser_worker_mode,
+                human_like_interaction=human_like_interaction,
                 use_domain_freshness_defaults=bool(payload.get("use_domain_freshness_defaults", self.state.use_domain_freshness_defaults)),
                 artifact_reuse_mode=artifact_reuse_mode,
                 artifact_reuse_max_age_hours=artifact_reuse_max_age_hours,
@@ -1560,6 +2048,8 @@ class _Handler(BaseHTTPRequestHandler):
                 preflight_error = _preflight_gate_error_locked(self.state)
                 step_mode = self.state.step_mode
                 manual_auth_phase = self.state.manual_auth_phase
+                browser_worker_mode = self.state.browser_worker_mode
+                human_like_interaction = self.state.human_like_interaction
                 auth_session_id = str(self.state.pending_auth_session_id or "")
                 ai_backend = normalize_backend(str(payload.get("ai_backend", self.state.ai_backend)))
                 min_live = max(1, min(20, int(payload.get("min_live_non_curated_citations", self.state.min_live_non_curated_citations))))
@@ -1594,6 +2084,8 @@ class _Handler(BaseHTTPRequestHandler):
                 min_live_non_curated_citations=min_live,
                 manual_auth_phase=manual_auth_phase,
                 auth_session_id=auth_session_id,
+                browser_worker_mode=browser_worker_mode,
+                human_like_interaction=human_like_interaction,
                 artifact_reuse_mode=artifact_reuse_mode,
                 artifact_reuse_max_age_hours=artifact_reuse_max_age_hours,
             )
@@ -1607,12 +2099,16 @@ class _Handler(BaseHTTPRequestHandler):
                 self.state.pause_reason = str(result.get("pause_reason", "")) if self.state.paused_for_credentials else ""
                 if self.state.paused_for_credentials:
                     self.state.pending_auth_instruction = instruction
-                    self.state.pending_auth_url = str(result.get("opened_url", "") or "")
+                    self.state.pending_auth_url = _sanitize_focus_auth_url(
+                        str(result.get("opened_url", "") or ""),
+                        instruction=instruction,
+                    )
                     self.state.pending_auth_session_id = str(result.get("auth_session_id", "") or "")
                 else:
                     self.state.pending_auth_instruction = ""
                     self.state.pending_auth_url = ""
                     self.state.pending_auth_session_id = ""
+                _apply_auth_loop_tracking_locked(self.state, result)
             self._send_json(200, result)
             return
 
@@ -1644,6 +2140,13 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _send_bytes(self, status: int, payload: bytes, content_type: str) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
     def log_message(self, fmt: str, *args: Any) -> None:
         _ = (fmt, args)
 
@@ -1652,6 +2155,8 @@ def run_ui_server(host: str = "127.0.0.1", port: int = 8795, open_browser: bool 
     state = UiState(saved_automations=_load_automations(), history=_load_history())
     state.global_hooks = GlobalTeachHooks(state.recorder)
     _apply_user_defaults(state)
+    # Chat-first product mode: do not block normal delegation behind reliability gates.
+    state.preflight_required = False
 
     def scheduler_run(job: ScheduleJob) -> Dict[str, Any]:
         with state.lock:
@@ -1660,6 +2165,8 @@ def run_ui_server(host: str = "127.0.0.1", port: int = 8795, open_browser: bool 
             preflight_error = _preflight_gate_error_locked(state)
             step_mode = state.step_mode
             manual_auth_phase = state.manual_auth_phase
+            browser_worker_mode = state.browser_worker_mode
+            human_like_interaction = state.human_like_interaction
             ai_backend = state.ai_backend
             min_live = state.min_live_non_curated_citations
             reuse_mode = state.artifact_reuse_mode
@@ -1685,6 +2192,8 @@ def run_ui_server(host: str = "127.0.0.1", port: int = 8795, open_browser: bool 
             ai_backend=ai_backend,
             min_live_non_curated_citations=min_live,
             manual_auth_phase=manual_auth_phase,
+            browser_worker_mode=browser_worker_mode,
+            human_like_interaction=human_like_interaction,
             artifact_reuse_mode=reuse_mode,
             artifact_reuse_max_age_hours=reuse_hours,
         )
@@ -1698,7 +2207,18 @@ def run_ui_server(host: str = "127.0.0.1", port: int = 8795, open_browser: bool 
                 state.paused_for_credentials = True
                 state.pause_reason = str(result.get("pause_reason", ""))
                 state.pending_auth_instruction = instruction
-                state.pending_auth_url = str(result.get("opened_url", "") or "")
+                state.pending_auth_url = _sanitize_focus_auth_url(
+                    str(result.get("opened_url", "") or ""),
+                    instruction=instruction,
+                )
+                state.pending_auth_session_id = str(result.get("auth_session_id", "") or "")
+            else:
+                state.paused_for_credentials = False
+                state.pause_reason = ""
+                state.pending_auth_instruction = ""
+                state.pending_auth_url = ""
+                state.pending_auth_session_id = ""
+            _apply_auth_loop_tracking_locked(state, result)
         return result
 
     scheduler = ScheduleEngine(
@@ -1768,10 +2288,92 @@ def _save_history(history: List[Dict[str, Any]]) -> None:
     _history_path().write_text(json.dumps(history[-300:], indent=2), encoding="utf-8")
 
 
+def _feedback_path() -> Path:
+    path = Path("data/interface/feedback.jsonl")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _append_feedback(entry: Dict[str, Any]) -> None:
+    safe = {
+        "session_id": str(entry.get("session_id", "")),
+        "task_id": str(entry.get("task_id", "")),
+        "message_id": str(entry.get("message_id", "")),
+        "rating": int(entry.get("rating", 0) or 0),
+        "reason": str(entry.get("reason", "")),
+        "comment": str(entry.get("comment", "")),
+        "timestamp": float(entry.get("timestamp", time.time()) or time.time()),
+    }
+    line = json.dumps(safe, ensure_ascii=False)
+    _feedback_path().open("a", encoding="utf-8").write(line + "\n")
+
+
+def _is_path_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def _guess_content_type(path: Path) -> str:
+    guessed, _enc = mimetypes.guess_type(str(path))
+    if guessed:
+        return guessed
+    suffix = path.suffix.lower()
+    if suffix in {".md", ".txt", ".log", ".yaml", ".yml"}:
+        return "text/plain; charset=utf-8"
+    if suffix == ".csv":
+        return "text/csv; charset=utf-8"
+    if suffix == ".json":
+        return "application/json"
+    return "application/octet-stream"
+
+
+def _render_directory_listing_html(dir_path: Path, workspace_root: Path) -> str:
+    rel = str(dir_path.resolve().relative_to(workspace_root.resolve())) if _is_path_within(dir_path, workspace_root) else str(dir_path.resolve())
+    children = sorted(
+        list(dir_path.iterdir()),
+        key=lambda p: (not p.is_dir(), p.name.lower()),
+    )[:400]
+    rows: List[str] = []
+    parent = dir_path.parent.resolve()
+    if _is_path_within(parent, workspace_root):
+        parent_href = f"/api/artifact?path={quote(str(parent))}"
+        rows.append(f"<div><a href=\"{parent_href}\">.. (parent)</a></div>")
+    for child in children:
+        name = child.name + ("/" if child.is_dir() else "")
+        href = f"/api/artifact?path={quote(str(child.resolve()))}"
+        rows.append(f"<div><a href=\"{href}\">{html_lib.escape(name)}</a></div>")
+    body = "\n".join(rows) if rows else "<div>No files.</div>"
+    return f"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Artifact Directory</title>
+<style>
+body{{font-family:'Segoe UI',Tahoma,sans-serif;background:#f8fafc;color:#0f172a;margin:0}}
+.wrap{{max-width:980px;margin:0 auto;padding:20px}}
+.card{{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:14px}}
+a{{color:#0f766e;text-decoration:none}}
+.meta{{font-size:12px;color:#64748b;margin-bottom:10px}}
+</style></head><body><div class="wrap"><div class="card">
+<h2 style="margin:0 0 8px 0;">Artifact Directory</h2>
+<div class="meta">{html_lib.escape(rel)}</div>
+{body}
+</div></div></body></html>"""
+
+
 def _apply_user_defaults(state: UiState) -> None:
     defaults = load_defaults(user=state.user_id)
     step_mode = bool(defaults.get("step_mode", state.step_mode))
     manual_auth_phase = bool(defaults.get("manual_auth_phase", state.manual_auth_phase))
+    policy_worker = _load_policy_browser_worker_defaults()
+    browser_worker_mode = normalize_browser_worker_mode(
+        str(defaults.get("browser_worker_mode", policy_worker.get("browser_worker_mode", state.browser_worker_mode)))
+    )
+    human_like_interaction = bool(
+        defaults.get("human_like_interaction", policy_worker.get("human_like_interaction", state.human_like_interaction))
+    )
     ai_backend = normalize_backend(str(defaults.get("ai_backend", state.ai_backend)))
     compression_mode = str(defaults.get("compression_mode", state.compression_mode)).strip().lower()
     policy_default = _load_policy_min_live_non_curated_citations()
@@ -1794,6 +2396,8 @@ def _apply_user_defaults(state: UiState) -> None:
     with state.lock:
         state.step_mode = step_mode
         state.manual_auth_phase = manual_auth_phase
+        state.browser_worker_mode = browser_worker_mode
+        state.human_like_interaction = human_like_interaction
         state.ai_backend = ai_backend
         state.compression_mode = compression_mode
         state.min_live_non_curated_citations = min_live_val
@@ -1808,6 +2412,8 @@ def _save_user_defaults_locked(state: UiState) -> None:
         {
             "step_mode": state.step_mode,
             "manual_auth_phase": state.manual_auth_phase,
+            "browser_worker_mode": state.browser_worker_mode,
+            "human_like_interaction": state.human_like_interaction,
             "ai_backend": state.ai_backend,
             "compression_mode": state.compression_mode,
             "min_live_non_curated_citations": state.min_live_non_curated_citations,
@@ -1846,6 +2452,186 @@ def _save_policy_yaml(raw: Dict[str, Any]) -> None:
     policy_path = Path("config/policy.yaml")
     policy_path.parent.mkdir(parents=True, exist_ok=True)
     policy_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+
+
+def _load_policy_browser_worker_defaults() -> Dict[str, Any]:
+    raw = _load_policy_yaml()
+    policies = raw.get("policies", {}) if isinstance(raw.get("policies"), dict) else {}
+    worker_cfg = policies.get("browser_worker", {}) if isinstance(policies.get("browser_worker"), dict) else {}
+    mode = normalize_browser_worker_mode(str(worker_cfg.get("mode", "local")))
+    human_like = bool(worker_cfg.get("human_like_interaction", True))
+    return {"browser_worker_mode": mode, "human_like_interaction": human_like}
+
+
+def _looks_like_gmail_auth_instruction(text: str) -> bool:
+    low = str(text or "").lower()
+    return ("gmail" in low) or ("scan my inbox" in low) or ("inbox" in low and "email" in low)
+
+
+def _sanitize_gmail_auth_url(url: str) -> str:
+    raw = str(url or "").strip()
+    if not raw:
+        return "https://mail.google.com/"
+    try:
+        host = (urlparse(raw).netloc or "").lower()
+    except Exception:
+        return "https://mail.google.com/"
+    if "mail.google.com" in host or "accounts.google.com" in host:
+        return raw
+    return "https://mail.google.com/"
+
+
+def _sanitize_focus_auth_url(url: str, instruction: str = "") -> str:
+    raw = str(url or "").strip()
+    if not raw:
+        return "https://mail.google.com/"
+    try:
+        host = (urlparse(raw).netloc or "").lower()
+    except Exception:
+        return "https://mail.google.com/"
+    if _looks_like_gmail_auth_instruction(instruction):
+        return _sanitize_gmail_auth_url(raw)
+    # Guard against known bad Google redirect target observed in auth loops.
+    if "myaccount.google.com" in host:
+        return "https://mail.google.com/"
+    return raw
+
+
+def _auth_loop_signature(result: Dict[str, Any]) -> str:
+    if not isinstance(result, dict):
+        return ""
+    paused = bool(result.get("paused_for_credentials", False))
+    if not paused:
+        return ""
+    summary = result.get("summary", {}) if isinstance(result.get("summary"), dict) else {}
+    source_status = result.get("source_status", {}) if isinstance(result.get("source_status"), dict) else {}
+    parts = [
+        str(result.get("mode", "")),
+        str(result.get("error_code", "")),
+        str(summary.get("error", "")),
+        str(summary.get("imap_error_code", "")),
+        str(result.get("pause_reason", ""))[:180],
+        json.dumps(source_status, sort_keys=True)[:220],
+    ]
+    return "|".join(parts)
+
+
+def _apply_auth_loop_tracking_locked(state: UiState, result: Dict[str, Any]) -> None:
+    sig = _auth_loop_signature(result)
+    if not sig:
+        state.auth_loop_signature = ""
+        state.auth_loop_count = 0
+        state.auth_loop_blocked = False
+        return
+    if sig == state.auth_loop_signature:
+        state.auth_loop_count = int(state.auth_loop_count or 0) + 1
+    else:
+        state.auth_loop_signature = sig
+        state.auth_loop_count = 1
+    state.auth_loop_blocked = state.auth_loop_count >= 3
+
+
+def _auth_loop_block_response(state: UiState) -> Dict[str, Any]:
+    count = int(state.auth_loop_count or 0)
+    reason = (
+        "Auth loop detected after repeated identical failures. "
+        "Use Focus auth tab, complete login or inbox readiness, then click Resume once. "
+        "If still blocked, click Reset Session."
+    )
+    return {
+        "ok": False,
+        "mode": "auth_loop_blocked",
+        "error": "auth_loop_detected",
+        "error_code": "auth_loop_detected",
+        "paused_for_credentials": True,
+        "pause_reason": reason,
+        "auth_loop_count": count,
+        "canvas": {
+            "title": "Auth Loop Detected",
+            "subtitle": f"Stopped after {count} repeated auth retries to avoid credit burn.",
+            "cards": [],
+        },
+    }
+
+
+def _extract_auth_error_code(result: Dict[str, Any]) -> str:
+    if not isinstance(result, dict):
+        return ""
+    code = str(result.get("error_code", "")).strip()
+    if code:
+        return code
+    summary = result.get("summary", {}) if isinstance(result.get("summary"), dict) else {}
+    imap_code = str(summary.get("imap_error_code", "")).strip()
+    if imap_code:
+        return imap_code
+    summary_err = str(summary.get("error", "")).strip()
+    if summary_err:
+        return summary_err
+    return ""
+
+
+def _recommend_mode_for_auth_error(error_code: str, current_mode: str) -> tuple[str, str, str]:
+    code = str(error_code or "").strip().lower()
+    mode = normalize_browser_worker_mode(str(current_mode or "local"))
+    if code in {
+        "browser_worker_unavailable",
+        "docker_worker_not_ready",
+        "docker_worker_start_failed",
+        "docker_worker_attach_failed",
+        "docker_worker_auth_required",
+        "docker_worker_inbox_not_ready",
+        "docker_workspace_redirect",
+        "docker_worker_exception",
+    }:
+        return (
+            "local",
+            "high",
+            "Docker worker cannot complete this auth flow reliably. Use local mode for interactive login.",
+        )
+    if code in {"auth_profile_locked", "browser_triage_exception"}:
+        return (
+            "docker",
+            "medium",
+            "Local browser profile/session appears unstable. Docker worker may provide a cleaner browser context.",
+        )
+    if code in {"imap_app_password_required"}:
+        return (
+            "local",
+            "high",
+            "IMAP requires an app password. Continue with Gmail UI auth in local mode or add app-password credentials.",
+        )
+    if code in {"auth_loop_detected", "credential_missing"}:
+        return (
+            mode,
+            "medium",
+            "Complete sign-in once in the focused auth tab, then resume once to avoid repeated retries.",
+        )
+    if code:
+        return (mode, "low", "No strong mode preference detected from this error code.")
+    return (mode, "low", "")
+
+
+def _build_auth_recovery_recommendation_locked(state: UiState, current_task: Dict[str, Any]) -> Dict[str, Any]:
+    result = current_task.get("result", {}) if isinstance(current_task.get("result"), dict) else {}
+    error_code = _extract_auth_error_code(result)
+    if state.auth_loop_blocked:
+        error_code = "auth_loop_detected"
+    if not error_code and state.paused_for_credentials:
+        error_code = "credential_missing"
+    recommended_mode, confidence, reason = _recommend_mode_for_auth_error(
+        error_code=error_code,
+        current_mode=state.browser_worker_mode,
+    )
+    show = bool(error_code or state.paused_for_credentials or state.auth_loop_blocked)
+    return {
+        "show": show,
+        "error_code": error_code,
+        "current_mode": normalize_browser_worker_mode(state.browser_worker_mode),
+        "recommended_mode": recommended_mode,
+        "confidence": confidence,
+        "reason": reason,
+        "pause_reason": str(state.pause_reason or ""),
+    }
 
 
 def _load_policy_freshness_defaults() -> Dict[str, Any]:
@@ -2042,6 +2828,8 @@ def _start_instruction_task(
     ai_backend: str,
     min_live_non_curated_citations: int = 3,
     manual_auth_phase: bool = True,
+    browser_worker_mode: str = "local",
+    human_like_interaction: bool = True,
     use_domain_freshness_defaults: bool = True,
     artifact_reuse_mode: str = "reuse_if_recent",
     artifact_reuse_max_age_hours: int = 72,
@@ -2082,6 +2870,8 @@ def _start_instruction_task(
             step_mode = state.step_mode
             backend = normalize_backend(str(ai_backend or state.ai_backend))
             min_live = max(1, min(20, int(min_live_non_curated_citations or state.min_live_non_curated_citations)))
+            worker_mode = normalize_browser_worker_mode(str(browser_worker_mode or state.browser_worker_mode))
+            human_like = bool(human_like_interaction if human_like_interaction is not None else state.human_like_interaction)
             reuse_mode = str(artifact_reuse_mode or state.artifact_reuse_mode).strip().lower()
             if reuse_mode not in {"reuse", "reuse_if_recent", "always_regenerate"}:
                 reuse_mode = state.artifact_reuse_mode
@@ -2116,6 +2906,8 @@ def _start_instruction_task(
                 min_live_non_curated_citations=min_live,
                 manual_auth_phase=manual_auth_phase,
                 auth_session_id=auth_session_id,
+                browser_worker_mode=worker_mode,
+                human_like_interaction=human_like,
                 artifact_reuse_mode=reuse_mode,
                 artifact_reuse_max_age_hours=reuse_hours,
                 progress_cb=_progress,
@@ -2141,12 +2933,16 @@ def _start_instruction_task(
                 state.pause_reason = str(result.get("pause_reason", "")) if state.paused_for_credentials else ""
                 if state.paused_for_credentials:
                     state.pending_auth_instruction = instruction
-                    state.pending_auth_url = str(result.get("opened_url", "") or "")
+                    pending_url = str(result.get("opened_url", "") or "")
+                    if _looks_like_gmail_auth_instruction(instruction):
+                        pending_url = _sanitize_gmail_auth_url(pending_url)
+                    state.pending_auth_url = pending_url
                     state.pending_auth_session_id = str(result.get("auth_session_id", "") or "")
                 else:
                     state.pending_auth_instruction = ""
                     state.pending_auth_url = ""
                     state.pending_auth_session_id = ""
+                _apply_auth_loop_tracking_locked(state, result)
         except Exception as exc:  # pylint: disable=broad-exception-caught
             with state.lock:
                 task = state.tasks.get(task_id, {})

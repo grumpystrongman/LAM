@@ -2,6 +2,7 @@ import unittest
 import tempfile
 import json
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import lam.interface.search_agent as search_agent_mod
@@ -245,6 +246,134 @@ class TestSearchAgent(unittest.TestCase):
         self.assertFalse(out.get("ok"))
         self.assertEqual(out.get("error_code"), "playbook_obligation_failed")
 
+    @patch("lam.interface.search_agent._fetch_text")
+    def test_search_ebay_listings_parses_price_cards(self, mock_fetch_text) -> None:
+        mock_fetch_text.return_value = """
+        <html><body>
+          <li class="s-item">
+            <a class="s-item__link" href="https://www.ebay.com/itm/111">
+              <div class="s-item__title">Cyberdeck Raspberry Pi Build A</div>
+              <span class="s-item__price">$189.00</span>
+              <div class="s-item__subtitle">Used condition</div>
+            </a>
+          </li>
+          <li class="s-item">
+            <a class="s-item__link" href="https://www.ebay.com/itm/222">
+              <div class="s-item__title">Cyberdeck Raspberry Pi Build B</div>
+              <span class="s-item__price">$149.99</span>
+            </a>
+          </li>
+        </body></html>
+        """
+        rows = search_agent_mod._search_ebay_listings(
+            query="cyberdeck raspberry pi",
+            search_url="https://www.ebay.com/sch/i.html?_nkw=cyberdeck+raspberry+pi&_sop=12",
+            limit=5,
+        )
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0].source, "ebay")
+        self.assertEqual(rows[0].url, "https://www.ebay.com/itm/111")
+        self.assertAlmostEqual(float(rows[1].price or 0.0), 149.99, places=2)
+
+    @patch("lam.interface.search_agent._search_ebay_listings_playwright")
+    @patch("lam.interface.search_agent._fetch_text")
+    def test_search_ebay_listings_uses_playwright_fallback_on_interstitial(
+        self,
+        mock_fetch_text,
+        mock_playwright_rows,
+    ) -> None:
+        mock_fetch_text.return_value = "<html><title>Pardon Our Interruption...</title></html>"
+        mock_playwright_rows.return_value = [
+            search_agent_mod.SearchResult(
+                title="Cyberdeck Raspberry Pi Build C",
+                url="https://www.ebay.com/itm/333",
+                price=199.0,
+                source="ebay",
+                snippet="Fallback row",
+            )
+        ]
+        rows = search_agent_mod._search_ebay_listings(
+            query="cyberdeck raspberry pi",
+            search_url="https://www.ebay.com/sch/i.html?_nkw=cyberdeck+raspberry+pi&_sop=12",
+            limit=5,
+            browser_worker_mode="local",
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].url, "https://www.ebay.com/itm/333")
+        mock_playwright_rows.assert_called_once()
+
+    def test_clean_ebay_query_removes_best_price_prompt_wrapping(self) -> None:
+        cleaned = search_agent_mod._clean_ebay_query(
+            "search ebay for best price on cyberdeck raspberry pi and recommend me the one to buy"
+        )
+        self.assertEqual(cleaned, "cyberdeck raspberry pi")
+
+    def test_pick_recommended_candidate_prefers_lowest_price_then_quality(self) -> None:
+        picked = search_agent_mod._pick_recommended_candidate(
+            [
+                {"title": "A", "url": "https://example.com/a", "price": 299.0, "rating": 4.9, "review_count": 11},
+                {"title": "B", "url": "https://example.com/b", "price": 249.0, "rating": 3.8, "review_count": 5},
+                {"title": "C", "url": "https://example.com/c", "price": 249.0, "rating": 4.5, "review_count": 88},
+            ]
+        )
+        self.assertEqual(picked.get("title"), "C")
+
+    @patch("lam.interface.search_agent._resolve_navigation_target")
+    @patch("lam.interface.search_agent._search_ebay_listings")
+    @patch("lam.interface.search_agent._search_web")
+    def test_execute_instruction_ebay_price_recommendation_selects_lowest_listing(
+        self,
+        mock_search_web,
+        mock_search_ebay,
+        mock_resolve_nav,
+    ) -> None:
+        mock_search_web.return_value = [
+            search_agent_mod.SearchResult(
+                title="Cyberdeck Raspberry Pi for sale | eBay",
+                url="https://www.ebay.com/sch/i.html?_nkw=cyberdeck+raspberry+pi&_sop=12",
+                price=None,
+                source="duckduckgo",
+                snippet="Marketplace landing page.",
+            )
+        ]
+        mock_search_ebay.return_value = [
+            search_agent_mod.SearchResult(
+                title="Cyberdeck Raspberry Pi Build A",
+                url="https://www.ebay.com/itm/111",
+                price=189.0,
+                source="ebay",
+                snippet="Used",
+            ),
+            search_agent_mod.SearchResult(
+                title="Cyberdeck Raspberry Pi Build B",
+                url="https://www.ebay.com/itm/222",
+                price=149.99,
+                source="ebay",
+                snippet="Like new",
+            ),
+        ]
+        mock_resolve_nav.return_value = {
+            "url": "https://www.ebay.com/itm/222",
+            "reused": False,
+            "opened": True,
+            "decision": {"score": 92.0, "reasons": ["ok"], "elegance_cost": 0},
+        }
+        out = execute_instruction(
+            "search ebay for cyberdeck raspberry pi best price and recommend me the one to buy",
+            control_granted=True,
+            progress_cb=None,
+        )
+        self.assertTrue(out.get("ok"))
+        self.assertEqual(out.get("mode"), "web_search")
+        self.assertEqual(out.get("opened_url"), "https://www.ebay.com/itm/222")
+        self.assertEqual(out.get("best_result", {}).get("url"), "https://www.ebay.com/itm/222")
+        self.assertEqual(out.get("recommendation", {}).get("selected_url"), "https://www.ebay.com/itm/222")
+        self.assertAlmostEqual(float(out.get("recommendation", {}).get("selected_price") or 0.0), 149.99, places=2)
+        self.assertEqual(out.get("canvas", {}).get("title"), "Best Price Recommendation")
+        self.assertIn("decision_matrix_csv", out.get("artifacts", {}))
+        self.assertIn("recommendation_md", out.get("artifacts", {}))
+        self.assertGreaterEqual(int(out.get("summary", {}).get("marketplace_candidate_count", 0) or 0), 1)
+
     def test_strategy_order_prefers_email_when_reusable_session_exists(self) -> None:
         with patch("lam.interface.search_agent.SessionManager") as mock_mgr:
             inst = mock_mgr.return_value
@@ -351,6 +480,44 @@ class TestSearchAgent(unittest.TestCase):
             self.assertTrue(r2.get("ok"))
             self.assertEqual(mock_open.call_count, 1)
 
+    @patch("lam.interface.search_agent.webbrowser.open")
+    def test_focus_auth_session_sanitizes_bad_fallback_url(self, mock_open) -> None:
+        with patch.dict("lam.interface.search_agent._EMAIL_AUTH_SESSIONS", {}, clear=True):
+            r = search_agent_mod.focus_auth_session(
+                auth_session_id="missing",
+                fallback_url="https://myaccount.google.com/find-your-phone",
+                allow_reopen=True,
+            )
+            self.assertFalse(r.get("ok"))
+            self.assertEqual(r.get("error"), "auth_session_not_found")
+            self.assertEqual(r.get("opened_url"), "https://mail.google.com/")
+            mock_open.assert_called_once()
+            opened_arg = str(mock_open.call_args.args[0])
+            self.assertEqual(opened_arg, "https://mail.google.com/")
+
+    @patch("lam.interface.search_agent.webbrowser.open")
+    def test_focus_auth_session_uses_latest_when_id_missing_and_sanitizes_target(self, mock_open) -> None:
+        with patch.dict(
+            "lam.interface.search_agent._EMAIL_AUTH_SESSIONS",
+            {
+                "sid-a": {
+                    "created_ts": 10.0,
+                    "url": "https://myaccount.google.com/find-your-phone",
+                    "opened_once": False,
+                }
+            },
+            clear=True,
+        ):
+            r = search_agent_mod.focus_auth_session(
+                auth_session_id="",
+                fallback_url="https://mail.google.com/",
+                allow_reopen=True,
+            )
+            self.assertTrue(r.get("ok"))
+            self.assertEqual(r.get("auth_session_id"), "sid-a")
+            self.assertEqual(r.get("opened_url"), "https://mail.google.com/")
+            mock_open.assert_called_once_with("https://mail.google.com/", new=2)
+
     def test_select_latest_auth_session_prefers_recent(self) -> None:
         with patch.dict(
             "lam.interface.search_agent._EMAIL_AUTH_SESSIONS",
@@ -396,6 +563,57 @@ class TestSearchAgent(unittest.TestCase):
             self.assertTrue(out.get("paused_for_credentials"))
             self.assertEqual(out.get("error_code"), "credential_missing")
             self.assertEqual(out.get("source_status", {}).get("gmail_ui"), "auth_profile_locked")
+
+    @patch("lam.interface.search_agent.ensure_browser_worker")
+    def test_email_triage_docker_mode_reports_worker_unavailable(self, mock_ensure_worker) -> None:
+        mock_ensure_worker.return_value = {"ok": False, "detail": "docker not running"}
+        out = search_agent_mod._run_email_triage_active_browser(
+            instruction="Scan my inbox for last 48 hours and draft replies.",
+            manual_auth_phase=False,
+            auth_session_id="",
+            browser_worker_mode="docker",
+        )
+        self.assertFalse(out.get("ok"))
+        self.assertEqual(out.get("error_code"), "browser_worker_unavailable")
+        self.assertFalse(bool(out.get("paused_for_credentials", False)))
+
+    @patch("lam.interface.search_agent._launch_persistent_chrome_with_retry")
+    def test_attach_or_launch_auth_context_skips_automated_fallback_by_default(self, mock_launch) -> None:
+        class _Chromium:
+            def connect_over_cdp(self, _url: str, timeout: int = 0) -> Any:  # type: ignore[name-defined]
+                _ = timeout
+                raise RuntimeError("cdp unavailable")
+
+        class _Playwright:
+            chromium = _Chromium()
+
+        out = search_agent_mod._attach_or_launch_auth_context(
+            playwright=_Playwright(),
+            profile_dir=Path("."),
+            session={"debug_port": 9222},
+        )
+        self.assertIsNone(out)
+        mock_launch.assert_not_called()
+
+    @patch("lam.interface.search_agent.imaplib.IMAP4_SSL", side_effect=RuntimeError("Application-specific password required"))
+    @patch("lam.interface.search_agent._resolve_gmail_vault_credentials")
+    def test_imap_fallback_classifies_app_password_required(self, mock_creds, _mock_imap) -> None:
+        mock_creds.return_value = {
+            "ok": True,
+            "username": "cmajeff@gmail.com",
+            "password": "secret",
+            "entry_id": "entry-1",
+        }
+        out = search_agent_mod._run_email_triage_imap_fallback(
+            instruction="Scan my inbox for last 48 hours and draft replies.",
+            account="cmajeff@gmail.com",
+            progress_cb=None,
+            trace=[],
+        )
+        self.assertFalse(out.get("ok"))
+        self.assertEqual(out.get("error_code"), "imap_app_password_required")
+        self.assertIn("app password", str(out.get("pause_reason", "")).lower())
+        self.assertEqual(out.get("summary", {}).get("imap_error_code"), "imap_app_password_required")
 
     def test_control_gate(self) -> None:
         result = execute_instruction("search amazon for abu garcia voltiq baitcasting reel", control_granted=False)
@@ -450,6 +668,29 @@ class TestSearchAgent(unittest.TestCase):
         self.assertIn("final_report", result)
         self.assertIn("summary", result)
         self.assertIn("elegance_budget", result.get("summary", {}))
+        self.assertTrue(mock_exec.call_args.kwargs.get("human_like_interaction"))
+
+    @patch("lam.interface.search_agent.get_guidance")
+    @patch("lam.interface.search_agent.execute_plan")
+    def test_open_app_flow_passes_human_like_interaction(self, mock_exec, mock_guidance) -> None:
+        class R:
+            ok = True
+            trace = [{"step": 0, "action": "open_app", "ok": True}]
+            done = True
+            next_step_index = 1
+            paused_for_credentials = False
+            pause_reason = ""
+            error = ""
+
+        mock_exec.return_value = R()
+        mock_guidance.return_value = {"app_name": "chatgpt", "guidance": []}
+        result = execute_instruction(
+            "open chatgpt app",
+            control_granted=True,
+            human_like_interaction=True,
+        )
+        self.assertTrue(result["ok"])
+        self.assertTrue(mock_exec.call_args.kwargs.get("human_like_interaction"))
 
     @patch("lam.interface.search_agent.execute_plan")
     def test_resume_pending_plan(self, mock_exec) -> None:

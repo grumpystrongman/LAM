@@ -20,14 +20,17 @@
 
 ## Main UI Areas
 
-- Control Bar: accept/revoke control, AI backend, step mode, compression mode
-- Instruction Bar: prompt input, preview, run, save/run automation
-- Teach Mode: record steps and generate reusable instructions
-- Selector Picker: capture UI target at cursor
-- Schedules: interval, daily, and event triggers
-- Password Vault: local credential storage + autofill
-- Canvas: visual summary of run outcomes
-- History: click previous runs to inspect outputs
+- Sidebar (collapsible): new task, task history, quick status
+- Chat Workspace (default focus):
+  - task instruction + run controls
+  - assistant feed with concise progress and completion updates
+  - feedback chips (`thumbs up/down`, `too slow`, `wrong path`, `not human-like`, `great result`)
+- Canvas / Workbench (opens on demand):
+  - browser frame, terminal-like progress, artifacts/outputs
+  - developer details section for world model, run summary, and raw JSON
+- Auth Recovery Wizard:
+  - appears only when auth loop or credential pause is detected
+  - recommends `local` vs `docker` worker mode based on failure code
 
 ## Best Prompt Patterns
 
@@ -103,6 +106,8 @@ Prompt:
   - confirm `Accept Control` is on
 - If execution pauses:
   - complete login/MFA and click `Resume`
+- If auth loops between sessions:
+  - use `Auth Recovery Wizard` and apply the recommended mode (`local` or `docker`)
 - If selector fails:
   - capture selector again with picker or use teach mode
 - If OCR-based find fails:

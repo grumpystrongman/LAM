@@ -123,8 +123,13 @@ def execute_plan(
     start_index: int = 0,
     step_mode: bool = False,
     allow_input_fallback: bool = True,
+    human_like_interaction: bool = False,
 ) -> SequenceResult:
-    adapter = UIAAdapter(allow_input_fallback=allow_input_fallback, dry_run=False)
+    adapter = UIAAdapter(
+        allow_input_fallback=allow_input_fallback,
+        dry_run=False,
+        human_like=bool(human_like_interaction),
+    )
     vault = LocalPasswordVault()
     steps: List[Dict[str, Any]] = plan.get("steps", [])
     trace: List[Dict[str, Any]] = []

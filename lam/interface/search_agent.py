@@ -5,6 +5,7 @@ import csv
 import html
 import hashlib
 import os
+import random
 import shutil
 import statistics
 import subprocess
@@ -28,6 +29,7 @@ from typing import Any, Callable, Dict, List, Optional, Set
 
 from lam.interface.ai_backend import backend_metadata, normalize_backend
 from lam.interface.app_launcher import is_app_running, normalize_app_name, open_installed_app
+from lam.interface.browser_worker import ensure_browser_worker, normalize_browser_worker_mode
 from lam.interface.app_learner import get_guidance
 from lam.interface.desktop_sequence import assess_risk, build_plan, execute_plan
 from lam.interface.domain_playbooks import (
@@ -164,6 +166,22 @@ class EmailActionItem:
 
 _EMAIL_AUTH_SESSIONS: Dict[str, Dict[str, Any]] = {}
 ARTIFACT_REUSE_MODES = {"reuse", "reuse_if_recent", "always_regenerate"}
+
+
+def _normalize_gmail_auth_url(url: str, default: str = "https://mail.google.com/") -> str:
+    raw = str(url or "").strip()
+    if not raw:
+        return default
+    try:
+        parsed = urllib.parse.urlparse(raw)
+        host = (parsed.netloc or "").lower()
+    except Exception:
+        return default
+    if "mail.google.com" in host:
+        return raw
+    if "accounts.google.com" in host:
+        return raw
+    return default
 
 
 def _artifact_reuse_index_path() -> Path:
@@ -345,6 +363,432 @@ def _search_web(query: str, limit: int = 10) -> List[SearchResult]:
     for r in results + fallback:
         out[r.url] = r
     return list(out.values())[:limit]
+
+
+def _parse_review_image_signals(text: str) -> Dict[str, Any]:
+    raw = str(text or "")
+    low = raw.lower()
+    rating: Optional[float] = None
+    review_count: Optional[int] = None
+    image_count = low.count("<img")
+    rating_match = re.search(r"([0-5](?:\.[0-9])?)\s*(?:out of 5|/5)", low)
+    if rating_match:
+        try:
+            rating = float(rating_match.group(1))
+        except ValueError:
+            rating = None
+    review_match = re.search(r"([0-9][0-9,]{0,8})\s+(?:ratings|rating|reviews|review)\b", low)
+    if review_match:
+        try:
+            review_count = int(review_match.group(1).replace(",", ""))
+        except ValueError:
+            review_count = None
+    return {
+        "rating": rating,
+        "review_count": review_count,
+        "image_count": int(image_count),
+    }
+
+
+def _collect_page_signals(url: str) -> Dict[str, Any]:
+    target = str(url or "").strip()
+    if not target:
+        return {"rating": None, "review_count": None, "image_count": 0}
+    try:
+        page_text = _fetch_text(target)
+    except Exception:
+        return {"rating": None, "review_count": None, "image_count": 0}
+    return _parse_review_image_signals(page_text)
+
+
+def _estimate_condition(text: str) -> str:
+    low = str(text or "").lower()
+    if any(t in low for t in ["brand new", "new in box", "new"]):
+        return "new"
+    if any(t in low for t in ["refurb", "renewed"]):
+        return "refurbished"
+    if any(t in low for t in ["open box", "used", "pre-owned", "preowned"]):
+        return "used"
+    return "unknown"
+
+
+def _build_shopping_candidates(results: List[SearchResult], max_items: int = 10, signal_pages: int = 4) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for result in results:
+        url = str(result.url or "").strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        base_text = f"{result.title} {result.snippet}"
+        signals = _parse_review_image_signals(base_text)
+        candidates.append(
+            {
+                "title": result.title,
+                "url": url,
+                "source": result.source,
+                "price": result.price,
+                "snippet": result.snippet,
+                "condition": _estimate_condition(base_text),
+                "rating": signals.get("rating"),
+                "review_count": signals.get("review_count"),
+                "image_count": int(signals.get("image_count") or 0),
+            }
+        )
+        if len(candidates) >= max_items:
+            break
+    for idx, row in enumerate(candidates[: max(0, signal_pages)]):
+        if row.get("rating") is not None and row.get("review_count"):
+            continue
+        page_signals = _collect_page_signals(str(row.get("url", "")))
+        if row.get("rating") is None and page_signals.get("rating") is not None:
+            row["rating"] = page_signals.get("rating")
+        if not row.get("review_count") and page_signals.get("review_count") is not None:
+            row["review_count"] = page_signals.get("review_count")
+        row["image_count"] = max(int(row.get("image_count") or 0), int(page_signals.get("image_count") or 0))
+        candidates[idx] = row
+    return candidates
+
+
+def _pick_recommended_candidate(candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not candidates:
+        return {}
+    priced = [c for c in candidates if isinstance(c.get("price"), (int, float))]
+    if priced:
+        priced.sort(
+            key=lambda c: (
+                float(c.get("price") or 999999.0),
+                -(float(c.get("rating") or 0.0)),
+                -(int(c.get("review_count") or 0)),
+            )
+        )
+        return dict(priced[0])
+    ranked = sorted(
+        candidates,
+        key=lambda c: (
+            -(float(c.get("rating") or 0.0)),
+            -(int(c.get("review_count") or 0)),
+            -(int(c.get("image_count") or 0)),
+        ),
+    )
+    return dict(ranked[0]) if ranked else {}
+
+
+def _write_shopping_decision_artifacts(
+    instruction: str,
+    query: str,
+    candidates: List[Dict[str, Any]],
+    recommendation: Dict[str, Any],
+) -> Dict[str, str]:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = Path("data/reports/shopping_assistant") / ts
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / "decision_matrix.csv"
+    notes_path = out_dir / "recommendation.md"
+    dash_path = out_dir / "shopping_dashboard.html"
+
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "rank",
+                "title",
+                "url",
+                "source",
+                "price",
+                "rating",
+                "review_count",
+                "image_count",
+                "condition",
+                "snippet",
+            ],
+        )
+        writer.writeheader()
+        for idx, row in enumerate(candidates, start=1):
+            writer.writerow(
+                {
+                    "rank": idx,
+                    "title": row.get("title", ""),
+                    "url": row.get("url", ""),
+                    "source": row.get("source", ""),
+                    "price": row.get("price", ""),
+                    "rating": row.get("rating", ""),
+                    "review_count": row.get("review_count", ""),
+                    "image_count": row.get("image_count", ""),
+                    "condition": row.get("condition", ""),
+                    "snippet": row.get("snippet", ""),
+                }
+            )
+
+    lines = [
+        "# Shopping Recommendation",
+        "",
+        f"- Generated: {datetime.now().isoformat(timespec='seconds')}",
+        f"- Instruction: {instruction}",
+        f"- Query focus: {query}",
+        f"- Candidate rows reviewed: {len(candidates)}",
+        "",
+    ]
+    if recommendation:
+        lines.extend(
+            [
+                "## Recommended Option",
+                f"- Title: {recommendation.get('title', '')}",
+                f"- URL: {recommendation.get('url', '')}",
+                f"- Price: {recommendation.get('price', 'n/a')}",
+                f"- Rating: {recommendation.get('rating', 'n/a')}",
+                f"- Review count: {recommendation.get('review_count', 'n/a')}",
+                f"- Condition: {recommendation.get('condition', 'unknown')}",
+                "",
+                "## Why this option",
+                "- Lowest available price is prioritized first.",
+                "- Then rating/review confidence and listing clarity are considered.",
+            ]
+        )
+    else:
+        lines.append("No recommendation could be determined from available candidates.")
+    notes_path.write_text("\n".join(lines), encoding="utf-8")
+
+    rows = []
+    for row in candidates:
+        price = row.get("price")
+        rows.append(
+            {
+                "title": row.get("title", ""),
+                "source": row.get("source", ""),
+                "price": (f"${float(price):.2f}" if isinstance(price, (int, float)) else "n/a"),
+                "url": row.get("url", ""),
+                "snippet": row.get("snippet", ""),
+                "rating": row.get("rating", ""),
+                "review_count": row.get("review_count", ""),
+                "image_count": row.get("image_count", ""),
+                "condition": row.get("condition", ""),
+            }
+        )
+    rows_payload = json.dumps(rows)
+    rec_payload = json.dumps(recommendation or {})
+    html_text = f"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Shopping Decision Dashboard</title>
+<style>
+body{{font-family:'Segoe UI',Tahoma,sans-serif;background:#f8fafc;color:#0f172a;margin:0}}
+.wrap{{max-width:1200px;margin:0 auto;padding:20px}}
+.hero{{background:#fff;border:1px solid #dbe4f0;border-radius:12px;padding:16px}}
+.meta{{font-size:12px;color:#64748b}}
+.tbl{{margin-top:12px;background:#fff;border:1px solid #e2e8f0;border-radius:12px;overflow:auto}}
+table{{width:100%;border-collapse:collapse;font-size:13px}}
+th,td{{padding:8px 10px;border-bottom:1px solid #e2e8f0;text-align:left;vertical-align:top}}
+a{{color:#0f766e;text-decoration:none}}
+</style></head><body><div class="wrap">
+<div class="hero">
+<h1 style="margin:0">Shopping Decision Dashboard</h1>
+<div class="meta" style="margin-top:6px;">{html.escape(query)} | candidates: {len(candidates)}</div>
+<div id="rec" style="margin-top:10px;"></div>
+</div>
+<div class="tbl"><table><thead>
+<tr><th>#</th><th>Title</th><th>Price</th><th>Rating</th><th>Reviews</th><th>Images</th><th>Condition</th><th>Source</th></tr>
+</thead><tbody id="rows"></tbody></table></div>
+</div>
+<script>
+const rows={rows_payload};
+const rec={rec_payload};
+const recEl=document.getElementById('rec');
+if(rec && rec.url){{
+  recEl.innerHTML=`<strong>Recommended:</strong> <a target="_blank" rel="noopener" href="${{rec.url}}">${{(rec.title||'selected item')}}</a> | price: ${{rec.price ?? 'n/a'}} | rating: ${{rec.rating ?? 'n/a'}} | reviews: ${{rec.review_count ?? 'n/a'}}`;
+}}
+document.getElementById('rows').innerHTML = rows.map((r, i)=>`<tr><td>${{i+1}}</td><td><a target="_blank" rel="noopener" href="${{r.url}}">${{r.title}}</a><div class="meta">${{r.snippet||''}}</div></td><td>${{r.price}}</td><td>${{r.rating||'n/a'}}</td><td>${{r.review_count||'n/a'}}</td><td>${{r.image_count||0}}</td><td>${{r.condition||'unknown'}}</td><td>${{r.source}}</td></tr>`).join('');
+</script></body></html>"""
+    dash_path.write_text(html_text, encoding="utf-8")
+
+    return {
+        "directory": str(out_dir.resolve()),
+        "decision_matrix_csv": str(csv_path.resolve()),
+        "recommendation_md": str(notes_path.resolve()),
+        "shopping_dashboard_html": str(dash_path.resolve()),
+        "primary_open_file": str(dash_path.resolve()),
+    }
+
+
+def _extract_inline_url(text: str) -> str:
+    match = re.search(r"https?://[^\s)>\"]+", str(text or ""), flags=re.IGNORECASE)
+    if not match:
+        return ""
+    return match.group(0).rstrip(".,;:!?")
+
+
+def _is_price_recommendation_intent(instruction: str) -> bool:
+    low = str(instruction or "").lower()
+    strong = [
+        "best price",
+        "lowest price",
+        "cheapest",
+        "recommend",
+        "which one to buy",
+        "what should i buy",
+        "for sale",
+    ]
+    if any(token in low for token in strong):
+        return True
+    return "ebay" in low and "price" in low
+
+
+def _clean_ebay_query(instruction: str) -> str:
+    raw = str(instruction or "").strip()
+    cleaned = re.sub(r"https?://[^\s]+", " ", raw, flags=re.IGNORECASE)
+    patterns = [
+        r"^\s*(?:search|find|look(?:\s+up)?)\s+ebay\s+(?:for\s+)?",
+        r"^\s*(?:on\s+)?ebay\s+(?:for\s+)?",
+        r"^\s*on\s+",
+    ]
+    for pattern in patterns:
+        cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(
+        r"\b(best|lowest|cheapest)\s+price\b|\brecommend(?:\s+me)?(?:\s+the\s+one\s+to\s+buy)?\b|\bwhich\s+one\s+to\s+buy\b",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .,-")
+    cleaned = re.sub(r"^\s*(on|for)\s+", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(and|to|for|please)\s*$", "", cleaned, flags=re.IGNORECASE).strip(" .,-")
+    return cleaned or raw
+
+
+def _parse_ebay_listing_blocks(html_text: str, limit: int = 10) -> List[SearchResult]:
+    item_pattern = re.compile(r"<li[^>]*class=\"[^\"]*s-item[^\"]*\"[^>]*>(.*?)</li>", re.IGNORECASE | re.DOTALL)
+    link_pattern = re.compile(r"class=\"[^\"]*s-item__link[^\"]*\"[^>]*href=\"([^\"]+)\"", re.IGNORECASE | re.DOTALL)
+    title_pattern = re.compile(r"class=\"[^\"]*s-item__title[^\"]*\"[^>]*>(.*?)</", re.IGNORECASE | re.DOTALL)
+    price_pattern = re.compile(r"class=\"[^\"]*s-item__price[^\"]*\"[^>]*>(.*?)</", re.IGNORECASE | re.DOTALL)
+    subtitle_pattern = re.compile(r"class=\"[^\"]*s-item__subtitle[^\"]*\"[^>]*>(.*?)</", re.IGNORECASE | re.DOTALL)
+
+    out: Dict[str, SearchResult] = {}
+    for block in item_pattern.findall(html_text):
+        href_match = link_pattern.search(block)
+        title_match = title_pattern.search(block)
+        if not href_match or not title_match:
+            continue
+        href = html.unescape(href_match.group(1)).strip()
+        title = html.unescape(re.sub("<.*?>", "", title_match.group(1))).strip()
+        if not href or not title:
+            continue
+        low_title = title.lower()
+        if "shop on ebay" in low_title or "results matching fewer words" in low_title:
+            continue
+        price_match = price_pattern.search(block)
+        price_text = html.unescape(re.sub("<.*?>", "", price_match.group(1))).strip() if price_match else ""
+        snippet_match = subtitle_pattern.search(block)
+        snippet = html.unescape(re.sub("<.*?>", "", snippet_match.group(1))).strip() if snippet_match else ""
+        out[href] = SearchResult(
+            title=title,
+            url=href,
+            price=_extract_price(f"{price_text} {title}"),
+            source="ebay",
+            snippet=snippet,
+        )
+        if len(out) >= limit:
+            break
+    return list(out.values())[:limit]
+
+
+def _search_ebay_listings_playwright(search_url: str, limit: int = 10, browser_worker_mode: str = "local") -> List[SearchResult]:
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception:
+        return []
+
+    rows: Dict[str, SearchResult] = {}
+    with sync_playwright() as p:
+        browser = None
+        context = None
+        attached = False
+        try:
+            worker = ensure_browser_worker(mode=browser_worker_mode)
+            if worker.get("ok"):
+                debug_port = int(worker.get("debug_port", 9222) or 9222)
+                try:
+                    browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{debug_port}", timeout=3500)
+                    contexts = list(getattr(browser, "contexts", []) or [])
+                    context = contexts[0] if contexts else browser.new_context()
+                    attached = True
+                except Exception:
+                    browser = None
+                    context = None
+            if context is None:
+                browser = p.chromium.launch(headless=True)
+                context = browser.new_context()
+
+            page = _select_best_context_page(context, search_url) if attached else None
+            if page is None:
+                pages = list(getattr(context, "pages", []) or [])
+                page = pages[0] if pages else context.new_page()
+            if "ebay.com" not in str(getattr(page, "url", "")).lower():
+                page.goto(search_url, timeout=30000)
+            page.wait_for_timeout(2200)
+            if "pardon our interruption" in str(page.title() or "").lower():
+                return []
+
+            cards = page.query_selector_all("li.s-item, .srp-results .s-item")
+            if not cards:
+                page.wait_for_timeout(1200)
+                cards = page.query_selector_all("li.s-item, .srp-results .s-item")
+            for card in cards[: max(6, limit * 3)]:
+                try:
+                    link_node = card.query_selector(".s-item__link")
+                    title_node = card.query_selector(".s-item__title")
+                    price_node = card.query_selector(".s-item__price")
+                    subtitle_node = card.query_selector(".s-item__subtitle")
+                    if not link_node or not title_node:
+                        continue
+                    href = str(link_node.get_attribute("href") or "").strip()
+                    title = str(title_node.inner_text() or "").strip()
+                    if not href or not title:
+                        continue
+                    low_title = title.lower()
+                    if "shop on ebay" in low_title or "results matching fewer words" in low_title:
+                        continue
+                    price_text = str(price_node.inner_text() or "").strip() if price_node else ""
+                    subtitle = str(subtitle_node.inner_text() or "").strip() if subtitle_node else ""
+                    rows[href] = SearchResult(
+                        title=title,
+                        url=href,
+                        price=_extract_price(f"{price_text} {title}"),
+                        source="ebay",
+                        snippet=subtitle,
+                    )
+                    if len(rows) >= limit:
+                        break
+                except Exception:
+                    continue
+            return list(rows.values())[:limit]
+        finally:
+            if browser is not None and not attached:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+    return list(rows.values())[:limit]
+
+
+def _search_ebay_listings(query: str, search_url: str = "", limit: int = 10, browser_worker_mode: str = "local") -> List[SearchResult]:
+    target = str(search_url or "").strip()
+    if not target:
+        q = urllib.parse.quote_plus(str(query or "").strip())
+        target = f"https://www.ebay.com/sch/i.html?_nkw={q}&_sop=12"
+    text_rows: List[SearchResult] = []
+    try:
+        html_text = _fetch_text(target)
+        if "pardon our interruption" not in html_text.lower():
+            text_rows = _parse_ebay_listing_blocks(html_text=html_text, limit=limit)
+    except Exception:
+        text_rows = []
+    if text_rows:
+        return text_rows
+    return _search_ebay_listings_playwright(
+        search_url=target,
+        limit=limit,
+        browser_worker_mode=browser_worker_mode,
+    )
 
 
 def _safe_search_web(query: str, limit: int = 10) -> List[SearchResult]:
@@ -961,6 +1405,8 @@ def execute_instruction(
     min_live_non_curated_citations: Optional[int] = None,
     manual_auth_phase: bool = False,
     auth_session_id: Optional[str] = None,
+    browser_worker_mode: str = "local",
+    human_like_interaction: bool = True,
     artifact_reuse_mode: str = "reuse_if_recent",
     artifact_reuse_max_age_hours: int = 72,
     progress_cb: Optional[Callable[[int, str], None]] = None,
@@ -1069,6 +1515,8 @@ def execute_instruction(
             min_live_non_curated_citations=min_live_non_curated_citations,
             manual_auth_phase=manual_auth_phase,
             auth_session_id=auth_session_id,
+            browser_worker_mode=browser_worker_mode,
+            human_like_interaction=bool(human_like_interaction),
         )
         ex_summary = execution.get("summary", {}) if isinstance(execution.get("summary"), dict) else {}
         ex_summary = _apply_freshness_metadata(ex_summary, freshness_mode, freshness_hours)
@@ -1137,7 +1585,13 @@ def execute_instruction(
                     ],
                 },
             }
-        run = execute_plan(plan, start_index=0, step_mode=step_mode, allow_input_fallback=True)
+        run = execute_plan(
+            plan,
+            start_index=0,
+            step_mode=step_mode,
+            allow_input_fallback=True,
+            human_like_interaction=bool(human_like_interaction),
+        )
         _emit_progress(progress_cb, 95, "Finalizing desktop run output")
         store = LocalVectorStore()
         app_name = plan.get("app_name", "") or "desktop"
@@ -1169,6 +1623,7 @@ def execute_instruction(
         }
         response_summary = {
             "executed_steps": len(run.trace),
+            "human_like_interaction": bool(human_like_interaction),
             "elegance_budget": elegance.snapshot(),
         }
         response["summary"] = _apply_freshness_metadata(response_summary, freshness_mode, freshness_hours)
@@ -1267,43 +1722,144 @@ def execute_instruction(
     query = normalized
     _emit_progress(progress_cb, 20, "Running web search")
     results: List[SearchResult] = []
+    ebay_intent = "ebay" in normalized.lower()
     if "amazon" in normalized.lower():
         cleaned = re.sub(r"^.*?search\s+amazon\s+for\s+", "", normalized, flags=re.IGNORECASE)
         query = cleaned if cleaned and cleaned != normalized else normalized
         results.extend(_search_amazon_playwright(query, limit=8))
         if len(results) < 3:
             results.extend(_search_web(f"site:amazon.com {query}", limit=8))
+    elif ebay_intent:
+        query = _clean_ebay_query(normalized)
+        results.extend(_search_web(f"site:ebay.com/itm {query}", limit=10))
+        if len(results) < 4:
+            results.extend(_search_web(f"site:ebay.com {query}", limit=10))
+        results = [
+            row
+            for row in results
+            if "ebay." in urllib.parse.urlparse(str(row.url or "")).netloc.lower()
+        ]
+        if not results:
+            fallback_url = f"https://www.ebay.com/sch/i.html?_nkw={urllib.parse.quote_plus(query)}&_sop=12"
+            results.append(
+                SearchResult(
+                    title=f"eBay search results for {query}",
+                    url=fallback_url,
+                    price=None,
+                    source="ebay_search",
+                    snippet="Marketplace search landing page.",
+                )
+            )
     else:
         results.extend(_search_web(query, limit=8))
+
+    price_recommendation_intent = _is_price_recommendation_intent(normalized)
+    if ebay_intent:
+        _emit_progress(progress_cb, 56, "Analyzing eBay listings")
+        inline_url = _extract_inline_url(normalized)
+        ebay_search_url = ""
+        if "ebay.com" in inline_url.lower():
+            ebay_search_url = inline_url
+        else:
+            for row in results:
+                if "ebay.com" in row.url.lower():
+                    ebay_search_url = row.url
+                    break
+        ebay_query = _clean_ebay_query(normalized)
+        try:
+            ebay_rows = _search_ebay_listings(
+                query=ebay_query,
+                search_url=ebay_search_url,
+                limit=12,
+                browser_worker_mode=browser_worker_mode,
+            )
+        except Exception:
+            ebay_rows = []
+        if ebay_rows:
+            results.extend(ebay_rows)
 
     dedup: Dict[str, SearchResult] = {}
     for result in results:
         dedup[result.url] = result
     ranked = list(dedup.values())
+    if price_recommendation_intent:
+        ranked.sort(
+            key=lambda r: (
+                0 if "ebay." in urllib.parse.urlparse(r.url).netloc.lower() else 1,
+                r.price is None,
+                r.price if r.price is not None else 999999.0,
+            )
+        )
     best = _best_price(ranked)
 
     opened_url = ""
     nav = {"url": "", "reused": False, "opened": False, "decision": {"score": 0.0, "reasons": ["no_result"], "elegance_cost": 0}}
     if best:
+        _emit_progress(progress_cb, 84, "Selecting best option")
         nav = _resolve_navigation_target(
             target_url=best.url,
             recent_actions=[f"open_tab:{best.url}"],
         )
         opened_url = str(nav.get("url", "") or best.url)
         plan_steps[1]["target"] = {"url": opened_url}
+    recommendation: Dict[str, Any] = {}
+    shopping_artifacts: Dict[str, str] = {}
+    priced_candidates = len([row for row in ranked if row.price is not None])
+    candidate_rows: List[Dict[str, Any]] = []
+    if best and price_recommendation_intent:
+        _emit_progress(progress_cb, 92, "Compiling decision matrix")
+        candidate_rows = _build_shopping_candidates(ranked, max_items=10, signal_pages=4)
+        picked = _pick_recommended_candidate(candidate_rows)
+        selected_host = urllib.parse.urlparse(str(picked.get("url", best.url))).netloc.lower()
+        recommendation = {
+            "selected_title": picked.get("title", best.title),
+            "selected_url": picked.get("url", best.url),
+            "selected_price": picked.get("price", best.price),
+            "selected_rating": picked.get("rating"),
+            "selected_review_count": picked.get("review_count"),
+            "selected_condition": picked.get("condition"),
+            "reason": (
+                f"Lowest detected listing price among {priced_candidates} priced candidate(s)."
+                if priced_candidates
+                else ("No machine-readable price found; selected the top marketplace listing." if "ebay." in selected_host else "Best available match from discovered candidates.")
+            ),
+        }
+        if recommendation.get("selected_url"):
+            plan_steps[1]["target"] = {"url": str(recommendation.get("selected_url"))}
+            opened_url = str(recommendation.get("selected_url"))
+        try:
+            shopping_artifacts = _write_shopping_decision_artifacts(
+                instruction=instruction,
+                query=query,
+                candidates=candidate_rows,
+                recommendation={
+                    "title": recommendation.get("selected_title"),
+                    "url": recommendation.get("selected_url"),
+                    "price": recommendation.get("selected_price"),
+                    "rating": recommendation.get("selected_rating"),
+                    "review_count": recommendation.get("selected_review_count"),
+                    "condition": recommendation.get("selected_condition"),
+                },
+            )
+        except Exception:
+            shopping_artifacts = {}
     needs_credentials = _likely_requires_login(normalized, opened_url, best.title if best else "")
 
     response = {
         "ok": True,
+        "mode": "web_search",
         "instruction": instruction,
         "ai": ai_meta,
         "query": query,
         "opened_url": opened_url,
         "best_result": asdict(best) if best else None,
+        "recommendation": recommendation,
+        "results_count": len(ranked),
         "results": [asdict(item) for item in ranked[:10]],
+        "artifacts": shopping_artifacts,
         "canvas": {
-            "title": "Search Summary",
-            "subtitle": query,
+            "title": "Best Price Recommendation" if recommendation else "Search Summary",
+            "subtitle": (f"{recommendation.get('selected_price'):.2f} selected" if isinstance(recommendation.get("selected_price"), (int, float)) else query),
             "cards": [
                 {
                     "title": item.title[:100],
@@ -1319,6 +1875,8 @@ def execute_instruction(
         "summary": _apply_freshness_metadata({
             "navigation_reused_existing_target": bool(nav.get("reused", False)),
             "navigation_opened_new_target": bool(nav.get("opened", False)),
+            "marketplace_priced_candidates": priced_candidates,
+            "marketplace_candidate_count": len(candidate_rows),
             "action_critic": nav.get("decision", {}),
         }, freshness_mode, freshness_hours),
     }
@@ -1578,6 +2136,8 @@ def _execute_native_plan(
     min_live_non_curated_citations: Optional[int] = None,
     manual_auth_phase: bool = False,
     auth_session_id: Optional[str] = None,
+    browser_worker_mode: str = "local",
+    human_like_interaction: bool = False,
 ) -> Dict[str, Any]:
     validation = plan.get("playbook_validation", {}) if isinstance(plan, dict) else {}
     if isinstance(validation, dict) and validation and not bool(validation.get("ok", True)):
@@ -1632,6 +2192,8 @@ def _execute_native_plan(
         min_live_non_curated_citations=min_live_non_curated_citations,
         manual_auth_phase=manual_auth_phase,
         auth_session_id=auth_session_id,
+        browser_worker_mode=browser_worker_mode,
+        human_like_interaction=bool(human_like_interaction),
     )
     obligations = plan.get("playbook_step_obligations", []) if isinstance(plan, dict) else []
     if obligations and isinstance(obligations, list) and bool(out.get("ok", False)):
@@ -1679,6 +2241,8 @@ def _run_reflective_planner(
     min_live_non_curated_citations: Optional[int] = None,
     manual_auth_phase: bool = False,
     auth_session_id: Optional[str] = None,
+    browser_worker_mode: str = "local",
+    human_like_interaction: bool = False,
 ) -> Dict[str, Any]:
     min_live = _effective_min_live_non_curated_citations(min_live_non_curated_citations)
     objective = str(plan.get("objective", instruction))
@@ -1716,6 +2280,8 @@ def _run_reflective_planner(
             min_live_non_curated_citations=min_live,
             manual_auth_phase=manual_auth_phase,
             auth_session_id=auth_session_id,
+            browser_worker_mode=browser_worker_mode,
+            human_like_interaction=bool(human_like_interaction),
         )
         if bool(result.get("paused_for_credentials", False)) or str(result.get("error_code", "")) in {"credential_missing", "permission_denied"}:
             decision_log.append(f"Attempt {attempt} blocked: {result.get('error_code') or 'paused_for_credentials'}")
@@ -1915,6 +2481,8 @@ def _run_strategy(
     min_live_non_curated_citations: Optional[int] = None,
     manual_auth_phase: bool = False,
     auth_session_id: Optional[str] = None,
+    browser_worker_mode: str = "local",
+    human_like_interaction: bool = False,
 ) -> Dict[str, Any]:
     if strategy == "email_triage":
         return _run_email_triage(
@@ -1922,6 +2490,8 @@ def _run_strategy(
             progress_cb=progress_cb,
             manual_auth_phase=manual_auth_phase,
             auth_session_id=auth_session_id,
+            browser_worker_mode=browser_worker_mode,
+            human_like_interaction=bool(human_like_interaction),
         )
     if strategy == "study_pack":
         return _run_study_pack(instruction, progress_cb=progress_cb)
@@ -1972,6 +2542,7 @@ def _score_result_against_objective(
     wants_jobs = any(t in low_obj for t in ["job", "position", "salary", "linkedin", "indeed"])
     wants_competitor = any(t in low_obj for t in ["competitor", "competition", "executive summary", "powerpoint", "ppt"])
     wants_email_triage = any(t in low_obj for t in ["inbox", "gmail", "draft replies", "draft reply", "task list"]) and "last" in low_obj
+    wants_shopping_decision = any(t in low_obj for t in ["best price", "cheapest", "recommend", "which one to buy", "what should i buy", "buy"])
     if wants_study:
         if "flashcards_csv" not in artifacts or not any(k in artifacts for k in ["quiz_md", "quiz_html"]):
             score -= 0.5
@@ -2001,6 +2572,11 @@ def _score_result_against_objective(
             score -= 0.45
         if result.get("mode") != "email_triage":
             score -= 0.4
+    if wants_shopping_decision:
+        if "decision_matrix_csv" not in artifacts and "results_csv" not in artifacts:
+            score -= 0.35
+        if result.get("mode") not in {"web_search", "generic_research"}:
+            score -= 0.2
 
     return max(0.0, min(1.0, score))
 
@@ -2010,12 +2586,16 @@ def _run_email_triage(
     progress_cb: Optional[Callable[[int, str], None]] = None,
     manual_auth_phase: bool = False,
     auth_session_id: Optional[str] = None,
+    browser_worker_mode: str = "local",
+    human_like_interaction: bool = False,
 ) -> Dict[str, Any]:
     return _run_email_triage_active_browser(
         instruction=instruction,
         progress_cb=progress_cb,
         manual_auth_phase=manual_auth_phase,
         auth_session_id=auth_session_id,
+        browser_worker_mode=browser_worker_mode,
+        human_like_interaction=bool(human_like_interaction),
     )
 
 
@@ -2024,15 +2604,52 @@ def _run_email_triage_active_browser(
     progress_cb: Optional[Callable[[int, str], None]] = None,
     manual_auth_phase: bool = False,
     auth_session_id: Optional[str] = None,
+    browser_worker_mode: str = "local",
+    human_like_interaction: bool = False,
 ) -> Dict[str, Any]:
+    worker_mode = normalize_browser_worker_mode(browser_worker_mode)
+    worker_info: Dict[str, Any] = {"ok": True, "mode": worker_mode, "debug_port": 9222}
+    if worker_mode == "docker":
+        _emit_progress(progress_cb, 10, "Starting Docker browser worker")
+        worker_info = ensure_browser_worker(mode="docker")
+        if not bool(worker_info.get("ok", False)):
+            return {
+                "ok": False,
+                "mode": "email_triage",
+                "query": "newer_than:2d in:inbox",
+                "results_count": 0,
+                "results": [],
+                "artifacts": {},
+                "summary": {
+                    "error": "browser_worker_unavailable",
+                    "detail": str(worker_info.get("detail", "")),
+                    "browser_worker_mode": worker_mode,
+                },
+                "source_status": {"browser_worker": "docker_unavailable"},
+                "opened_url": "",
+                "paused_for_credentials": False,
+                "pause_reason": "",
+                "error": "browser_worker_unavailable",
+                "error_code": "browser_worker_unavailable",
+                "auth_session_id": "",
+                "trace": [],
+                "canvas": {
+                    "title": "Docker Browser Worker Unavailable",
+                    "subtitle": "Docker could not start a browser worker. Switch to local mode or fix Docker.",
+                    "cards": [],
+                },
+            }
     profile_dir = Path("data/interface/browser_profile")
+    if worker_mode == "docker":
+        profile_dir = Path("data/interface/browser_profile_docker")
     profile_dir.mkdir(parents=True, exist_ok=True)
     sessions = SessionManager()
     account = _extract_inbox_account(instruction)
     trace: List[Dict[str, Any]] = []
+    debug_port = int(worker_info.get("debug_port", 9222) or 9222)
 
-    # Manual-auth phase is explicit: open Gmail in controlled session and pause.
-    if manual_auth_phase:
+    # Manual-auth phase is explicit for local mode only.
+    if manual_auth_phase and worker_mode != "docker":
         action_decision = ActionCritic().evaluate(
             next_action="open_tab",
             target="https://mail.google.com/",
@@ -2073,7 +2690,12 @@ def _run_email_triage_active_browser(
                 },
             }
         _emit_progress(progress_cb, 12, "Opening Gmail auth target")
-        started = _start_email_auth_session(profile_dir=profile_dir)
+        started = _start_email_auth_session(
+            profile_dir=profile_dir,
+            browser_worker_mode=worker_mode,
+            debug_port=debug_port,
+            auto_open_auth_tab=True,
+        )
         if not started.get("ok"):
             return {
                 "ok": False,
@@ -2127,14 +2749,75 @@ def _run_email_triage_active_browser(
                 "cards": [],
             },
         }
+    if manual_auth_phase and worker_mode == "docker":
+        _emit_progress(progress_cb, 12, "Docker mode enabled; continuing without manual auth pause")
 
     sid = str(auth_session_id or "").strip()
     session: Dict[str, Any] = _EMAIL_AUTH_SESSIONS.get(sid, {})
     if not session:
         sid, session = _select_latest_auth_session(preferred_sid=sid)
     if not session:
+        if worker_mode == "docker":
+            started = _start_email_auth_session(
+                profile_dir=profile_dir,
+                browser_worker_mode=worker_mode,
+                debug_port=debug_port,
+                auto_open_auth_tab=False,
+            )
+            if not started.get("ok"):
+                return {
+                    "ok": False,
+                    "mode": "email_triage",
+                    "query": "newer_than:2d in:inbox",
+                    "results_count": 0,
+                    "results": [],
+                    "artifacts": {},
+                    "summary": {
+                        "error": "browser_worker_session_failed",
+                        "detail": str(started.get("error", "")),
+                        "browser_worker_mode": worker_mode,
+                    },
+                    "source_status": {"gmail_ui": "docker_session_failed", "browser_worker": "docker"},
+                    "opened_url": "",
+                    "paused_for_credentials": False,
+                    "pause_reason": "",
+                    "error": "browser_worker_session_failed",
+                    "error_code": "browser_worker_session_failed",
+                    "auth_session_id": "",
+                    "trace": trace,
+                    "canvas": {
+                        "title": "Docker Worker Session Failed",
+                        "subtitle": "Could not initialize docker browser session.",
+                        "cards": [],
+                    },
+                }
+            sid = str(started.get("auth_session_id", ""))
+            session = _EMAIL_AUTH_SESSIONS.get(sid, {})
+            if not session:
+                return {
+                    "ok": False,
+                    "mode": "email_triage",
+                    "query": "newer_than:2d in:inbox",
+                    "results_count": 0,
+                    "results": [],
+                    "artifacts": {},
+                    "summary": {"error": "browser_worker_session_missing", "browser_worker_mode": worker_mode},
+                    "source_status": {"gmail_ui": "docker_session_missing", "browser_worker": "docker"},
+                    "opened_url": "",
+                    "paused_for_credentials": False,
+                    "pause_reason": "",
+                    "error": "browser_worker_session_missing",
+                    "error_code": "browser_worker_session_missing",
+                    "auth_session_id": sid,
+                    "trace": trace,
+                    "canvas": {
+                        "title": "Docker Worker Session Missing",
+                        "subtitle": "Retry after worker startup completes.",
+                        "cards": [],
+                    },
+                }
         retry_decision = sessions.auth_retry_decision(domain="mail.google.com", max_failed_attempts=2)
-        if not retry_decision.allow_retry and not retry_decision.reusable_authenticated_tab:
+        if worker_mode != "docker" and (not retry_decision.allow_retry and not retry_decision.reusable_authenticated_tab):
             return {
                 "ok": False,
                 "mode": "email_triage",
@@ -2157,40 +2840,55 @@ def _run_email_triage_active_browser(
                     "cards": [],
                 },
             }
-        started = _start_email_auth_session(profile_dir=profile_dir)
+        if worker_mode != "docker":
+            started = _start_email_auth_session(
+                profile_dir=profile_dir,
+                browser_worker_mode=worker_mode,
+                debug_port=debug_port,
+                auto_open_auth_tab=True,
+            )
+        else:
+            started = {"ok": True, "auth_session_id": sid}
         nsid = str(started.get("auth_session_id", ""))
-        focused = focus_auth_session(nsid, fallback_url="https://mail.google.com/", allow_reopen=False)
-        opened = str(focused.get("opened_url", "https://mail.google.com/"))
-        sessions.remember_tab(url=opened, title="Gmail Auth Target", authenticated=False)
-        sessions.record_auth_attempt(domain="mail.google.com", status="blocked", detail="session_missing")
-        return {
-            "ok": False,
-            "mode": "email_triage",
-            "query": "newer_than:2d in:inbox",
-            "results_count": 0,
-            "results": [],
-            "artifacts": {},
-            "summary": {"error": "credential_missing", "account": account},
-            "source_status": {"gmail_ui": "manual_auth_phase"},
-            "opened_url": opened,
-            "paused_for_credentials": True,
-            "pause_reason": "Gmail auth session required. Sign in in the opened tab, then click Resume.",
-            "error": "credential_missing",
-            "error_code": "credential_missing",
-            "auth_session_id": nsid,
-            "trace": [{"step": 0, "action": "open_auth_tab", "ok": True, "opened_url": opened}],
-            "canvas": {
-                "title": "Paused For Login",
-                "subtitle": "Sign in to Gmail, then click Resume.",
-                "cards": [],
-            },
-        }
+        if worker_mode != "docker":
+            focused = focus_auth_session(nsid, fallback_url="https://mail.google.com/", allow_reopen=False)
+            opened = str(focused.get("opened_url", "https://mail.google.com/"))
+            sessions.remember_tab(url=opened, title="Gmail Auth Target", authenticated=False)
+            sessions.record_auth_attempt(domain="mail.google.com", status="blocked", detail="session_missing")
+            return {
+                "ok": False,
+                "mode": "email_triage",
+                "query": "newer_than:2d in:inbox",
+                "results_count": 0,
+                "results": [],
+                "artifacts": {},
+                "summary": {"error": "credential_missing", "account": account},
+                "source_status": {"gmail_ui": "manual_auth_phase"},
+                "opened_url": opened,
+                "paused_for_credentials": True,
+                "pause_reason": "Gmail auth session required. Sign in in the opened tab, then click Resume.",
+                "error": "credential_missing",
+                "error_code": "credential_missing",
+                "auth_session_id": nsid,
+                "trace": [{"step": 0, "action": "open_auth_tab", "ok": True, "opened_url": opened}],
+                "canvas": {
+                    "title": "Paused For Login",
+                    "subtitle": "Sign in to Gmail, then click Resume.",
+                    "cards": [],
+                },
+            }
+        sid = nsid
+        session = _EMAIL_AUTH_SESSIONS.get(nsid, session)
 
     session["auth_confirmed"] = True
-    focused = focus_auth_session(sid, fallback_url="https://mail.google.com/", allow_reopen=False)
-    opened = str(focused.get("opened_url", "https://mail.google.com/"))
-    sessions.remember_tab(url=opened, title="Gmail Resume Target", authenticated=False)
-    trace.append({"step": 0, "action": "focus_auth_tab", "ok": bool(focused.get("ok", False)), "opened_url": opened})
+    if worker_mode == "docker":
+        opened = "https://mail.google.com/"
+        trace.append({"step": 0, "action": "docker_worker_session_reuse", "ok": True, "opened_url": opened})
+    else:
+        focused = focus_auth_session(sid, fallback_url="https://mail.google.com/", allow_reopen=False)
+        opened = str(focused.get("opened_url", "https://mail.google.com/"))
+        sessions.remember_tab(url=opened, title="Gmail Resume Target", authenticated=False)
+        trace.append({"step": 0, "action": "focus_auth_tab", "ok": bool(focused.get("ok", False)), "opened_url": opened})
 
     _emit_progress(progress_cb, 24, "Opening automation browser context")
     page = session.get("page")
@@ -2207,8 +2905,32 @@ def _run_email_triage_active_browser(
                 playwright=playwright,
                 profile_dir=profile_dir,
                 session=session,
+                allow_automated_fallback=(worker_mode == "docker"),
             )
             if context is None:
+                if worker_mode == "docker":
+                    return {
+                        "ok": False,
+                        "mode": "email_triage",
+                        "query": "newer_than:2d in:inbox",
+                        "results_count": 0,
+                        "results": [],
+                        "artifacts": {},
+                        "summary": {"error": "docker_worker_attach_failed", "account": account, "browser_worker_mode": worker_mode},
+                        "source_status": {"gmail_ui": "docker_attach_failed", "browser_worker": "docker"},
+                        "opened_url": "",
+                        "paused_for_credentials": False,
+                        "pause_reason": "",
+                        "error": "docker_worker_attach_failed",
+                        "error_code": "docker_worker_attach_failed",
+                        "auth_session_id": sid,
+                        "trace": trace,
+                        "canvas": {
+                            "title": "Docker Worker Attach Failed",
+                            "subtitle": "Could not attach to docker browser context.",
+                            "cards": [],
+                        },
+                    }
                 return {
                     "ok": False,
                     "mode": "email_triage",
@@ -2266,6 +2988,34 @@ def _run_email_triage_active_browser(
                 sessions.record_auth_attempt(domain="mail.google.com", status="failed", detail=str(login_attempt.get("error", "")))
                 ready = "login"
         if ready == "login":
+            if worker_mode == "docker":
+                return {
+                    "ok": False,
+                    "mode": "email_triage",
+                    "query": "newer_than:2d in:inbox",
+                    "results_count": 0,
+                    "results": [],
+                    "artifacts": {},
+                    "summary": {
+                        "error": "docker_worker_auth_required",
+                        "account": account,
+                        "browser_worker_mode": worker_mode,
+                        "detail": "Vault-based sign-in could not complete in docker worker.",
+                    },
+                    "source_status": {"gmail_ui": "docker_auth_required", "browser_worker": "docker"},
+                    "opened_url": "",
+                    "paused_for_credentials": False,
+                    "pause_reason": "",
+                    "error": "docker_worker_auth_required",
+                    "error_code": "docker_worker_auth_required",
+                    "auth_session_id": sid,
+                    "trace": trace,
+                    "canvas": {
+                        "title": "Docker Worker Needs Interactive Auth",
+                        "subtitle": "Switch browser worker mode to local for interactive Gmail sign-in.",
+                        "cards": [],
+                    },
+                }
             decision = sessions.auth_retry_decision(domain="mail.google.com", max_failed_attempts=2)
             sessions.remember_tab(url=opened, title="Gmail Login Required", authenticated=False)
             return {
@@ -2326,12 +3076,63 @@ def _run_email_triage_active_browser(
             if "workspace.google.com/intl" in current_url.lower():
                 sessions.record_auth_attempt(domain="mail.google.com", status="blocked", detail="workspace_redirect")
                 trace.append({"step": 0, "action": "browser_blocked_google_workspace", "ok": False, "url": current_url[:180]})
+                if worker_mode == "docker":
+                    return {
+                        "ok": False,
+                        "mode": "email_triage",
+                        "query": "newer_than:2d in:inbox",
+                        "results_count": 0,
+                        "results": [],
+                        "artifacts": {},
+                        "summary": {"error": "docker_workspace_redirect", "browser_worker_mode": worker_mode},
+                        "source_status": {"gmail_ui": "docker_workspace_redirect", "browser_worker": "docker"},
+                        "opened_url": "",
+                        "paused_for_credentials": False,
+                        "pause_reason": "",
+                        "error": "docker_workspace_redirect",
+                        "error_code": "docker_workspace_redirect",
+                        "auth_session_id": sid,
+                        "trace": trace,
+                        "canvas": {
+                            "title": "Docker Worker Blocked By Workspace Redirect",
+                            "subtitle": "Switch to local worker mode or update account permissions.",
+                            "cards": [],
+                        },
+                    }
                 return _run_email_triage_imap_fallback(
                     instruction=instruction,
                     account=account,
                     progress_cb=progress_cb,
                     trace=trace,
                 )
+            if worker_mode == "docker":
+                return {
+                    "ok": False,
+                    "mode": "email_triage",
+                    "query": "newer_than:2d in:inbox",
+                    "results_count": 0,
+                    "results": [],
+                    "artifacts": {},
+                    "summary": {
+                        "error": "docker_worker_inbox_not_ready",
+                        "account": account,
+                        "detail": f"state={ready}",
+                        "browser_worker_mode": worker_mode,
+                    },
+                    "source_status": {"gmail_ui": f"docker_not_ready:{ready}", "browser_worker": "docker"},
+                    "opened_url": "",
+                    "paused_for_credentials": False,
+                    "pause_reason": "",
+                    "error": "docker_worker_inbox_not_ready",
+                    "error_code": "docker_worker_inbox_not_ready",
+                    "auth_session_id": sid,
+                    "trace": trace,
+                    "canvas": {
+                        "title": "Docker Worker Could Not Reach Gmail Inbox",
+                        "subtitle": "Switch to local browser worker mode for interactive auth.",
+                        "cards": [],
+                    },
+                }
             return {
                 "ok": False,
                 "mode": "email_triage",
@@ -2365,12 +3166,16 @@ def _run_email_triage_active_browser(
         rows = _gmail_collect_rows(page, max_rows=20, scroll_passes=4)
         max_rows = min(len(rows), 20)
         for idx in range(max_rows):
-            item = _gmail_process_message(page, idx)
+            item = _gmail_process_message(page, idx, human_like_interaction=bool(human_like_interaction))
             if item is None:
                 _gmail_back_to_inbox(page)
                 continue
             if item.requires_action:
-                item.draft_created = _gmail_create_draft_reply(page, item)
+                item.draft_created = _gmail_create_draft_reply(
+                    page,
+                    item,
+                    human_like_interaction=bool(human_like_interaction),
+                )
             items.append(item)
             _gmail_back_to_inbox(page)
             trace.append(
@@ -2386,6 +3191,33 @@ def _run_email_triage_active_browser(
             )
     except Exception as exc:  # pylint: disable=broad-exception-caught
         trace.append({"step": 0, "action": "browser_triage_exception", "ok": False, "error": str(exc)})
+        if worker_mode == "docker":
+            return {
+                "ok": False,
+                "mode": "email_triage",
+                "query": "newer_than:2d in:inbox",
+                "results_count": 0,
+                "results": [],
+                "artifacts": {},
+                "summary": {
+                    "error": "docker_worker_exception",
+                    "detail": str(exc),
+                    "browser_worker_mode": worker_mode,
+                },
+                "source_status": {"gmail_ui": "docker_exception", "browser_worker": "docker"},
+                "opened_url": "",
+                "paused_for_credentials": False,
+                "pause_reason": "",
+                "error": "docker_worker_exception",
+                "error_code": "docker_worker_exception",
+                "auth_session_id": sid,
+                "trace": trace,
+                "canvas": {
+                    "title": "Docker Worker Browser Exception",
+                    "subtitle": "Switch to local mode for interactive troubleshooting.",
+                    "cards": [],
+                },
+            }
         return _run_email_triage_imap_fallback(
             instruction=instruction,
             account=account,
@@ -2430,9 +3262,12 @@ def _run_email_triage_active_browser(
             "drafts_created": sum(1 for x in action_items if x.draft_created),
             "active_browser_mode": False,
             "auth_session_reused": True,
+            "browser_worker_mode": worker_mode,
+            "browser_worker_status": str(worker_info.get("status", worker_mode)),
+            "human_like_interaction": bool(human_like_interaction),
             "session_manager": sessions.snapshot(),
         },
-        "source_status": {"gmail_ui": "ok"},
+        "source_status": {"gmail_ui": "ok", "browser_worker": worker_mode},
         "opened_url": opened_url,
         "paused_for_credentials": False,
         "pause_reason": "",
@@ -2461,26 +3296,49 @@ def _extract_inbox_account(instruction: str) -> str:
     return "inbox"
 
 
-def _start_email_auth_session(profile_dir: Path) -> Dict[str, Any]:
+def _start_email_auth_session(
+    profile_dir: Path,
+    *,
+    browser_worker_mode: str = "local",
+    debug_port: int = 9222,
+    auto_open_auth_tab: bool = True,
+) -> Dict[str, Any]:
     sid = uuid.uuid4().hex
-    url = "https://mail.google.com/"
-    opened = _open_auth_browser(profile_dir=profile_dir, url=url, debug_port=9222)
-    if not opened.get("ok"):
-        try:
-            webbrowser.open(url, new=2)
-            opened = {"ok": True, "method": "default_browser", "url": url, "profile_dir": str(profile_dir.resolve()), "debug_port": 9222}
-        except Exception as exc:  # pylint: disable=broad-exception-caught
-            return {"ok": False, "error": str(exc)}
+    url = _normalize_gmail_auth_url("https://mail.google.com/")
+    worker_mode = normalize_browser_worker_mode(browser_worker_mode)
+    target_debug_port = int(debug_port or 9222)
+    opened = {
+        "ok": True,
+        "method": "session_only",
+        "url": url,
+        "profile_dir": str(profile_dir.resolve()),
+        "debug_port": target_debug_port,
+    }
+    if auto_open_auth_tab and worker_mode != "docker":
+        opened = _open_auth_browser(profile_dir=profile_dir, url=url, debug_port=target_debug_port)
+        if not opened.get("ok"):
+            try:
+                webbrowser.open(url, new=2)
+                opened = {
+                    "ok": True,
+                    "method": "default_browser",
+                    "url": url,
+                    "profile_dir": str(profile_dir.resolve()),
+                    "debug_port": target_debug_port,
+                }
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                return {"ok": False, "error": str(exc)}
     try:
         _EMAIL_AUTH_SESSIONS[sid] = {
-            "mode": "manual_auth_tab",
+            "mode": "manual_auth_tab" if worker_mode == "local" else "worker_auth_session",
+            "browser_worker_mode": worker_mode,
             "url": url,
             "profile_dir": str(profile_dir.resolve()),
             "created_ts": time.time(),
             "auth_confirmed": False,
-            "opened_once": True,
+            "opened_once": bool(auto_open_auth_tab and worker_mode != "docker"),
             "open_method": str(opened.get("method", "")),
-            "debug_port": int(opened.get("debug_port", 9222) or 9222),
+            "debug_port": int(opened.get("debug_port", target_debug_port) or target_debug_port),
         }
         return {"ok": True, "auth_session_id": sid}
     except Exception as exc:  # pylint: disable=broad-exception-caught
@@ -2493,14 +3351,18 @@ def focus_auth_session(
     allow_reopen: bool = False,
 ) -> Dict[str, Any]:
     sid = str(auth_session_id or "").strip()
+    safe_fallback = _normalize_gmail_auth_url(fallback_url)
+    if not sid:
+        sid, _sess = _select_latest_auth_session(preferred_sid="")
     sess = _EMAIL_AUTH_SESSIONS.get(sid, {}) if sid else {}
     if not sess:
         try:
-            webbrowser.open(fallback_url, new=2)
+            webbrowser.open(safe_fallback, new=2)
         except Exception:
             pass
-        return {"ok": False, "error": "auth_session_not_found", "opened_url": fallback_url}
-    target = str(sess.get("url", fallback_url) or fallback_url)
+        return {"ok": False, "error": "auth_session_not_found", "opened_url": safe_fallback}
+    target = _normalize_gmail_auth_url(str(sess.get("url", safe_fallback) or safe_fallback), default=safe_fallback)
+    sess["url"] = target
     if sess.get("opened_once", False) and not allow_reopen:
         return {"ok": True, "auth_session_id": sid, "opened_url": target, "already_open": True}
     try:
@@ -2682,7 +3544,12 @@ def _select_latest_auth_session(preferred_sid: str = "") -> tuple[str, Dict[str,
     return str(best_sid), dict(best or {})
 
 
-def _attach_or_launch_auth_context(playwright: Any, profile_dir: Path, session: Dict[str, Any]) -> Any:
+def _attach_or_launch_auth_context(
+    playwright: Any,
+    profile_dir: Path,
+    session: Dict[str, Any],
+    allow_automated_fallback: bool = False,
+) -> Any:
     debug_port = int(session.get("debug_port", 9222) or 9222)
     try:
         browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{debug_port}", timeout=3500)
@@ -2692,6 +3559,8 @@ def _attach_or_launch_auth_context(playwright: Any, profile_dir: Path, session: 
         return browser.new_context()
     except Exception:
         pass
+    if not allow_automated_fallback:
+        return None
     try:
         return _launch_persistent_chrome_with_retry(playwright, profile_dir=profile_dir)
     except Exception:
@@ -2820,8 +3689,11 @@ def _gmail_filter_last_48h(page: Any) -> None:
 def _gmail_collect_rows(page: Any, max_rows: int = 20, scroll_passes: int = 4) -> List[Any]:
     rows: List[Any] = []
     for _ in range(max(1, scroll_passes)):
-        locator = page.locator("tr.zA")
+        locator = page.locator("tr.zA:visible")
         count = locator.count()
+        if count <= 0:
+            locator = page.locator("tr.zA")
+            count = locator.count()
         for i in range(min(count, max_rows)):
             rows.append(locator.nth(i))
             if len(rows) >= max_rows:
@@ -2831,12 +3703,38 @@ def _gmail_collect_rows(page: Any, max_rows: int = 20, scroll_passes: int = 4) -
     return rows[:max_rows]
 
 
-def _gmail_process_message(page: Any, row_index: int) -> Optional[EmailActionItem]:
-    rows = page.locator("tr.zA")
+def _gmail_process_message(
+    page: Any,
+    row_index: int,
+    human_like_interaction: bool = False,
+) -> Optional[EmailActionItem]:
+    rows = page.locator("tr.zA:visible")
+    if rows.count() <= 0:
+        rows = page.locator("tr.zA")
     if row_index >= rows.count():
         return None
     row = rows.nth(row_index)
-    row.click(timeout=12000)
+    try:
+        row.scroll_into_view_if_needed(timeout=2000)
+    except Exception:
+        pass
+    if human_like_interaction:
+        try:
+            box = row.bounding_box()
+            if box:
+                tx = float(box.get("x", 0.0)) + (float(box.get("width", 0.0)) / 2.0) + random.uniform(-12.0, 12.0)
+                ty = float(box.get("y", 0.0)) + (float(box.get("height", 0.0)) / 2.0) + random.uniform(-6.0, 6.0)
+                page.mouse.move(tx, ty, steps=random.randint(10, 22))
+                page.wait_for_timeout(random.randint(70, 180))
+        except Exception:
+            pass
+    try:
+        row.click(timeout=12000)
+    except Exception:
+        try:
+            row.click(timeout=5000, force=True)
+        except Exception:
+            return None
     page.wait_for_timeout(700)
     sender = ""
     subject = ""
@@ -2896,14 +3794,20 @@ def _classify_requires_action(subject: str, snippet: str) -> tuple[bool, str]:
     return False, "no_action_keyword"
 
 
-def _gmail_create_draft_reply(page: Any, item: EmailActionItem) -> bool:
+def _gmail_create_draft_reply(page: Any, item: EmailActionItem, human_like_interaction: bool = False) -> bool:
     try:
         reply = page.locator("div[aria-label='Reply'], [data-tooltip='Reply']").first
+        if human_like_interaction:
+            page.wait_for_timeout(random.randint(80, 210))
         reply.click(timeout=7000)
         page.wait_for_timeout(500)
         body = page.locator("div[aria-label='Message Body'][role='textbox'], div[role='textbox'][aria-label='Message Body']").last
         body.click(timeout=5000)
-        body.fill(_build_draft_text(item))
+        text = _build_draft_text(item)
+        if human_like_interaction:
+            body.type(text, delay=random.randint(18, 52))
+        else:
+            body.fill(text)
         page.wait_for_timeout(250)
         return True
     except Exception:
@@ -2990,6 +3894,20 @@ def _run_email_triage_imap_fallback(
                     drafts_created += 1
             items.append(item)
     except Exception as exc:  # pylint: disable=broad-exception-caught
+        detail = str(exc)
+        detail_low = detail.lower()
+        is_app_password_required = ("application-specific password required" in detail_low) or ("app password" in detail_low)
+        error_code = "imap_app_password_required" if is_app_password_required else "credential_missing"
+        pause_reason = (
+            "IMAP requires a Gmail app password. Add an app password in Local Password Vault or continue with Gmail UI session, then Resume."
+            if is_app_password_required
+            else "Gmail IMAP fallback failed. Verify app password and IMAP access, then Resume."
+        )
+        subtitle = (
+            "Gmail requires an app password for IMAP access."
+            if is_app_password_required
+            else "Verify Gmail app-password and IMAP access."
+        )
         return {
             "ok": False,
             "mode": "email_triage",
@@ -2997,17 +3915,21 @@ def _run_email_triage_imap_fallback(
             "results_count": 0,
             "results": [],
             "artifacts": {},
-            "summary": {"error": "imap_fallback_failed", "detail": str(exc)},
+            "summary": {
+                "error": "imap_fallback_failed",
+                "detail": detail,
+                "imap_error_code": error_code,
+            },
             "source_status": {"gmail_imap": f"error:{type(exc).__name__}"},
             "opened_url": "",
             "paused_for_credentials": True,
-            "pause_reason": "Gmail IMAP fallback failed. Verify app password and IMAP access, then Resume.",
+            "pause_reason": pause_reason,
             "error": "credential_missing",
-            "error_code": "credential_missing",
+            "error_code": error_code,
             "trace": trace or [],
             "canvas": {
                 "title": "IMAP Fallback Failed",
-                "subtitle": "Verify Gmail app-password and IMAP access.",
+                "subtitle": subtitle,
                 "cards": [],
             },
         }
@@ -5676,11 +6598,21 @@ def _emit_progress(progress_cb: Optional[Callable[[int, str], None]], pct: int, 
         return
 
 
-def resume_pending_plan(pending: Dict[str, Any], step_mode: bool = False) -> Dict[str, Any]:
+def resume_pending_plan(
+    pending: Dict[str, Any],
+    step_mode: bool = False,
+    human_like_interaction: bool = False,
+) -> Dict[str, Any]:
     plan = pending.get("plan", {})
     plan_steps = [dict(x) for x in plan.get("steps", [])]
     start = int(pending.get("next_step_index", 0))
-    run = execute_plan(plan, start_index=start, step_mode=step_mode, allow_input_fallback=True)
+    run = execute_plan(
+        plan,
+        start_index=start,
+        step_mode=step_mode,
+        allow_input_fallback=True,
+        human_like_interaction=bool(human_like_interaction),
+    )
     response = {
         "ok": run.ok,
         "mode": "desktop_sequence_resume",

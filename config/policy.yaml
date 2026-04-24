@@ -25,6 +25,9 @@ abac:
 policies:
   competitor_analysis:
     min_live_non_curated_citations: 3
+  browser_worker:
+    mode: local
+    human_like_interaction: true
   freshness_defaults:
     enabled: true
     domains:
