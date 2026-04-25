@@ -382,6 +382,192 @@ class TestSearchAgent(unittest.TestCase):
             self.assertGreaterEqual(len(order), 1)
             self.assertEqual(order[0], "email_triage")
 
+    def test_strategy_order_prefers_generic_research_for_non_email_web_research(self) -> None:
+        order = search_agent_mod._strategy_order(
+            preferred="web_research",
+            instruction="Go research and find me the best wine to buy for dinner tonight.",
+        )
+        self.assertEqual(order, ["generic_research"])
+
+    def test_extract_generic_query_focuses_wine_pairing_prompt(self) -> None:
+        query = search_agent_mod._extract_generic_query(
+            "Go research and find me the best wine to buy for dinner tonight. I am having steak and potatoes."
+        )
+        self.assertEqual(query, "best wine for steak and potatoes")
+
+    def test_extract_generic_query_trims_artifact_clauses(self) -> None:
+        query = search_agent_mod._extract_generic_query(
+            "Go research the best portable espresso maker for travel and recommend which one to buy. Build a spreadsheet and summary."
+        )
+        self.assertEqual(query, "the best portable espresso maker for travel")
+
+    def test_expand_queries_adds_topic_focused_recommendation_variants(self) -> None:
+        queries = search_agent_mod._expand_queries(
+            "best wine for steak and potatoes",
+            instruction="Go research and find me the best wine to buy for dinner tonight. I am having steak and potatoes.",
+        )
+        self.assertIn("wine steak potatoes pairing", queries)
+        self.assertIn("cabernet sauvignon steak potatoes", queries)
+
+    def test_build_recommendation_focus_query_for_espresso_and_monitor(self) -> None:
+        espresso = search_agent_mod._build_recommendation_focus_query(
+            query="the best portable espresso maker for travel",
+            instruction="Go research the best portable espresso maker for travel and recommend which one to buy.",
+        )
+        monitor = search_agent_mod._build_recommendation_focus_query(
+            query="the best 27 inch monitor under 300 dollars for coding with a MacBook Pro",
+            instruction="Find the best 27 inch monitor under 300 dollars for coding with a MacBook Pro.",
+        )
+        self.assertEqual(espresso, "portable espresso maker travel review")
+        self.assertEqual(monitor, "27-inch monitor under 300 coding macbook pro")
+
+    def test_build_product_candidate_rows_extracts_espresso_models(self) -> None:
+        notes = [
+            {
+                "url": "https://example.com/review-1",
+                "title": "Portable espresso machine roundup",
+                "summary": "The Wacaco Picopresso and OutIn Nano stand out for travel.",
+                "excerpt": "Many travelers prefer the Wacaco Picopresso, while the OutIn Nano is the easiest battery-powered option.",
+            },
+            {
+                "url": "https://example.com/review-2",
+                "title": "Best travel espresso makers",
+                "summary": "OutIn Nano is convenient and Picopresso has excellent espresso quality.",
+                "excerpt": "OutIn Nano appears in nearly every travel roundup.",
+            },
+        ]
+        rows = search_agent_mod._build_product_candidate_rows(
+            browser_notes=notes,
+            instruction="Go research the best portable espresso maker for travel and recommend which one to buy.",
+            query="the best portable espresso maker for travel",
+        )
+        self.assertGreaterEqual(len(rows), 2)
+        self.assertEqual(rows[0]["candidate"], "OutIn Nano")
+
+    def test_build_product_candidate_rows_extracts_monitor_models(self) -> None:
+        notes = [
+            {
+                "url": "https://example.com/monitor-1",
+                "title": "Best monitors for MacBook Pro",
+                "summary": "LG 27UP650-W is a strong budget match for MacBook Pro users.",
+                "excerpt": "Dell S2722QC and LG 27UP650-W both work well for coding and USB-C setups.",
+            }
+        ]
+        rows = search_agent_mod._build_product_candidate_rows(
+            browser_notes=notes,
+            instruction="Find the best 27 inch monitor under 300 dollars for coding with a MacBook Pro.",
+            query="the best 27 inch monitor under 300 dollars for coding with a MacBook Pro",
+        )
+        self.assertGreaterEqual(len(rows), 2)
+        self.assertEqual(rows[0]["candidate"], "LG 27UP650-W")
+
+    def test_quality_gate_filters_generic_best_junk_results(self) -> None:
+        ranked = [
+            search_agent_mod.SearchResult(
+                title='How can I apologize and promise that a mistake will not happen again?',
+                url='https://ell.stackexchange.com/questions/94558/example',
+                price=None,
+                source='bing_rss',
+                snippet='Steve suggestion is the best.',
+            ),
+            search_agent_mod.SearchResult(
+                title='The Right Wine to Pair With Any Kind of Steak',
+                url='https://www.foodandwine.com/best-wine-steak-pairings-11755220',
+                price=None,
+                source='bing_rss',
+                snippet='Cabernet sauvignon and malbec are classic steak pairings.',
+            ),
+        ]
+        filtered = search_agent_mod._apply_human_judgment_quality_gate(
+            ranked=ranked,
+            instruction='Go research and find me the best wine to buy for dinner tonight. I am having steak and potatoes.',
+            query='best wine for steak and potatoes',
+            constraints={'compare_required': True, 'locality_required': False, 'locality_terms': []},
+        )
+        self.assertEqual(len(filtered), 1)
+        self.assertIn('foodandwine.com', filtered[0].url)
+
+    def test_quality_gate_requires_multi_term_overlap_for_product_research(self) -> None:
+        ranked = [
+            search_agent_mod.SearchResult(
+                title='PortableApps.com Platform Features',
+                url='https://portableapps.com/platform/features',
+                price=None,
+                source='bing_rss',
+                snippet='Run your favorite apps anywhere.',
+            ),
+            search_agent_mod.SearchResult(
+                title='Best Portable Espresso Machine 2026: Top 4 Travel Makers',
+                url='https://www.coffeejournals.com/best-portable-espresso-machine/',
+                price=None,
+                source='bing_rss',
+                snippet='Portable espresso machines tested for travel use.',
+            ),
+        ]
+        filtered = search_agent_mod._apply_human_judgment_quality_gate(
+            ranked=ranked,
+            instruction='Go research the best portable espresso maker for travel and recommend which one to buy.',
+            query='the best portable espresso maker for travel',
+            constraints={'compare_required': True, 'locality_required': False, 'locality_terms': []},
+        )
+        self.assertEqual(len(filtered), 1)
+        self.assertIn('coffeejournals.com', filtered[0].url)
+
+    def test_quality_gate_filters_monitor_query_false_positive(self) -> None:
+        ranked = [
+            search_agent_mod.SearchResult(
+                title='Encoded apostrophe is converted to %27 - Stack Overflow',
+                url='https://stackoverflow.com/questions/48114236/encoded-apostrophe-is-converted-to-27',
+                price=None,
+                source='bing_rss',
+                snippet='Why is encoded apostrophe converted to %27?',
+            ),
+            search_agent_mod.SearchResult(
+                title='The 6 Best Monitors For MacBook Pro And MacBook Air of 2026',
+                url='https://www.rtings.com/monitor/reviews/best/monitors-macbook-pro',
+                price=None,
+                source='bing_rss',
+                snippet='Top monitor picks for MacBook Pro users.',
+            ),
+        ]
+        filtered = search_agent_mod._apply_human_judgment_quality_gate(
+            ranked=ranked,
+            instruction='Find the best 27 inch monitor under 300 dollars for coding with a MacBook Pro.',
+            query='the best 27 inch monitor under 300 dollars for coding with a MacBook Pro',
+            constraints={'compare_required': True, 'locality_required': False, 'locality_terms': []},
+        )
+        self.assertEqual(len(filtered), 1)
+        self.assertIn('rtings.com', filtered[0].url)
+
+    @patch("lam.interface.search_agent._score_result_against_objective", return_value=0.95)
+    @patch("lam.interface.search_agent._run_strategy")
+    def test_reflective_planner_web_research_does_not_start_with_email_triage(self, mock_run_strategy, _mock_score) -> None:
+        seen: list[str] = []
+
+        def _fake_run_strategy(*args, **kwargs):
+            strategy = kwargs.get("strategy", "")
+            seen.append(str(strategy))
+            return {
+                "ok": strategy == "generic_research",
+                "mode": strategy,
+                "query": "best wine for steak dinner",
+                "results_count": 2,
+                "results": [],
+                "artifacts": {"decision_matrix_csv": "C:\\temp\\decision.csv"},
+                "summary": {},
+                "source_status": {},
+                "opened_url": "https://example.com/wine",
+                "recommendation": {"selected_title": "Cabernet Sauvignon"},
+            }
+
+        mock_run_strategy.side_effect = _fake_run_strategy
+        plan = {"domain": "web_research", "objective": "Find the best wine for steak dinner tonight."}
+        out = search_agent_mod._run_reflective_planner(plan=plan, instruction=plan["objective"])
+        self.assertTrue(out.get("ok"))
+        self.assertEqual(seen[0], "generic_research")
+        self.assertNotIn("email_triage", seen[:1])
+        self.assertEqual(out.get("recommendation", {}).get("selected_title"), "Cabernet Sauvignon")
+
     @patch("lam.interface.search_agent._search_web")
     def test_generic_research_superlative_requires_comparison_candidates(self, mock_search) -> None:
         mock_search.return_value = [
@@ -425,6 +611,39 @@ class TestSearchAgent(unittest.TestCase):
         self.assertFalse(out.get("ok"))
         self.assertEqual(out.get("summary", {}).get("error"), "locality_not_satisfied")
 
+    def test_build_native_plan_promotes_decision_research_to_spreadsheet_report_dashboard(self) -> None:
+        plan = search_agent_mod._build_native_plan(
+            "Go research and find me the best wine to buy for dinner tonight. I am having steak and potatoes."
+        )
+        self.assertEqual(plan.get("domain"), "web_research")
+        self.assertIn("spreadsheet", plan.get("deliverables", []))
+        self.assertIn("report", plan.get("deliverables", []))
+        self.assertIn("dashboard", plan.get("deliverables", []))
+
+    @patch("lam.interface.search_agent._execute_native_plan")
+    def test_recommendation_research_routes_into_native_plan(self, mock_exec_native) -> None:
+        mock_exec_native.return_value = {
+            "ok": True,
+            "mode": "autonomous_plan_execute",
+            "query": "best wine for steak dinner",
+            "results_count": 3,
+            "results": [],
+            "artifacts": {"decision_matrix_csv": "C:\\temp\\decision.csv", "dashboard_html": "C:\\temp\\dashboard.html"},
+            "summary": {},
+            "source_status": {"browser_worker": "ok:local"},
+            "opened_url": "https://example.com/wine-guide",
+            "canvas": {"title": "Decision Package Generated", "subtitle": "Cabernet Sauvignon", "cards": []},
+        }
+        result = execute_instruction(
+            "Go research and find me the best wine to buy for dinner tonight. I am having steak and potatoes.",
+            control_granted=True,
+        )
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(result.get("mode"), "autonomous_plan_execute")
+        self.assertTrue(mock_exec_native.called)
+        plan_arg = mock_exec_native.call_args.kwargs.get("plan", {})
+        self.assertIn("spreadsheet", plan_arg.get("deliverables", []))
+
     @patch("lam.interface.search_agent._search_web")
     @patch("lam.interface.search_agent._write_generic_research_artifacts")
     @patch("lam.interface.search_agent.webbrowser.open")
@@ -457,6 +676,203 @@ class TestSearchAgent(unittest.TestCase):
             )
         self.assertTrue(out.get("ok"))
         self.assertIn("judgment", out.get("summary", {}))
+
+    @patch("lam.interface.search_agent._open_target_with_reuse")
+    @patch("lam.interface.search_agent._browser_research_walk")
+    @patch("lam.interface.search_agent._search_web")
+    def test_generic_research_generates_wine_recommendation(self, mock_search, mock_browser_walk, mock_open_target) -> None:
+        mock_open_target.side_effect = lambda target_url, recent_actions=None: (target_url, {"decision": {"score": 80, "reasons": ["ok"]}})
+        mock_browser_walk.return_value = {
+            "ok": True,
+            "opened_url": "https://example.com/cabernet-steak",
+            "worker_status": "local_session",
+            "notes": [
+                {
+                    "url": "https://example.com/cabernet-steak",
+                    "title": "Cabernet with Steak",
+                    "summary": "Cabernet Sauvignon is the strongest pairing for steak and potatoes.",
+                }
+            ],
+        }
+        mock_search.return_value = [
+            search_agent_mod.SearchResult(
+                title="Best red wine with steak: Cabernet Sauvignon guide",
+                url="https://example.com/cabernet-steak",
+                price=None,
+                source="duckduckgo",
+                snippet="Cabernet Sauvignon is the classic steak pairing.",
+            ),
+            search_agent_mod.SearchResult(
+                title="Malbec with steak and potatoes",
+                url="https://example.com/malbec-steak",
+                price=None,
+                source="duckduckgo",
+                snippet="Malbec pairs well with grilled steak dinners.",
+            ),
+            search_agent_mod.SearchResult(
+                title="Merlot or cabernet for steak dinner",
+                url="https://example.com/merlot-cabernet",
+                price=None,
+                source="duckduckgo",
+                snippet="Cabernet Sauvignon remains the strongest steak pairing option.",
+            ),
+        ]
+        out = search_agent_mod._run_generic_research(
+            "Go research and find me the best wine to buy for dinner tonight. I am having steak and potatoes.",
+            progress_cb=None,
+            browser_worker_mode="local",
+            human_like_interaction=True,
+        )
+        self.assertTrue(out.get("ok"))
+        self.assertIn("decision_matrix_csv", out.get("artifacts", {}))
+        self.assertIn("browser_research_md", out.get("artifacts", {}))
+        self.assertEqual(out.get("recommendation", {}).get("selected_title"), "Cabernet Sauvignon")
+        self.assertIn("browser_worker_mode", out.get("summary", {}))
+
+    @patch("lam.interface.search_agent.ensure_browser_worker")
+    @patch("playwright.sync_api.sync_playwright")
+    def test_browser_research_walk_collects_page_notes(self, mock_sync_playwright, mock_ensure_worker) -> None:
+        mock_ensure_worker.return_value = {"ok": False, "error": "unavailable"}
+
+        page_state = {
+            "https://example.com/a": {
+                "title": "Cabernet with Steak",
+                "text": "Cabernet Sauvignon is a strong pairing for steak and potatoes dinner.",
+            },
+            "https://example.com/b": {
+                "title": "Malbec Pairing Guide",
+                "text": "Malbec works well with grilled steak, but cabernet remains the classic.",
+            },
+        }
+
+        class _BodyLocator:
+            def __init__(self, page: Any) -> None:
+                self.page = page
+
+            def inner_text(self, timeout: int = 0) -> str:
+                _ = timeout
+                return page_state.get(self.page.url, {}).get("text", "")
+
+        class _Page:
+            def __init__(self) -> None:
+                self.url = ""
+
+            def goto(self, url: str, timeout: int = 0) -> None:
+                _ = timeout
+                self.url = url
+
+            def wait_for_timeout(self, _ms: int) -> None:
+                return None
+
+            def title(self) -> str:
+                return page_state.get(self.url, {}).get("title", "")
+
+            def locator(self, selector: str) -> Any:
+                self.assert_selector = selector
+                return _BodyLocator(self)
+
+        class _Context:
+            def __init__(self) -> None:
+                self._page = _Page()
+                self.pages = []
+
+            def new_page(self) -> Any:
+                return self._page
+
+        class _Browser:
+            def __init__(self) -> None:
+                self._context = _Context()
+
+            def new_context(self) -> Any:
+                return self._context
+
+            def close(self) -> None:
+                return None
+
+        class _Chromium:
+            def connect_over_cdp(self, _url: str, timeout: int = 0) -> Any:
+                _ = timeout
+                raise RuntimeError("no cdp")
+
+            def launch(self, headless: bool = True) -> Any:
+                _ = headless
+                return _Browser()
+
+        class _Playwright:
+            chromium = _Chromium()
+
+        class _Factory:
+            def __enter__(self) -> _Playwright:
+                return _Playwright()
+
+            def __exit__(self, exc_type, exc, tb) -> bool:
+                _ = (exc_type, exc, tb)
+                return False
+
+        mock_sync_playwright.return_value = _Factory()
+        out = search_agent_mod._browser_research_walk(
+            query="best wine for steak dinner",
+            candidates=[
+                search_agent_mod.SearchResult(title="A", url="https://example.com/a", price=None, source="web", snippet=""),
+                search_agent_mod.SearchResult(title="B", url="https://example.com/b", price=None, source="web", snippet=""),
+            ],
+            browser_worker_mode="local",
+            human_like_interaction=True,
+            progress_cb=None,
+            max_pages=2,
+        )
+        self.assertTrue(out.get("ok"))
+        self.assertEqual(len(out.get("notes", [])), 2)
+        self.assertEqual(out.get("opened_url"), "https://example.com/b")
+
+    @patch("lam.interface.search_agent._open_target_with_reuse")
+    @patch("lam.interface.search_agent._browser_research_walk")
+    @patch("lam.interface.search_agent._search_web")
+    def test_generic_research_product_compare_uses_browser_notes(self, mock_search, mock_browser_walk, mock_open_target) -> None:
+        mock_open_target.side_effect = lambda target_url, recent_actions=None: (target_url, {"decision": {"score": 82, "reasons": ["ok"]}})
+        mock_search.return_value = [
+            search_agent_mod.SearchResult(
+                title="AeroPress Go travel coffee maker review",
+                url="https://example.com/aeropress-go",
+                price=44.95,
+                source="duckduckgo",
+                snippet="Portable coffee maker for travel.",
+            ),
+            search_agent_mod.SearchResult(
+                title="Wacaco Nanopresso review for travel",
+                url="https://example.com/nanopresso",
+                price=69.90,
+                source="duckduckgo",
+                snippet="Compact espresso maker for carry-on use.",
+            ),
+            search_agent_mod.SearchResult(
+                title="OutIn Nano portable espresso maker",
+                url="https://example.com/outin-nano",
+                price=149.0,
+                source="duckduckgo",
+                snippet="Battery-powered travel espresso machine.",
+            ),
+        ]
+        mock_browser_walk.return_value = {
+            "ok": True,
+            "opened_url": "https://example.com/nanopresso",
+            "worker_status": "local_session",
+            "notes": [
+                {"url": "https://example.com/aeropress-go", "title": "AeroPress Go", "summary": "Lightweight and simple, but not true espresso."},
+                {"url": "https://example.com/nanopresso", "title": "Nanopresso", "summary": "Better espresso quality with strong travel portability."},
+            ],
+        }
+        out = search_agent_mod._run_generic_research(
+            "Go research the best portable espresso maker for travel and recommend which one to buy.",
+            progress_cb=None,
+            browser_worker_mode="local",
+            human_like_interaction=True,
+        )
+        self.assertTrue(out.get("ok"))
+        self.assertIn("decision_matrix_csv", out.get("artifacts", {}))
+        self.assertIn("browser_research_json", out.get("artifacts", {}))
+        self.assertEqual(out.get("summary", {}).get("browser_pages_reviewed"), 2)
+        self.assertEqual(out.get("source_status", {}).get("browser_walk"), "local_session")
 
     @patch("lam.interface.search_agent.webbrowser.open")
     def test_focus_auth_session_does_not_reopen_existing_tab_by_default(self, mock_open) -> None:
