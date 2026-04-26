@@ -334,6 +334,8 @@ HTML_PAGE = """<!doctype html>
           <option value="job_market">job_market</option>
           <option value="competitor_analysis">competitor_analysis</option>
           <option value="study_pack">study_pack</option>
+          <option value="payer_pricing_review">payer_pricing_review</option>
+          <option value="code_workbench">code_workbench</option>
           <option value="artifact_generation">artifact_generation</option>
           <option value="email_triage">email_triage</option>
           <option value="desktop_sequence">desktop_sequence</option>
@@ -350,7 +352,7 @@ HTML_PAGE = """<!doctype html>
         <button onclick="loadDomainFreshnessPolicy()">Reload Domain Policy</button>
       </div>
       <div class="row chat-composer-row">
-        <input id="instruction" class="wide" type="text" placeholder="open chatgpt app then click New chat then type &quot;hello&quot; then press enter"/>
+        <input id="instruction" class="wide" type="text" placeholder="Example: Review Durham payer pricing, build a RAG index, create the stakeholder workbook, and show me which plans need outreach."/>
         <button class="primary" onclick="runInstruction()">Run</button>
         <button onclick="previewInstruction()">Preview</button>
       </div>
@@ -365,6 +367,8 @@ HTML_PAGE = """<!doctype html>
       <div class="row advanced-control">
         <button onclick="useTemplate('open chatgpt app then click New chat then type \\'Daily summary\\' then press enter')">Template: ChatGPT Daily</button>
         <button onclick="useTemplate('search Amazon for best price on Abu Garcia Voltiq baitcasting reel')">Template: Amazon Price</button>
+        <button onclick="useTemplate('Review Durham, NC payer pricing, build a RAG index, create the stakeholder workbook, and show me which plans need outreach.')">Template: Durham Payer Review</button>
+        <button onclick="useTemplate('Create a new VS Code workspace for this task, write analysis code, add smoke tests, and leave me a runnable scaffold with notes.')">Template: Code Workbench</button>
       </div>
       <div class="row advanced-control">
         <input id="appSearch" type="text" placeholder="Search installed apps"/>
@@ -2689,6 +2693,8 @@ def _infer_instruction_domain(instruction: str) -> str:
     low = str(instruction or "").lower()
     if any(x in low for x in ["gmail", "inbox", "email", "draft replies"]):
         return "email_triage"
+    if any(x in low for x in ["vscode", "vs code", "visual studio code", "write code", "analysis script", "workspace scaffold"]):
+        return "code_workbench"
     if any(x in low for x in ["job", "linkedin", "indeed", "salary"]):
         return "job_market"
     if any(x in low for x in ["competitor", "executive summary", "epic systems"]):

@@ -29,35 +29,59 @@ APP_CANDIDATES: Dict[str, list[str]] = {
         r"%ProgramFiles%\Microsoft Office\root\Office16\EXCEL.EXE",
         r"%ProgramFiles(x86)%\Microsoft Office\root\Office16\EXCEL.EXE",
     ],
+    "vscode": [
+        "code",
+        "code.cmd",
+        "code.exe",
+        r"%LOCALAPPDATA%\Programs\Microsoft VS Code\Code.exe",
+        r"%ProgramFiles%\Microsoft VS Code\Code.exe",
+        r"%ProgramFiles(x86)%\Microsoft VS Code\Code.exe",
+    ],
 }
 
 
 def normalize_app_name(text: str) -> str:
     lowered = re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+    aliases = {
+        "vs code": "vscode",
+        "visual studio code": "vscode",
+        "code": "vscode",
+    }
+    if lowered in aliases:
+        return aliases[lowered]
     for known in APP_CANDIDATES:
         if known in lowered:
+            return known
+    for alias, known in aliases.items():
+        if alias in lowered:
             return known
     return lowered.split()[0] if lowered else ""
 
 
 def open_installed_app(app_name: str) -> Tuple[bool, str]:
     """Open an installed app by alias/path/start-menu id."""
+    return open_app_target(app_name)
+
+
+def open_app_target(app_name: str, launch_args: Optional[List[str]] = None) -> Tuple[bool, str]:
+    """Open an installed app by alias/path/start-menu id with optional args."""
     key = normalize_app_name(app_name)
     candidates = APP_CANDIDATES.get(key, [f"{key}.exe", key])
+    launch_args = list(launch_args or [])
 
     for candidate in candidates:
         expanded = os.path.expandvars(candidate)
         exe = shutil.which(expanded)
         if exe:
-            subprocess.Popen([exe], shell=False)  # noqa: S603
+            subprocess.Popen([exe, *launch_args], shell=False)  # noqa: S603
             return True, exe
         path = Path(expanded)
         if path.exists():
-            os.startfile(str(path))  # type: ignore[attr-defined]
+            os.startfile(str(path), arguments=" ".join(launch_args))  # type: ignore[attr-defined]
             return True, str(path)
 
     app_id = _lookup_startapps_id(app_name)
-    if app_id:
+    if app_id and not launch_args:
         subprocess.Popen(
             [
                 "powershell",

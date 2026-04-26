@@ -55,7 +55,17 @@ class TestDomainPlaybooks(unittest.TestCase):
         self.assertFalse(out.get("ok"))
         self.assertGreaterEqual(len(out.get("errors", [])), 1)
 
+    def test_validate_code_workbench_plan(self) -> None:
+        steps = [
+            {"kind": "research"},
+            {"kind": "extract"},
+            {"kind": "analyze"},
+            {"kind": "produce"},
+            {"kind": "present"},
+        ]
+        self.assertTrue(validate_plan_steps("code_workbench", steps).get("ok"))
+        self.assertTrue(validate_transition_graph("code_workbench", steps).get("ok"))
+
 
 if __name__ == "__main__":
     unittest.main()
-

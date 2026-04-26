@@ -51,6 +51,16 @@ from lam.interface.operator_contract import attach_operator_contract
 from lam.interface.password_vault import LocalPasswordVault
 from lam.interface.session_manager import SessionManager
 from lam.interface.world_model import build_run_world_model
+from lam.deep_workbench.workflow import (
+    build_workspace as build_code_workbench_workspace,
+    extract_workbench_contract,
+)
+from lam.payer_rag.workflow import (
+    ask_workspace_question,
+    build_workspace,
+    ensure_workspace,
+    extract_current_task_contract,
+)
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 MIN_LIVE_NON_CURATED_CITATIONS = 3
@@ -117,6 +127,48 @@ RECOMMENDATION_RESEARCH_TOKENS = {
     "for dinner",
     "pairing",
     "compare",
+}
+
+CODE_WORKBENCH_TOKENS = {
+    "vscode",
+    "vs code",
+    "visual studio code",
+    "write code",
+    "build code",
+    "analysis app",
+    "analysis script",
+    "workspace",
+    "new codebase",
+}
+
+PAYER_PRICING_INTENT_TOKENS = {
+    "payer",
+    "payers",
+    "insurance",
+    "plan",
+    "plans",
+    "health plan",
+    "transparency in coverage",
+    "negotiated rate",
+    "pricing outlier",
+    "standard charges",
+    "shoppable",
+}
+
+PAYER_PRICING_ACTION_TOKENS = {
+    "durham",
+    "rag",
+    "vector store",
+    "retriever",
+    "pricing",
+    "rate",
+    "rates",
+    "analy",
+    "outlier",
+    "contract",
+    "contact",
+    "spreadsheet",
+    "stakeholder",
 }
 
 QUERY_NOISE_TERMS = {
@@ -913,6 +965,77 @@ def _build_product_candidate_rows(browser_notes: List[Dict[str, Any]], instructi
     return rows
 
 
+def _slugify_product_name(value: str) -> str:
+    text = str(value or "").strip().lower()
+    text = text.replace("&", " and ")
+    text = re.sub(r"[^a-z0-9]+", "-", text)
+    text = re.sub(r"-+", "-", text).strip("-")
+    return text
+
+
+def _is_buy_page_url(url: str) -> bool:
+    target = str(url or "").strip().lower()
+    if not target.startswith("http"):
+        return False
+    host = urllib.parse.urlparse(target).netloc.lower()
+    path = urllib.parse.urlparse(target).path.lower()
+    if any(domain in host for domain in ["amazon.com", "totalwine.com", "wine.com", "heb.com", "instacart.com", "wacaco.com"]):
+        return True
+    article_terms = ["review", "reviews", "guide", "best-", "buying-guides", "article", "content", "blog"]
+    if any(term in path for term in article_terms):
+        return False
+    return any(term in path for term in ["/product", "/products/", "/dp/", "/p/", "/shop/"])
+
+
+def _probe_candidate_url(url: str) -> str:
+    target = str(url or "").strip()
+    if not target:
+        return ""
+    try:
+        req = urllib.request.Request(target, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=20) as resp:  # nosec B310 - controlled URLs
+            final_url = str(getattr(resp, "geturl", lambda: target)() or target)
+            return final_url
+    except Exception:
+        return ""
+
+
+def _candidate_buy_url_variants(candidate: str, instruction: str, query: str) -> List[str]:
+    low = f"{instruction} {query} {candidate}".lower()
+    variants: List[str] = []
+    if "wacaco" in low:
+        if "picopresso" in low:
+            variants.append("https://www.wacaco.com/products/picopresso")
+        if "nanopresso" in low:
+            variants.append("https://www.wacaco.com/products/nanopresso")
+        if "minipresso gr2" in low:
+            variants.append("https://www.wacaco.com/products/minipresso-gr2")
+        if "minipresso ns2" in low:
+            variants.append("https://www.wacaco.com/products/minipresso-ns2")
+        slug = _slugify_product_name(re.sub(r"^wacaco\s+", "", candidate, flags=re.IGNORECASE))
+        if slug:
+            variants.append(f"https://www.wacaco.com/products/{slug}")
+    slug = _slugify_product_name(candidate)
+    if "amazon.com" not in " ".join(variants) and slug:
+        variants.append(f"https://www.amazon.com/s?k={urllib.parse.quote_plus(candidate)}")
+    out: List[str] = []
+    for item in variants:
+        if item not in out:
+            out.append(item)
+    return out
+
+
+def _resolve_product_candidate_buy_url(candidate: str, instruction: str, query: str, current_url: str = "") -> str:
+    existing = str(current_url or "").strip()
+    if _is_buy_page_url(existing):
+        return existing
+    for url in _candidate_buy_url_variants(candidate=candidate, instruction=instruction, query=query):
+        resolved = _probe_candidate_url(url)
+        if resolved and _is_buy_page_url(resolved):
+            return resolved
+    return existing
+
+
 def _wine_pairing_decision_rows(results: List[SearchResult], instruction: str, query: str) -> List[Dict[str, Any]]:
     if not _is_wine_pairing_intent(instruction=instruction, query=query):
         return []
@@ -985,6 +1108,13 @@ def _build_recommendation_summary(
             "query_focus": query,
         }
     selected_url = str(top.get("url", "")) or (results[0].url if results else "")
+    if candidate_type == "product_candidate":
+        selected_url = _resolve_product_candidate_buy_url(
+            candidate=str(top.get("candidate", "")),
+            instruction=instruction,
+            query=query,
+            current_url=selected_url,
+        )
     return {
         "selected_title": str(top.get("candidate", "")),
         "selected_url": selected_url,
@@ -1432,7 +1562,14 @@ def _detect_ambiguities(instruction: str, plan_steps: List[Dict[str, Any]]) -> L
 
 def _classify_explicit_route(instruction: str) -> str:
     low = instruction.lower()
-    if _is_email_triage_intent(instruction) or _is_competitor_analysis_intent(instruction) or _is_study_pack_intent(instruction) or _is_job_research_intent(instruction):
+    if (
+        _is_email_triage_intent(instruction)
+        or _is_competitor_analysis_intent(instruction)
+        or _is_study_pack_intent(instruction)
+        or _is_job_research_intent(instruction)
+        or _is_payer_pricing_review_intent(instruction)
+        or _is_code_workbench_intent(instruction)
+    ):
         return ""
     asks_chat_action = any(x in low for x in ["respond", "reply", "message", "post", "send"]) and any(
         x in low for x in ["chat", "dm", "thread", "comment", "message"]
@@ -1466,6 +1603,10 @@ def _requested_outputs(instruction: str) -> Set[str]:
         requested.add("visual")
     if any(x in low for x in ["draft reply", "draft replies", "reply", "respond", "chat response"]):
         requested.add("chat_response")
+    if any(x in low for x in ["write code", "build code", "analysis script", "python script", "code scaffold"]):
+        requested.add("code")
+    if any(x in low for x in ["workspace", "vs code", "vscode", "visual studio code"]):
+        requested.add("workspace")
     return requested
 
 
@@ -1483,6 +1624,9 @@ def _plan_represented_outputs(plan: Dict[str, Any], plan_steps: List[Dict[str, A
         "visual": "visual",
         "draft_reply": "chat_response",
         "apply_links": "links",
+        "code": "code",
+        "workspace": "workspace",
+        "vscode_workspace": "workspace",
     }
     for item in deliverables:
         if item in deliverable_map:
@@ -1501,6 +1645,8 @@ def _plan_represented_outputs(plan: Dict[str, Any], plan_steps: List[Dict[str, A
             represented.add("dashboard")
         if action in {"type_text", "type"} and text:
             represented.add("chat_response")
+    if str(plan.get("domain", "")).lower() == "code_workbench":
+        represented.update({"code", "workspace", "document"})
     return represented
 
 
@@ -1879,6 +2025,10 @@ def _build_run_narration(out: Dict[str, Any], playbook: Dict[str, Any]) -> List[
     pb_name = str(playbook.get("name", "General Operator Playbook")).strip()
     if pb_name:
         lines.append(f"Selected playbook: {pb_name}.")
+    task_contract = out.get("current_task_contract", {}) if isinstance(out.get("current_task_contract"), dict) else {}
+    geography = str(task_contract.get("geography", "")).strip()
+    if geography:
+        lines.append(f"Current task geography: {geography}.")
     opened_url = str(out.get("opened_url", "")).strip()
     if opened_url:
         lines.append(f"Working target: {opened_url}.")
@@ -1891,6 +2041,9 @@ def _build_run_narration(out: Dict[str, Any], playbook: Dict[str, Any]) -> List[
     artifacts = out.get("artifacts", {}) if isinstance(out.get("artifacts"), dict) else {}
     if artifacts:
         lines.append(f"Created {len(artifacts)} artifact(s): {', '.join(sorted(artifacts.keys())[:4])}.")
+    invalidated = summary.get("invalidated_artifacts", []) if isinstance(summary.get("invalidated_artifacts"), list) else []
+    if invalidated:
+        lines.append("Rejected stale artifacts from a different task contract.")
     if isinstance(out.get("decision_log"), list) and out.get("decision_log"):
         lines.append(f"Planner decisions: {len(out.get('decision_log', []))} recorded.")
     source_status = out.get("source_status", {}) if isinstance(out.get("source_status"), dict) else {}
@@ -2486,6 +2639,8 @@ def _likely_requires_login(instruction: str, url: str, title: str) -> bool:
 
 def _is_desktop_sequence_intent(instruction: str) -> bool:
     low = instruction.lower()
+    if _is_code_workbench_intent(instruction):
+        return False
     if any(phrase in low for phrase in ["then click", "then type", "press enter", "hotkey ", "focus window", "click found"]):
         return True
     starters = ["open ", "click ", "type ", "press ", "hotkey ", "focus ", "switch to ", "scroll ", "login with ", "use credentials "]
@@ -2494,11 +2649,26 @@ def _is_desktop_sequence_intent(instruction: str) -> bool:
     return (starts_like_macro or explicit_ui_find) and "search amazon" not in low and "job" not in low
 
 
+def _is_code_workbench_intent(instruction: str) -> bool:
+    low = str(instruction or "").lower()
+    has_tooling_signal = any(token in low for token in CODE_WORKBENCH_TOKENS)
+    has_build_signal = any(token in low for token in ["analy", "research", "fulfill", "build", "create", "scaffold", "prototype"])
+    has_editor_phrase = (
+        any(token in low for token in ["vscode", "vs code", "visual studio code"])
+        and any(token in low for token in ["write", "build", "open", "create", "launch"])
+    )
+    return bool(has_editor_phrase or (has_tooling_signal and has_build_signal))
+
+
 def _is_native_planning_intent(instruction: str) -> bool:
     low = instruction.lower()
+    if _is_code_workbench_intent(instruction):
+        return True
     if _is_desktop_sequence_intent(low):
         return False
     if _is_email_triage_intent(instruction):
+        return True
+    if _is_payer_pricing_review_intent(instruction):
         return True
     if _is_marketplace_shopping_intent(instruction):
         return False
@@ -2548,9 +2718,90 @@ def _is_email_triage_intent(instruction: str) -> bool:
     return has_email_scope and has_outputs and has_time_filter
 
 
+def _is_payer_pricing_review_intent(instruction: str) -> bool:
+    low = instruction.lower()
+    has_domain = any(token in low for token in PAYER_PRICING_INTENT_TOKENS)
+    has_action = any(token in low for token in PAYER_PRICING_ACTION_TOKENS)
+    is_durham_healthcare = "durham" in low and any(token in low for token in ["payer", "insurance", "plan"])
+    return (has_domain and has_action) or is_durham_healthcare
+
+
+def _is_payer_pricing_question(instruction: str) -> bool:
+    low = instruction.lower()
+    question_signals = [
+        "which plans",
+        "which payers",
+        "show evidence",
+        "what data sources",
+        "why was",
+        "why were",
+        "need outreach",
+        "most expensive",
+        "highest",
+        "what supports",
+    ]
+    build_signals = [
+        "build",
+        "create",
+        "generate",
+        "review",
+        "analy",
+        "export",
+        "submit",
+        "package",
+        "rebuild",
+        "refresh",
+    ]
+    return _is_payer_pricing_review_intent(instruction) and (
+        ("?" in instruction or any(token in low for token in question_signals))
+        and not any(token in low for token in build_signals)
+    )
+
+
+def _payer_service_keywords(instruction: str) -> List[str]:
+    base = [
+        "mri",
+        "magnetic resonance",
+        "magnetic resonance imaging",
+        "ct",
+        "computed tomography",
+        "cat scan",
+        "ultrasound",
+        "x-ray",
+        "xray",
+        "colonoscopy",
+        "endoscopy",
+        "office visit",
+        "evaluation and management",
+        "emergency",
+        "heart",
+        "transplant",
+    ]
+    low = instruction.lower()
+    for keyword in [
+        "mri",
+        "ct",
+        "ultrasound",
+        "x-ray",
+        "colonoscopy",
+        "endoscopy",
+        "office visit",
+        "emergency",
+        "heart",
+        "transplant",
+    ]:
+        if keyword in low and keyword not in base:
+            base.append(keyword)
+    return list(dict.fromkeys(base))
+
+
 def _build_native_plan(instruction: str) -> Dict[str, Any]:
     if _is_email_triage_intent(instruction):
         domain = "email_triage"
+    elif _is_code_workbench_intent(instruction):
+        domain = "code_workbench"
+    elif _is_payer_pricing_review_intent(instruction):
+        domain = "payer_pricing_review"
     elif _is_study_pack_intent(instruction):
         domain = "study_pack"
     elif _is_job_research_intent(instruction):
@@ -2563,6 +2814,8 @@ def _build_native_plan(instruction: str) -> Dict[str, Any]:
     low = instruction.lower()
     if "spreadsheet" in low or "csv" in low:
         deliverables.append("spreadsheet")
+    if "xlsx" in low or "workbook" in low:
+        deliverables.append("spreadsheet")
     if "report" in low:
         deliverables.append("report")
     if "executive summary" in low:
@@ -2571,8 +2824,22 @@ def _build_native_plan(instruction: str) -> Dict[str, Any]:
         deliverables.append("powerpoint")
     if "dashboard" in low:
         deliverables.append("dashboard")
+    if any(token in low for token in ["write code", "build code", "analysis script", "python script", "code scaffold"]):
+        deliverables.append("code")
+    if any(token in low for token in ["workspace", "vs code", "vscode", "visual studio code"]):
+        deliverables.append("workspace")
+    if "rag" in low or "vector store" in low or "retriever" in low:
+        deliverables.append("rag_index")
     if "link" in low:
         deliverables.append("apply_links")
+    if _is_payer_pricing_review_intent(instruction):
+        for item in ["spreadsheet", "report", "dashboard", "rag_index"]:
+            if item not in deliverables:
+                deliverables.append(item)
+    if _is_code_workbench_intent(instruction):
+        for item in ["code", "workspace", "report"]:
+            if item not in deliverables:
+                deliverables.append(item)
     if _is_recommendation_research_intent(instruction):
         for item in ["spreadsheet", "report", "dashboard"]:
             if item not in deliverables:
@@ -2582,6 +2849,10 @@ def _build_native_plan(instruction: str) -> Dict[str, Any]:
 
     if domain == "email_triage":
         sources = ["gmail_ui"]
+    elif domain == "code_workbench":
+        sources = ["user_instruction", "local_workspace", "desktop_editor"]
+    elif domain == "payer_pricing_review":
+        sources = ["public_transparency_files", "provider_price_pages", "payer_reference_pages"]
     elif domain == "job_market":
         sources = ["linkedin", "indeed", "ziprecruiter", "glassdoor", "builtin"]
     elif domain == "competitor_analysis":
@@ -2609,6 +2880,60 @@ def _build_native_plan(instruction: str) -> Dict[str, Any]:
                 {"kind": "create_draft", "name": "Create draft replies for action-needed emails", "target": {"id": "gmail:drafts"}},
                 {"kind": "save_csv", "name": "Write task list spreadsheet artifact", "target": {"path": "data/reports/email_triage"}},
                 {"kind": "present", "name": "Open report dashboard for review", "target": {"id": "artifact:email_triage_report"}},
+            ],
+        }
+        steps = list(plan.get("steps", []))
+        plan["playbook_validation"] = validate_plan_steps(domain=domain, steps=steps)
+        plan["playbook_graph_validation"] = validate_transition_graph(domain=domain, steps=steps)
+        plan["playbook_step_obligations"] = build_step_obligations(domain=domain, steps=steps)
+        return plan
+    if domain == "payer_pricing_review":
+        plan = {
+            "planner": "native-v1",
+            "domain": domain,
+            "playbook": playbook,
+            "objective": objective,
+            "deliverables": deliverables,
+            "sources": sources,
+            "constraints": {
+                "prefer_public_pages": True,
+                "no_password_capture": True,
+                "persist_history": True,
+                "no_phi": True,
+            },
+            "steps": [
+                {"kind": "research", "name": "Collect Durham-area payer and provider pricing sources", "target": {"query": objective}},
+                {"kind": "extract", "name": "Normalize payer, plan, service, and rate records", "target": {"id": "dataset:normalized_pricing"}},
+                {"kind": "analyze", "name": "Build RAG index and identify pricing outliers", "target": {"id": "dataset:pricing_analysis"}},
+                {"kind": "produce", "name": "Generate workbook, dashboard, report, and validation queue", "target": {"path": "data/payer_rag_live"}},
+                {"kind": "present", "name": "Return stakeholder artifacts and evidence", "target": {"id": "artifact:payer_dashboard_html"}},
+            ],
+        }
+        steps = list(plan.get("steps", []))
+        plan["playbook_validation"] = validate_plan_steps(domain=domain, steps=steps)
+        plan["playbook_graph_validation"] = validate_transition_graph(domain=domain, steps=steps)
+        plan["playbook_step_obligations"] = build_step_obligations(domain=domain, steps=steps)
+        return plan
+    if domain == "code_workbench":
+        plan = {
+            "planner": "native-v1",
+            "domain": domain,
+            "playbook": playbook,
+            "objective": objective,
+            "deliverables": deliverables,
+            "sources": sources,
+            "constraints": {
+                "prefer_public_pages": False,
+                "no_password_capture": True,
+                "persist_history": True,
+                "fresh_workspace": True,
+            },
+            "steps": [
+                {"kind": "research", "name": "Parse the request into a code workbench contract", "target": {"query": objective}},
+                {"kind": "extract", "name": "Create a fresh workspace for the task", "target": {"path": "data/deep_work_runs"}},
+                {"kind": "analyze", "name": "Scaffold analysis code, notes, and smoke tests", "target": {"id": "workspace:scaffold"}},
+                {"kind": "produce", "name": "Launch VS Code and capture workbench artifacts", "target": {"app": "vscode"}},
+                {"kind": "present", "name": "Return the workbench package for review", "target": {"id": "artifact:workspace_readme_md"}},
             ],
         }
         steps = list(plan.get("steps", []))
@@ -2765,6 +3090,8 @@ def _run_reflective_planner(
         accept_threshold = 0.60
     elif preferred == "job_market":
         accept_threshold = 0.58
+    elif preferred == "code_workbench":
+        accept_threshold = 0.62
     else:
         accept_threshold = 0.72
     attempt_order = _strategy_order(preferred=preferred, instruction=instruction)
@@ -2977,7 +3304,7 @@ def _world_route_step_gate(
 
 
 def _strategy_order(preferred: str, instruction: str = "") -> List[str]:
-    all_strategies = ["email_triage", "study_pack", "job_market", "competitor_analysis", "generic_research"]
+    all_strategies = ["email_triage", "study_pack", "job_market", "competitor_analysis", "payer_pricing_review", "code_workbench", "generic_research"]
     low = str(instruction or "").lower()
     if any(x in low for x in ["gmail", "inbox", "email"]):
         mgr = SessionManager()
@@ -2992,6 +3319,10 @@ def _strategy_order(preferred: str, instruction: str = "") -> List[str]:
         return ["job_market", "generic_research"]
     if preferred == "competitor_analysis":
         return ["competitor_analysis", "generic_research"]
+    if preferred == "payer_pricing_review":
+        return ["payer_pricing_review", "generic_research"]
+    if preferred == "code_workbench":
+        return ["code_workbench", "generic_research"]
     if preferred == "web_research":
         return ["generic_research"]
     if preferred in all_strategies:
@@ -3028,6 +3359,10 @@ def _run_strategy(
             progress_cb=progress_cb,
             min_live_non_curated_citations=min_live_non_curated_citations,
         )
+    if strategy == "payer_pricing_review":
+        return _run_payer_pricing_review(instruction, progress_cb=progress_cb)
+    if strategy == "code_workbench":
+        return _run_code_workbench(instruction, progress_cb=progress_cb)
     return _run_generic_research(
         instruction,
         progress_cb=progress_cb,
@@ -3073,6 +3408,8 @@ def _score_result_against_objective(
     wants_competitor = any(t in low_obj for t in ["competitor", "competition", "executive summary", "powerpoint", "ppt"])
     wants_email_triage = any(t in low_obj for t in ["inbox", "gmail", "draft replies", "draft reply", "task list"]) and "last" in low_obj
     wants_shopping_decision = any(t in low_obj for t in ["best price", "cheapest", "recommend", "which one to buy", "what should i buy", "buy"])
+    wants_payer_review = _is_payer_pricing_review_intent(objective)
+    wants_code_workbench = _is_code_workbench_intent(objective)
     if wants_study:
         if "flashcards_csv" not in artifacts or not any(k in artifacts for k in ["quiz_md", "quiz_html"]):
             score -= 0.5
@@ -3107,8 +3444,285 @@ def _score_result_against_objective(
             score -= 0.35
         if result.get("mode") not in {"web_search", "generic_research"}:
             score -= 0.2
+    if wants_payer_review:
+        required = {"workbook_xlsx", "dashboard_html", "summary_report_md", "validation_queue_csv", "rag_index_db"}
+        missing = [key for key in required if key not in artifacts]
+        if missing:
+            score -= 0.5
+        if result.get("mode") != "payer_pricing_review":
+            score -= 0.35
+    if wants_code_workbench:
+        required = {"workspace_directory", "analysis_script_py", "workspace_readme_md", "smoke_log"}
+        missing = [key for key in required if key not in artifacts]
+        if missing:
+            score -= 0.45
+        else:
+            score += 0.25
+        if result.get("mode") != "code_workbench":
+            score -= 0.35
 
     return max(0.0, min(1.0, score))
+
+
+def _run_payer_pricing_review(
+    instruction: str,
+    progress_cb: Optional[Callable[[int, str], None]] = None,
+) -> Dict[str, Any]:
+    contract = extract_current_task_contract(instruction)
+    service_keywords = _payer_service_keywords(instruction)
+    _emit_progress(progress_cb, 10, f"Detected {contract.geography} as the current payer market")
+    _emit_progress(progress_cb, 16, "Checking for stale geography-specific artifacts")
+    allow_reuse = _is_payer_pricing_question(instruction) and not bool(getattr(contract, "geography_explicit", False))
+    if allow_reuse:
+        _emit_progress(progress_cb, 22, f"Looking for the latest valid {contract.geography} payer workspace")
+    else:
+        _emit_progress(progress_cb, 22, f"Creating a fresh run folder for {contract.geography}")
+    build_result = ensure_workspace(
+        contract=contract,
+        service_keywords=service_keywords,
+        max_services_per_source=24,
+        outlier_threshold=0.2,
+        min_peer_count=3,
+        offline_fallback=True,
+        allow_reuse=allow_reuse,
+    )
+    workspace = Path(str(build_result.get("workspace", "")))
+    invalidated = list(build_result.get("invalidated_artifacts", [])) if isinstance(build_result.get("invalidated_artifacts"), list) else []
+    if invalidated:
+        _emit_progress(progress_cb, 34, "Found stale outputs from a different market; excluding them from final output")
+    if bool(build_result.get("reused_existing_outputs", False)):
+        _emit_progress(progress_cb, 42, f"Using the latest valid {contract.geography} workspace")
+    else:
+        _emit_progress(progress_cb, 42, f"Rebuilding ingestion and normalization for {contract.geography}")
+    counts = build_result.get("counts", {}) if isinstance(build_result.get("counts"), dict) else {}
+    artifacts = build_result.get("artifact_paths", {}) if isinstance(build_result.get("artifact_paths"), dict) else {}
+    opened_url = artifacts.get("primary_open_file", "") or artifacts.get("dashboard_html", "")
+    geography_validation = (
+        build_result.get("geography_validation", {})
+        if isinstance(build_result.get("geography_validation"), dict)
+        else {}
+    )
+    if not bool(geography_validation.get("passed", False)):
+        return {
+            "ok": False,
+            "mode": "payer_pricing_review",
+            "query": instruction,
+            "results_count": int(counts.get("outreach_candidates", 0) or 0),
+            "results": build_result.get("top_candidates", [])[:20] if isinstance(build_result.get("top_candidates"), list) else [],
+            "artifacts": artifacts,
+            "summary": {
+                "workspace": str(workspace.resolve()) if workspace else "",
+                "counts": counts,
+                "issues": build_result.get("issues", []),
+                "reused_existing_outputs": bool(build_result.get("reused_existing_outputs", False)),
+                "current_task_contract": build_result.get("current_task_contract", {}),
+                "invalidated_artifacts": invalidated,
+                "generation_timestamp": build_result.get("generation_timestamp", ""),
+                "geography_validation": geography_validation,
+            },
+            "source_status": {"payer_rag": "error:geography_consistency_failed"},
+            "opened_url": opened_url,
+            "recommendation": {},
+            "current_task_contract": build_result.get("current_task_contract", {}),
+            "error": "geography_consistency_failed",
+            "error_code": "geography_consistency_failed",
+            "canvas": {
+                "title": "Geography Validation Failed",
+                "subtitle": f"Final artifacts do not consistently match {contract.geography}.",
+                "cards": [
+                    {"title": item[:110], "price": "validation", "source": "payer_rag", "url": ""}
+                    for item in geography_validation.get("errors", [])[:5]
+                ],
+            },
+        }
+    if _is_payer_pricing_question(instruction) and workspace:
+        _emit_progress(progress_cb, 78, f"Answering from the {contract.geography} payer corpus")
+        response = ask_workspace_question(instruction, contract=contract, workspace=workspace)
+        cards = [
+            {"title": line[:110], "price": "evidence", "source": "payer_rag", "url": ""}
+            for line in str(response.get("answer", "")).splitlines()[:5]
+            if str(line).strip()
+        ]
+        return {
+            "ok": True,
+            "mode": "payer_pricing_review",
+            "query": instruction,
+            "results_count": len(response.get("sources", [])),
+            "results": [
+                {
+                    "title": "payer_answer",
+                    "url": src,
+                    "price": None,
+                    "source": "payer_rag",
+                    "snippet": response.get("answer", ""),
+                }
+                for src in response.get("sources", [])
+            ],
+            "artifacts": artifacts,
+            "summary": {
+                "workspace": str(workspace.resolve()),
+                "counts": counts,
+                "reused_existing_outputs": bool(build_result.get("reused_existing_outputs", False)),
+                "question_answered": True,
+                "sources": response.get("sources", []),
+                "current_task_contract": build_result.get("current_task_contract", {}),
+                "invalidated_artifacts": invalidated,
+                "generation_timestamp": build_result.get("generation_timestamp", ""),
+                "geography_validation": build_result.get("geography_validation", {}),
+            },
+            "source_status": {"payer_rag": "ok", "workspace": str(workspace.resolve())},
+            "opened_url": opened_url,
+            "recommendation": {},
+            "current_task_contract": build_result.get("current_task_contract", {}),
+            "canvas": {
+                "title": "Payer Review Answer Ready",
+                "subtitle": str(response.get("answer", "")).splitlines()[0][:120]
+                if str(response.get("answer", "")).strip()
+                else "Source-backed answer ready",
+                "cards": cards,
+            },
+        }
+    _emit_progress(progress_cb, 78, f"Building stakeholder outputs for {contract.geography}")
+    top_candidates = build_result.get("top_candidates", []) if isinstance(build_result.get("top_candidates"), list) else []
+    cards = []
+    for row in top_candidates[:5]:
+        variance = str(row.get("variance_percent", "")).strip()
+        cards.append(
+            {
+                "title": f"{row.get('payer_name', '')} / {row.get('plan_name', '')}",
+                "price": f"{float(variance) * 100:.1f}% above median" if variance else "candidate",
+                "source": row.get("service", ""),
+                "url": row.get("source_evidence", "").split("|")[0].strip(),
+            }
+        )
+    return {
+        "ok": True,
+        "mode": "payer_pricing_review",
+        "query": instruction,
+        "results_count": int(counts.get("outreach_candidates", 0) or 0),
+        "results": top_candidates[:20],
+        "artifacts": artifacts,
+        "summary": {
+            "workspace": str(workspace.resolve()),
+            "counts": counts,
+            "issues": build_result.get("issues", []),
+            "reused_existing_outputs": bool(build_result.get("reused_existing_outputs", False)),
+            "validation_required": True,
+            "current_task_contract": build_result.get("current_task_contract", {}),
+            "invalidated_artifacts": invalidated,
+            "generation_timestamp": build_result.get("generation_timestamp", ""),
+            "geography_validation": build_result.get("geography_validation", {}),
+        },
+        "source_status": {"payer_rag": "ok", "workspace": str(workspace.resolve())},
+        "opened_url": opened_url,
+        "recommendation": {},
+        "current_task_contract": build_result.get("current_task_contract", {}),
+        "canvas": {
+            "title": f"{contract.geography} Payer Review Ready",
+            "subtitle": f"{int(counts.get('outreach_candidates', 0) or 0)} outreach candidates queued for validation",
+            "cards": cards,
+        },
+    }
+
+
+def _run_code_workbench(
+    instruction: str,
+    progress_cb: Optional[Callable[[int, str], None]] = None,
+) -> Dict[str, Any]:
+    contract = extract_workbench_contract(instruction)
+    _emit_progress(progress_cb, 10, "Translating the request into a code workbench contract")
+    build_result = build_code_workbench_workspace(contract=contract, open_vscode=True)
+    workspace = Path(str(build_result.get("workspace", "")))
+    artifacts = build_result.get("artifact_paths", {}) if isinstance(build_result.get("artifact_paths"), dict) else {}
+    vscode_launch = build_result.get("vscode_launch", {}) if isinstance(build_result.get("vscode_launch"), dict) else {}
+    _emit_progress(progress_cb, 34, "Created a fresh workspace with notes, code scaffold, and editor tasks")
+
+    smoke_ok = True
+    smoke_lines: List[str] = []
+    if workspace:
+        commands = [
+            ["python", "-m", "py_compile", "src\\analysis.py", "tests\\test_smoke.py"],
+            ["python", "src\\analysis.py"],
+        ]
+        for command in commands:
+            smoke_lines.append(f"$ {' '.join(command)}")
+            try:
+                proc = subprocess.run(
+                    command,
+                    cwd=str(workspace),
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+            except Exception as exc:
+                smoke_ok = False
+                smoke_lines.append(f"ERROR: {exc}")
+                continue
+            if proc.stdout.strip():
+                smoke_lines.append(proc.stdout.strip())
+            if proc.stderr.strip():
+                smoke_lines.append(proc.stderr.strip())
+            smoke_lines.append(f"exit_code={proc.returncode}")
+            if proc.returncode != 0:
+                smoke_ok = False
+
+    smoke_log_path = Path(str(artifacts.get("smoke_log", ""))) if artifacts.get("smoke_log") else None
+    if smoke_log_path:
+        smoke_log_path.write_text("\n".join(smoke_lines).strip() + "\n", encoding="utf-8")
+
+    analysis_summary = workspace / "artifacts" / "analysis_summary.json" if workspace else Path()
+    if analysis_summary.exists():
+        artifacts["analysis_summary_json"] = str(analysis_summary.resolve())
+
+    launch_note = (
+        "Opened a new VS Code window for the workspace"
+        if bool(vscode_launch.get("ok"))
+        else "VS Code launch was requested but not available; the workspace is ready on disk"
+    )
+    _emit_progress(progress_cb, 76, "Ran smoke checks against the generated scaffold")
+    _emit_progress(progress_cb, 90, launch_note)
+    cards = [
+        {"title": contract.title[:110], "price": "workspace", "source": "deep_work", "url": ""},
+        {"title": "analysis.py scaffold ready", "price": "code", "source": "deep_work", "url": ""},
+        {"title": "Smoke check passed" if smoke_ok else "Smoke check needs follow-up", "price": "verify", "source": "deep_work", "url": ""},
+    ]
+    return {
+        "ok": True,
+        "mode": "code_workbench",
+        "query": instruction,
+        "results_count": 1,
+        "results": [
+            {
+                "title": contract.title,
+                "url": str(workspace.resolve()) if workspace else "",
+                "price": None,
+                "source": "deep_workbench",
+                "snippet": "Fresh code workspace with notes, scaffold, and smoke-test output.",
+            }
+        ],
+        "artifacts": artifacts,
+        "summary": {
+            "workspace": str(workspace.resolve()) if workspace else "",
+            "generation_timestamp": build_result.get("generation_timestamp", ""),
+            "smoke_test_passed": smoke_ok,
+            "vscode_launch": vscode_launch,
+            "launch_note": launch_note,
+            "current_task_contract": build_result.get("current_task_contract", {}),
+        },
+        "source_status": {
+            "deep_workbench": "ok",
+            "vscode": "ok" if bool(vscode_launch.get("ok")) else f"warning:{vscode_launch.get('mode', 'not_found')}",
+        },
+        "opened_url": str(artifacts.get("primary_open_file", "")),
+        "recommendation": {},
+        "current_task_contract": build_result.get("current_task_contract", {}),
+        "canvas": {
+            "title": "Code Workbench Ready",
+            "subtitle": contract.title,
+            "cards": cards,
+        },
+    }
 
 
 def _run_email_triage(

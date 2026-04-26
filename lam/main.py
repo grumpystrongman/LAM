@@ -7,6 +7,8 @@ from pathlib import Path
 from lam.adapters.excel_adapter import ExcelAdapter
 from lam.adapters.playwright_adapter import PlaywrightAdapter
 from lam.adapters.uia_adapter import UIAAdapter
+from lam.deep_workbench.workflow import build_workspace as build_code_workbench_workspace
+from lam.deep_workbench.workflow import extract_workbench_contract
 from lam.dsl.parser import load_workflow
 from lam.endpoint_agent.kill_switch import KillSwitch
 from lam.endpoint_agent.runner import Runner
@@ -15,6 +17,15 @@ from lam.governance.audit_logger import AuditLogger
 from lam.governance.policy_engine import PolicyEngine
 from lam.governance.redaction import Redactor
 from lam.interface.web_ui import run_ui_server
+from lam.payer_rag.cli import (
+    payer_analyze,
+    payer_ask,
+    payer_build,
+    payer_build_index,
+    payer_export,
+    payer_ingest,
+    payer_init_manifest,
+)
 from lam.services.api_server import ApiAuthConfig, ControlPlaneService, run_http_server
 from lam.services.audit_store import AuditStore
 from lam.services.sqlite_approval_service import SqliteApprovalService
@@ -93,6 +104,12 @@ def validate_audit(args: argparse.Namespace) -> None:
     print(result)
 
 
+def workbench_create(args: argparse.Namespace) -> None:
+    contract = extract_workbench_contract(args.instruction, workspace_root=args.workspace_root)
+    result = build_code_workbench_workspace(contract=contract, open_vscode=not args.no_open_vscode)
+    print(result)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="LAM Governance-First Runtime and Control Plane")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -130,6 +147,60 @@ def main() -> None:
     ui_parser.set_defaults(
         func=lambda a: run_ui_server(host=a.host, port=a.port, open_browser=not a.no_open_browser)
     )
+
+    payer_ingest_parser = sub.add_parser("payer-ingest", help="Ingest Durham payer pricing sources")
+    payer_ingest_parser.add_argument("--workspace", default="data/payer_rag")
+    payer_ingest_parser.add_argument("--manifest", default="")
+    payer_ingest_parser.add_argument("--offline", action="store_true")
+    payer_ingest_parser.add_argument("--max-services-per-source", type=int, default=18)
+    payer_ingest_parser.add_argument(
+        "--service-keywords",
+        default="mri,ct,colonoscopy,emergency,ultrasound,x-ray,office visit,endoscopy,heart,transplant",
+    )
+    payer_ingest_parser.set_defaults(func=payer_ingest)
+
+    payer_analyze_parser = sub.add_parser("payer-analyze", help="Analyze outliers in normalized payer pricing data")
+    payer_analyze_parser.add_argument("--workspace", default="data/payer_rag")
+    payer_analyze_parser.add_argument("--outlier-threshold", type=float, default=0.2)
+    payer_analyze_parser.add_argument("--min-peer-count", type=int, default=3)
+    payer_analyze_parser.set_defaults(func=payer_analyze)
+
+    payer_build_index_parser = sub.add_parser("payer-build-index", help="Build the local payer RAG index")
+    payer_build_index_parser.add_argument("--workspace", default="data/payer_rag")
+    payer_build_index_parser.set_defaults(func=payer_build_index)
+
+    payer_export_parser = sub.add_parser("payer-export", help="Export stakeholder artifacts for payer pricing review")
+    payer_export_parser.add_argument("--workspace", default="data/payer_rag")
+    payer_export_parser.add_argument("--outlier-threshold", type=float, default=0.2)
+    payer_export_parser.set_defaults(func=payer_export)
+
+    payer_ask_parser = sub.add_parser("payer-ask", help="Ask a question against the payer RAG workspace")
+    payer_ask_parser.add_argument("--workspace", default="data/payer_rag")
+    payer_ask_parser.add_argument("--question", required=True)
+    payer_ask_parser.set_defaults(func=payer_ask)
+
+    payer_build_parser = sub.add_parser("payer-build", help="Run the end-to-end Durham payer build")
+    payer_build_parser.add_argument("--workspace", default="data/payer_rag")
+    payer_build_parser.add_argument("--manifest", default="")
+    payer_build_parser.add_argument("--offline", action="store_true")
+    payer_build_parser.add_argument("--max-services-per-source", type=int, default=18)
+    payer_build_parser.add_argument(
+        "--service-keywords",
+        default="mri,ct,colonoscopy,emergency,ultrasound,x-ray,office visit,endoscopy,heart,transplant",
+    )
+    payer_build_parser.add_argument("--outlier-threshold", type=float, default=0.2)
+    payer_build_parser.add_argument("--min-peer-count", type=int, default=3)
+    payer_build_parser.set_defaults(func=payer_build)
+
+    payer_manifest_parser = sub.add_parser("payer-init-manifest", help="Write the default Durham payer source manifest")
+    payer_manifest_parser.add_argument("--path", default="data/payer_rag/source_manifest.json")
+    payer_manifest_parser.set_defaults(func=payer_init_manifest)
+
+    workbench_parser = sub.add_parser("workbench-create", help="Create a fresh deep-work code workspace")
+    workbench_parser.add_argument("--instruction", required=True)
+    workbench_parser.add_argument("--workspace-root", default="data/deep_work_runs")
+    workbench_parser.add_argument("--no-open-vscode", action="store_true")
+    workbench_parser.set_defaults(func=workbench_create)
 
     args = parser.parse_args()
     args.func(args)

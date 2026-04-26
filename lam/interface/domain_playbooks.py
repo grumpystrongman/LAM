@@ -36,6 +36,22 @@ _PLAYBOOKS: Dict[str, Dict[str, Any]] = {
         "fallback_tree": ["query_refine", "source_breadth", "content_validation"],
         "disallowed_first_moves": ["generic_guessing"],
     },
+    "payer_pricing_review": {
+        "id": "payer-pricing-review-v1",
+        "name": "Payer Pricing Review Playbook",
+        "primary_tool_family": "payer_rag",
+        "inspect_first": ["public_source_scope", "durham_coverage", "artifact_requirements"],
+        "fallback_tree": ["provider_source_expansion", "shoppable_service_catalog", "offline_fixture_fallback"],
+        "disallowed_first_moves": ["unsupported_fairness_claim"],
+    },
+    "code_workbench": {
+        "id": "code-workbench-v1",
+        "name": "Code Workbench Playbook",
+        "primary_tool_family": "local_workspace",
+        "inspect_first": ["task_scope", "workspace_freshness", "tooling_targets"],
+        "fallback_tree": ["fresh_workspace", "editor_launch_fallback", "scaffold_then_smoke_test"],
+        "disallowed_first_moves": ["reuse_unrelated_workspace"],
+    },
     "web_research": {
         "id": "web-research-v1",
         "name": "Web Research Playbook",
@@ -75,6 +91,8 @@ _ALLOWED_STEP_KINDS: Dict[str, List[str]] = {
     "job_market": ["research", "extract", "analyze", "produce", "present"],
     "competitor_analysis": ["research", "extract", "analyze", "produce", "present"],
     "study_pack": ["research", "extract", "analyze", "produce", "present"],
+    "payer_pricing_review": ["research", "extract", "analyze", "produce", "present"],
+    "code_workbench": ["research", "extract", "analyze", "produce", "present"],
     "web_research": ["research", "extract", "analyze", "produce", "present"],
 }
 
@@ -83,6 +101,8 @@ _FIRST_STEP_KIND: Dict[str, List[str]] = {
     "job_market": ["research"],
     "competitor_analysis": ["research"],
     "study_pack": ["research"],
+    "payer_pricing_review": ["research"],
+    "code_workbench": ["research"],
     "web_research": ["research"],
 }
 
@@ -106,6 +126,18 @@ _TRANSITIONS: Dict[str, List[tuple[str, str]]] = {
         ("produce", "present"),
     ],
     "study_pack": [
+        ("research", "extract"),
+        ("extract", "analyze"),
+        ("analyze", "produce"),
+        ("produce", "present"),
+    ],
+    "payer_pricing_review": [
+        ("research", "extract"),
+        ("extract", "analyze"),
+        ("analyze", "produce"),
+        ("produce", "present"),
+    ],
+    "code_workbench": [
         ("research", "extract"),
         ("extract", "analyze"),
         ("analyze", "produce"),
@@ -140,6 +172,15 @@ _STEP_OBLIGATIONS: Dict[str, Dict[str, Dict[str, Any]]] = {
     "study_pack": {
         "research": {"required_results_min": 1},
         "produce": {"required_artifacts_min": 1},
+        "present": {"required_opened_url_or_artifact": True},
+    },
+    "payer_pricing_review": {
+        "research": {"required_results_min": 1},
+        "produce": {"required_artifacts_min": 4},
+        "present": {"required_opened_url_or_artifact": True},
+    },
+    "code_workbench": {
+        "produce": {"required_artifacts_min": 4},
         "present": {"required_opened_url_or_artifact": True},
     },
     "web_research": {

@@ -1,6 +1,7 @@
 import unittest
 import tempfile
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -461,6 +462,50 @@ class TestSearchAgent(unittest.TestCase):
         self.assertGreaterEqual(len(rows), 2)
         self.assertEqual(rows[0]["candidate"], "LG 27UP650-W")
 
+    def test_candidate_buy_url_variants_include_wacaco_store_page(self) -> None:
+        variants = search_agent_mod._candidate_buy_url_variants(
+            candidate="Wacaco Picopresso",
+            instruction="Go research the best portable espresso maker for travel and recommend which one to buy.",
+            query="the best portable espresso maker for travel",
+        )
+        self.assertIn("https://www.wacaco.com/products/picopresso", variants)
+
+    @patch("lam.interface.search_agent._probe_candidate_url")
+    def test_resolve_product_candidate_buy_url_prefers_official_wacaco_store(self, mock_probe) -> None:
+        def _fake_probe(url: str) -> str:
+            if url == "https://www.wacaco.com/products/picopresso":
+                return url
+            return ""
+
+        mock_probe.side_effect = _fake_probe
+        resolved = search_agent_mod._resolve_product_candidate_buy_url(
+            candidate="Wacaco Picopresso",
+            instruction="Go research the best portable espresso maker for travel and recommend which one to buy.",
+            query="the best portable espresso maker for travel",
+            current_url="https://homecoffeeexpert.com/best-portable-espresso-machine/",
+        )
+        self.assertEqual(resolved, "https://www.wacaco.com/products/picopresso")
+
+    @patch("lam.interface.search_agent._resolve_product_candidate_buy_url")
+    def test_build_recommendation_summary_resolves_buy_url_for_product_candidate(self, mock_resolve) -> None:
+        mock_resolve.return_value = "https://www.wacaco.com/products/picopresso"
+        recommendation = search_agent_mod._build_recommendation_summary(
+            decision_rows=[
+                {
+                    "candidate": "Wacaco Picopresso",
+                    "candidate_type": "product_candidate",
+                    "url": "https://homecoffeeexpert.com/best-portable-espresso-machine/",
+                    "price": None,
+                    "score": 3.5,
+                    "rationale": "Repeatedly surfaced across reviewed source pages.",
+                }
+            ],
+            results=[],
+            instruction="Go research the best portable espresso maker for travel and recommend which one to buy.",
+            query="the best portable espresso maker for travel",
+        )
+        self.assertEqual(recommendation.get("selected_url"), "https://www.wacaco.com/products/picopresso")
+
     def test_quality_gate_filters_generic_best_junk_results(self) -> None:
         ranked = [
             search_agent_mod.SearchResult(
@@ -620,6 +665,24 @@ class TestSearchAgent(unittest.TestCase):
         self.assertIn("report", plan.get("deliverables", []))
         self.assertIn("dashboard", plan.get("deliverables", []))
 
+    def test_build_native_plan_for_payer_review_includes_rag_and_spreadsheet_outputs(self) -> None:
+        plan = search_agent_mod._build_native_plan(
+            "Review Durham, NC payer pricing, build a vector store or RAG index, create the stakeholder workbook, and identify which plans need outreach."
+        )
+        self.assertEqual(plan.get("domain"), "payer_pricing_review")
+        self.assertIn("spreadsheet", plan.get("deliverables", []))
+        self.assertIn("dashboard", plan.get("deliverables", []))
+        self.assertIn("rag_index", plan.get("deliverables", []))
+
+    def test_build_native_plan_for_code_workbench_includes_workspace_and_code_outputs(self) -> None:
+        plan = search_agent_mod._build_native_plan(
+            "Create a new VS Code workspace, write analysis code, and leave me a runnable scaffold."
+        )
+        self.assertEqual(plan.get("domain"), "code_workbench")
+        self.assertIn("code", plan.get("deliverables", []))
+        self.assertIn("workspace", plan.get("deliverables", []))
+        self.assertTrue(plan.get("playbook_validation", {}).get("ok"))
+
     @patch("lam.interface.search_agent._execute_native_plan")
     def test_recommendation_research_routes_into_native_plan(self, mock_exec_native) -> None:
         mock_exec_native.return_value = {
@@ -643,6 +706,193 @@ class TestSearchAgent(unittest.TestCase):
         self.assertTrue(mock_exec_native.called)
         plan_arg = mock_exec_native.call_args.kwargs.get("plan", {})
         self.assertIn("spreadsheet", plan_arg.get("deliverables", []))
+
+    @patch("lam.interface.search_agent._execute_native_plan")
+    def test_payer_review_routes_into_native_plan(self, mock_exec_native) -> None:
+        mock_exec_native.return_value = {
+            "ok": True,
+            "mode": "autonomous_plan_execute",
+            "query": "durham payer pricing",
+            "results_count": 8,
+            "results": [],
+            "artifacts": {
+                "workbook_xlsx": "C:\\temp\\durham_nc_payer_outreach_candidates.xlsx",
+                "dashboard_html": "C:\\temp\\payer_dashboard.html",
+                "summary_report_md": "C:\\temp\\summary_report.md",
+                "validation_queue_csv": "C:\\temp\\contract_validation_queue.csv",
+                "rag_index_db": "C:\\temp\\payer_rag.db",
+            },
+            "summary": {},
+            "source_status": {"payer_rag": "ok"},
+            "opened_url": "file:///C:/temp/payer_dashboard.html",
+            "canvas": {"title": "Durham Payer Review Ready", "subtitle": "8 outreach candidates", "cards": []},
+        }
+        result = execute_instruction(
+            "Review Durham, NC payer pricing, build a vector store or RAG index, create the stakeholder workbook, and identify which plans need outreach.",
+            control_granted=True,
+        )
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(result.get("mode"), "autonomous_plan_execute")
+        self.assertTrue(mock_exec_native.called)
+        plan_arg = mock_exec_native.call_args.kwargs.get("plan", {})
+        self.assertEqual(plan_arg.get("domain"), "payer_pricing_review")
+
+    @patch("lam.interface.search_agent._execute_native_plan")
+    def test_code_workbench_routes_into_native_plan(self, mock_exec_native) -> None:
+        mock_exec_native.return_value = {
+            "ok": True,
+            "mode": "autonomous_plan_execute",
+            "query": "code workbench",
+            "results_count": 1,
+            "results": [],
+            "artifacts": {
+                "workspace_directory": "C:\\temp\\deep_work",
+                "analysis_script_py": "C:\\temp\\deep_work\\src\\analysis.py",
+                "workspace_readme_md": "C:\\temp\\deep_work\\README.md",
+                "smoke_log": "C:\\temp\\deep_work\\artifacts\\smoke.log",
+            },
+            "summary": {},
+            "source_status": {"deep_workbench": "ok"},
+            "opened_url": "C:\\temp\\deep_work\\README.md",
+            "canvas": {"title": "Code Workbench Ready", "subtitle": "scaffold", "cards": []},
+        }
+        result = execute_instruction(
+            "Create a new VS Code instance, write code to analyze this task, and leave me a runnable scaffold.",
+            control_granted=True,
+        )
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(result.get("mode"), "autonomous_plan_execute")
+        plan_arg = mock_exec_native.call_args.kwargs.get("plan", {})
+        self.assertEqual(plan_arg.get("domain"), "code_workbench")
+
+    @patch("lam.interface.search_agent.subprocess.run")
+    @patch("lam.interface.search_agent.build_code_workbench_workspace")
+    def test_run_code_workbench_creates_workspace_result(self, mock_build_workspace, mock_run) -> None:
+        temp_root = Path("data") / "test_artifacts"
+        temp_root.mkdir(parents=True, exist_ok=True)
+        workspace = temp_root / "search_agent_code_workbench_case"
+        shutil.rmtree(workspace, ignore_errors=True)
+        workspace.mkdir(parents=True, exist_ok=True)
+        try:
+            readme = workspace / "README.md"
+            readme.write_text("# workspace", encoding="utf-8")
+            smoke = workspace / "artifacts" / "smoke_test.log"
+            smoke.parent.mkdir(parents=True, exist_ok=True)
+            smoke.write_text("", encoding="utf-8")
+            (workspace / "artifacts" / "analysis_summary.json").write_text("{}", encoding="utf-8")
+            mock_build_workspace.return_value = {
+                "workspace": str(workspace),
+                "artifact_paths": {
+                    "workspace_directory": str(workspace),
+                    "analysis_script_py": str(workspace / "src" / "analysis.py"),
+                    "workspace_readme_md": str(readme),
+                    "smoke_log": str(smoke),
+                    "primary_open_file": str(readme),
+                },
+                "vscode_launch": {"ok": True, "launched": "code", "mode": "new_window"},
+                "generation_timestamp": "2026-04-25T20:30:00",
+                "current_task_contract": {"title": "Deep Work Task"},
+            }
+            mock_run.return_value = unittest.mock.Mock(returncode=0, stdout="ok", stderr="")
+            out = search_agent_mod._run_code_workbench(
+                "Create a new VS Code workspace and write code to analyze the task."
+            )
+            self.assertTrue(out.get("ok"))
+            self.assertEqual(out.get("mode"), "code_workbench")
+            self.assertIn("analysis_summary_json", out.get("artifacts", {}))
+            self.assertTrue(out.get("summary", {}).get("smoke_test_passed"))
+        finally:
+            shutil.rmtree(workspace, ignore_errors=True)
+
+    @patch("lam.interface.search_agent.ask_workspace_question")
+    @patch("lam.interface.search_agent.ensure_workspace")
+    def test_run_payer_pricing_review_question_with_explicit_geography_forces_fresh_run(self, mock_ensure, mock_ask) -> None:
+        mock_ensure.return_value = {
+            "workspace": "C:\\temp\\payer",
+            "artifact_paths": {
+                "dashboard_html": "C:\\temp\\durham_nc_payer_dashboard.html",
+                "primary_open_file": "C:\\temp\\durham_nc_payer_dashboard.html",
+                "workbook_xlsx": "C:\\temp\\durham_nc_payer_outreach_candidates.xlsx",
+                "summary_report_md": "C:\\temp\\durham_nc_summary_report.md",
+                "validation_queue_csv": "C:\\temp\\durham_nc_contract_validation_queue.csv",
+                "rag_index_db": "C:\\temp\\payer_rag.db",
+            },
+            "counts": {"outreach_candidates": 9},
+            "reused_existing_outputs": True,
+            "current_task_contract": {"geography": "Durham, NC"},
+            "invalidated_artifacts": ["fairfax_va_20260425_120000: geography mismatch (Fairfax, VA != Durham, NC)"],
+            "generation_timestamp": "2026-04-25T12:00:00",
+            "geography_validation": {"passed": True, "errors": []},
+        }
+        mock_ask.return_value = {
+            "answer": "1. United Healthcare / Commercial/EPO/PPO / MRI brain without contrast (14.2% above peer median)",
+            "sources": ["sample://duke | row_4"],
+        }
+        result = search_agent_mod._run_payer_pricing_review(
+            "Which plans need outreach in the Durham payer corpus?"
+        )
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(result.get("mode"), "payer_pricing_review")
+        self.assertEqual(result.get("results_count"), 1)
+        self.assertIn("validation_queue_csv", result.get("artifacts", {}))
+        self.assertTrue(result.get("summary", {}).get("invalidated_artifacts"))
+        self.assertFalse(mock_ensure.call_args.kwargs.get("allow_reuse"))
+
+    @patch("lam.interface.search_agent.ensure_workspace")
+    def test_run_payer_pricing_review_build_prompt_forces_fresh_rebuild(self, mock_ensure) -> None:
+        mock_ensure.return_value = {
+            "workspace": "C:\\temp\\fairfax_va_20260425_120000",
+            "artifact_paths": {
+                "dashboard_html": "C:\\temp\\fairfax_va_payer_dashboard.html",
+                "primary_open_file": "C:\\temp\\fairfax_va_payer_dashboard.html",
+                "workbook_xlsx": "C:\\temp\\fairfax_va_payer_outreach_candidates.xlsx",
+                "summary_report_md": "C:\\temp\\fairfax_va_summary_report.md",
+                "validation_queue_csv": "C:\\temp\\fairfax_va_contract_validation_queue.csv",
+                "rag_index_db": "C:\\temp\\payer_rag.db",
+            },
+            "counts": {"outreach_candidates": 5},
+            "reused_existing_outputs": False,
+            "current_task_contract": {"geography": "Fairfax, VA"},
+            "invalidated_artifacts": ["durham_nc_20260425_100000: geography mismatch (Durham, NC != Fairfax, VA)"],
+            "generation_timestamp": "2026-04-25T12:00:00",
+            "geography_validation": {"passed": True, "errors": []},
+            "top_candidates": [],
+            "issues": [],
+        }
+        result = search_agent_mod._run_payer_pricing_review(
+            "Build a payer pricing package for Fairfax, VA with a RAG index and stakeholder workbook."
+        )
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(result.get("canvas", {}).get("title"), "Fairfax, VA Payer Review Ready")
+        self.assertFalse(result.get("summary", {}).get("reused_existing_outputs"))
+        self.assertTrue(mock_ensure.call_args.kwargs.get("allow_reuse") is False)
+
+    @patch("lam.interface.search_agent.ensure_workspace")
+    def test_run_payer_pricing_review_blocks_wrong_geography_artifacts(self, mock_ensure) -> None:
+        mock_ensure.return_value = {
+            "workspace": "C:\\temp\\fairfax_va_20260425_120000",
+            "artifact_paths": {
+                "dashboard_html": "C:\\temp\\fairfax_va_payer_dashboard.html",
+                "primary_open_file": "C:\\temp\\fairfax_va_payer_dashboard.html",
+                "workbook_xlsx": "C:\\temp\\fairfax_va_payer_outreach_candidates.xlsx",
+                "summary_report_md": "C:\\temp\\fairfax_va_summary_report.md",
+                "validation_queue_csv": "C:\\temp\\fairfax_va_contract_validation_queue.csv",
+                "rag_index_db": "C:\\temp\\payer_rag.db",
+            },
+            "counts": {"outreach_candidates": 5},
+            "reused_existing_outputs": False,
+            "current_task_contract": {"geography": "Fairfax, VA"},
+            "invalidated_artifacts": ["durham_nc_20260425_100000: geography mismatch (Durham, NC != Fairfax, VA)"],
+            "generation_timestamp": "2026-04-25T12:00:00",
+            "geography_validation": {"passed": False, "errors": ["stale geography token 'durham' found in fairfax_va_summary_report.md"]},
+            "top_candidates": [],
+            "issues": [],
+        }
+        result = search_agent_mod._run_payer_pricing_review(
+            "Build a payer pricing package for Fairfax, VA with a RAG index and stakeholder workbook."
+        )
+        self.assertFalse(result.get("ok"))
+        self.assertEqual(result.get("error_code"), "geography_consistency_failed")
 
     @patch("lam.interface.search_agent._search_web")
     @patch("lam.interface.search_agent._write_generic_research_artifacts")

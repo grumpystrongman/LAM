@@ -5,6 +5,12 @@ from lam.interface import web_ui
 
 
 class TestWebUiFreshnessPolicy(unittest.TestCase):
+    def test_infer_instruction_domain_detects_code_workbench(self) -> None:
+        domain = web_ui._infer_instruction_domain(
+            "Create a new VS Code workspace, write analysis code, and leave me a runnable scaffold."
+        )
+        self.assertEqual(domain, "code_workbench")
+
     def test_resolve_domain_defaults_applies_policy(self) -> None:
         with patch(
             "lam.interface.web_ui._load_policy_freshness_defaults",

@@ -21,6 +21,7 @@ It combines governance controls, deterministic execution, teach mode recording, 
 - `open chatgpt app then click New chat then type "Daily summary" then press enter`
 - `search Amazon for best price on Abu Garcia Voltiq baitcasting reel`
 - `Search Indeed, LinkedIn, and other commercially available job sites for Data and AI roles in US and Ireland, then build a spreadsheet, report, and dashboard with links`
+- `Create a new VS Code workspace for this task, write analysis code, add smoke tests, and leave me a runnable scaffold`
 - `open linkedin app then login with linkedin`
 
 ## Commercial Feature Set (Current)
@@ -33,6 +34,7 @@ It combines governance controls, deterministic execution, teach mode recording, 
 - Schedule/trigger engine (interval, daily, event)
 - Chat-style history recall with persistent local history
 - Research artifact generation (CSV + Markdown + interactive HTML dashboard)
+- Code workbench generation from chat with fresh workspaces, VS Code launch, scaffolded analysis code, and smoke tests
 - Multi-backend AI mode selector in UI
 - Local password vault (DPAPI-encrypted, no cloud sync)
 
@@ -78,6 +80,50 @@ python -m lam.main serve-ui --host 127.0.0.1 --port 8795
 ```
 
 Open: `http://127.0.0.1:8795`
+
+## Code Workbench
+
+OpenLAMb can now create a fresh coding workspace directly from chat for deep analysis or build tasks.
+
+Example UI prompt:
+
+```text
+Create a new VS Code workspace for this task, write analysis code, add smoke tests, and leave me a runnable scaffold.
+```
+
+CLI smoke path:
+
+```powershell
+python -m lam.main workbench-create --instruction "Create a new VS Code workspace, write analysis code, and leave me a runnable scaffold."
+```
+
+The generated workspace includes:
+- `task_contract.json`
+- `notes/task_brief.md`
+- `notes/analysis_plan.md`
+- `src/analysis.py`
+- `tests/test_smoke.py`
+- `.vscode/tasks.json`
+- `artifacts/smoke_test.log`
+
+## Durham Payer RAG
+
+OpenLAMb also includes a Durham, NC payer-plan pricing review workflow built on public provider transparency files and payer reference pages.
+
+You can run it from chat in the UI with a prompt like:
+
+```text
+Review Durham, NC payer pricing, build a RAG index, create the stakeholder workbook, and show me which plans need outreach.
+```
+
+Each payer run now creates a geography-specific run folder under `data/payer_rag_runs/` and blocks completion if the final artifacts do not match the requested market.
+
+```powershell
+python -m lam.main payer-build --workspace data/payer_rag_live
+python -m lam.main payer-ask --workspace data/payer_rag_live --question "Which plans need outreach?"
+```
+
+See [docs/PAYER_RAG.md](/C:/Users/grump/LAM/docs/PAYER_RAG.md) for commands, outputs, and data caveats.
 
 ## Usability Walkthrough
 
