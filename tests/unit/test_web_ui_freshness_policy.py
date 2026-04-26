@@ -11,6 +11,18 @@ class TestWebUiFreshnessPolicy(unittest.TestCase):
         )
         self.assertEqual(domain, "code_workbench")
 
+    def test_infer_instruction_domain_detects_deep_analysis_without_vscode(self) -> None:
+        domain = web_ui._infer_instruction_domain(
+            "Research public hospital pricing data, build a RAG model, write and test the code, fix failures, and package the result for stakeholders."
+        )
+        self.assertEqual(domain, "code_workbench")
+
+    def test_infer_instruction_domain_keeps_payer_precedence(self) -> None:
+        domain = web_ui._infer_instruction_domain(
+            "Review Durham, NC payer pricing, build a vector store, write and test the code, and create the stakeholder workbook."
+        )
+        self.assertEqual(domain, "payer_pricing_review")
+
     def test_resolve_domain_defaults_applies_policy(self) -> None:
         with patch(
             "lam.interface.web_ui._load_policy_freshness_defaults",

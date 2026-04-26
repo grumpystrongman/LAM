@@ -11,6 +11,15 @@ from lam.interface.search_agent import EmailActionItem, execute_instruction, pre
 
 
 class TestSearchAgent(unittest.TestCase):
+    def _case_dir(self, name: str) -> Path:
+        root = Path("data") / "test_artifacts" / "search_agent"
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / name
+        shutil.rmtree(path, ignore_errors=True)
+        path.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(path, ignore_errors=True))
+        return path
+
     def test_resolve_navigation_target_reuses_session_tab(self) -> None:
         with patch("lam.interface.search_agent.SessionManager") as mock_mgr, patch("lam.interface.search_agent.webbrowser.open") as mock_open:
             inst = mock_mgr.return_value
@@ -50,56 +59,53 @@ class TestSearchAgent(unittest.TestCase):
             mock_open.assert_not_called()
 
     def test_artifact_reuse_index_roundtrip(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            base = Path(td)
-            doc = base / "document.md"
-            doc.write_text("# test", encoding="utf-8")
-            with patch("lam.interface.search_agent._artifact_reuse_index_path", return_value=base / "artifact_reuse_index.json"):
-                search_agent_mod._remember_artifacts_for_reuse(
-                    kind="artifact_generation",
-                    instruction="Create report",
-                    artifacts={"document_md": str(doc.resolve())},
-                )
-                reused = search_agent_mod._find_reusable_artifacts(
-                    kind="artifact_generation",
-                    instruction="Create report",
-                    required_keys=["document_md"],
-                    max_age_hours=24,
-                )
-                self.assertIn("document_md", reused)
+        base = self._case_dir("artifact_reuse_index_roundtrip")
+        doc = base / "document.md"
+        doc.write_text("# test", encoding="utf-8")
+        with patch("lam.interface.search_agent._artifact_reuse_index_path", return_value=base / "artifact_reuse_index.json"):
+            search_agent_mod._remember_artifacts_for_reuse(
+                kind="artifact_generation",
+                instruction="Create report",
+                artifacts={"document_md": str(doc.resolve())},
+            )
+            reused = search_agent_mod._find_reusable_artifacts(
+                kind="artifact_generation",
+                instruction="Create report",
+                required_keys=["document_md"],
+                max_age_hours=24,
+            )
+            self.assertIn("document_md", reused)
 
     @patch("lam.interface.search_agent._open_target_with_reuse")
     @patch("lam.interface.search_agent._find_reusable_artifacts")
     def test_run_artifact_generation_reuses_existing_outputs(self, mock_reuse, mock_open_target) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            doc = Path(td) / "document.md"
-            doc.write_text("# existing", encoding="utf-8")
-            mock_reuse.return_value = {"document_md": str(doc.resolve())}
-            mock_open_target.return_value = (doc.resolve().as_uri(), {"decision": {"score": 75, "reasons": ["shortest_path_reuse_existing_state"]}})
-            out = search_agent_mod._run_artifact_generation(
-                plan={"deliverables": ["document"], "objective": "Create report"},
-                instruction="Create report",
-            )
-            self.assertTrue(out.get("ok"))
-            self.assertTrue(out.get("summary", {}).get("reused_existing_outputs"))
-            self.assertIn("document_md", out.get("artifacts", {}))
+        doc = self._case_dir("artifact_generation_reuse") / "document.md"
+        doc.write_text("# existing", encoding="utf-8")
+        mock_reuse.return_value = {"document_md": str(doc.resolve())}
+        mock_open_target.return_value = (doc.resolve().as_uri(), {"decision": {"score": 75, "reasons": ["shortest_path_reuse_existing_state"]}})
+        out = search_agent_mod._run_artifact_generation(
+            plan={"deliverables": ["document"], "objective": "Create report"},
+            instruction="Create report",
+        )
+        self.assertTrue(out.get("ok"))
+        self.assertTrue(out.get("summary", {}).get("reused_existing_outputs"))
+        self.assertIn("document_md", out.get("artifacts", {}))
 
     @patch("lam.interface.search_agent._open_target_with_reuse")
     @patch("lam.interface.search_agent._find_reusable_artifacts")
     def test_run_artifact_generation_always_regenerate_ignores_reuse(self, mock_reuse, mock_open_target) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            doc = Path(td) / "document.md"
-            doc.write_text("# existing", encoding="utf-8")
-            mock_reuse.return_value = {"document_md": str(doc.resolve())}
-            mock_open_target.return_value = (doc.resolve().as_uri(), {"decision": {"score": 90, "reasons": ["ok"]}})
-            out = search_agent_mod._run_artifact_generation(
-                plan={"deliverables": ["document"], "objective": "Create report"},
-                instruction="Create report",
-                artifact_reuse_mode="always_regenerate",
-            )
-            self.assertTrue(out.get("ok"))
-            self.assertFalse(out.get("summary", {}).get("reused_existing_outputs"))
-            self.assertEqual(out.get("summary", {}).get("artifact_reuse_mode"), "always_regenerate")
+        doc = self._case_dir("artifact_generation_regenerate") / "document.md"
+        doc.write_text("# existing", encoding="utf-8")
+        mock_reuse.return_value = {"document_md": str(doc.resolve())}
+        mock_open_target.return_value = (doc.resolve().as_uri(), {"decision": {"score": 90, "reasons": ["ok"]}})
+        out = search_agent_mod._run_artifact_generation(
+            plan={"deliverables": ["document"], "objective": "Create report"},
+            instruction="Create report",
+            artifact_reuse_mode="always_regenerate",
+        )
+        self.assertTrue(out.get("ok"))
+        self.assertFalse(out.get("summary", {}).get("reused_existing_outputs"))
+        self.assertEqual(out.get("summary", {}).get("artifact_reuse_mode"), "always_regenerate")
 
     def test_world_route_step_gate_locks_email_domain(self) -> None:
         allow, reason, _cost = search_agent_mod._world_route_step_gate(
@@ -683,6 +689,19 @@ class TestSearchAgent(unittest.TestCase):
         self.assertIn("workspace", plan.get("deliverables", []))
         self.assertTrue(plan.get("playbook_validation", {}).get("ok"))
 
+    def test_build_native_plan_auto_routes_deep_analysis_prompt_into_code_workbench(self) -> None:
+        plan = search_agent_mod._build_native_plan(
+            "Research public hospital pricing data, build a RAG model, write and test the code, fix failures, and package the result for stakeholders."
+        )
+        self.assertEqual(plan.get("domain"), "code_workbench")
+        self.assertIn("code", plan.get("deliverables", []))
+
+    def test_build_native_plan_keeps_payer_review_precedence_over_code_workbench(self) -> None:
+        plan = search_agent_mod._build_native_plan(
+            "Review Durham, NC payer pricing, build a vector store or RAG index, write and test the code, create the stakeholder workbook, and identify which plans need outreach."
+        )
+        self.assertEqual(plan.get("domain"), "payer_pricing_review")
+
     @patch("lam.interface.search_agent._execute_native_plan")
     def test_recommendation_research_routes_into_native_plan(self, mock_exec_native) -> None:
         mock_exec_native.return_value = {
@@ -762,6 +781,33 @@ class TestSearchAgent(unittest.TestCase):
         )
         self.assertTrue(result.get("ok"))
         self.assertEqual(result.get("mode"), "autonomous_plan_execute")
+        plan_arg = mock_exec_native.call_args.kwargs.get("plan", {})
+        self.assertEqual(plan_arg.get("domain"), "code_workbench")
+
+    @patch("lam.interface.search_agent._execute_native_plan")
+    def test_deep_analysis_prompt_routes_into_code_workbench_without_vscode_phrase(self, mock_exec_native) -> None:
+        mock_exec_native.return_value = {
+            "ok": True,
+            "mode": "autonomous_plan_execute",
+            "query": "deep analysis",
+            "results_count": 1,
+            "results": [],
+            "artifacts": {
+                "workspace_directory": "C:\\temp\\deep_work",
+                "analysis_script_py": "C:\\temp\\deep_work\\src\\analysis.py",
+                "workspace_readme_md": "C:\\temp\\deep_work\\README.md",
+                "smoke_log": "C:\\temp\\deep_work\\artifacts\\smoke.log",
+            },
+            "summary": {},
+            "source_status": {"deep_workbench": "ok"},
+            "opened_url": "C:\\temp\\deep_work\\README.md",
+            "canvas": {"title": "Code Workbench Ready", "subtitle": "scaffold", "cards": []},
+        }
+        result = execute_instruction(
+            "Research public hospital pricing data, build a RAG model, write and test the code, fix failures, and package the result for stakeholders.",
+            control_granted=True,
+        )
+        self.assertTrue(result.get("ok"))
         plan_arg = mock_exec_native.call_args.kwargs.get("plan", {})
         self.assertEqual(plan_arg.get("domain"), "code_workbench")
 
@@ -915,15 +961,14 @@ class TestSearchAgent(unittest.TestCase):
                 snippet="Local price and pickup in Durham.",
             ),
         ]
-        with tempfile.TemporaryDirectory() as td:
-            out_dir = Path(td)
-            html_path = out_dir / "dashboard.html"
-            html_path.write_text("<html></html>", encoding="utf-8")
-            mock_write.return_value = {"dashboard_html": str(html_path), "primary_open_file": str(html_path)}
-            out = search_agent_mod._run_generic_research(
-                "Research whiskey options and produce a report.",
-                progress_cb=None,
-            )
+        out_dir = self._case_dir("generic_research_judgment_summary")
+        html_path = out_dir / "dashboard.html"
+        html_path.write_text("<html></html>", encoding="utf-8")
+        mock_write.return_value = {"dashboard_html": str(html_path), "primary_open_file": str(html_path)}
+        out = search_agent_mod._run_generic_research(
+            "Research whiskey options and produce a report.",
+            progress_cb=None,
+        )
         self.assertTrue(out.get("ok"))
         self.assertIn("judgment", out.get("summary", {}))
 
@@ -1655,45 +1700,44 @@ class TestSearchAgent(unittest.TestCase):
 
     @patch("lam.interface.search_agent.webbrowser.open")
     def test_email_triage_without_session_id_enters_manual_auth_phase(self, mock_open) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            out_dir = root / "email_triage"
-            out_dir.mkdir(parents=True, exist_ok=True)
-            csv_path = out_dir / "task_list.csv"
-            md_path = out_dir / "summary.md"
-            html_path = out_dir / "dashboard.html"
-            csv_path.write_text("message_id,sender\n", encoding="utf-8")
-            md_path.write_text("# Inbox Triage Summary\n", encoding="utf-8")
-            html_path.write_text("<html></html>", encoding="utf-8")
+        root = self._case_dir("email_triage_manual_auth_phase")
+        out_dir = root / "email_triage"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = out_dir / "task_list.csv"
+        md_path = out_dir / "summary.md"
+        html_path = out_dir / "dashboard.html"
+        csv_path.write_text("message_id,sender\n", encoding="utf-8")
+        md_path.write_text("# Inbox Triage Summary\n", encoding="utf-8")
+        html_path.write_text("<html></html>", encoding="utf-8")
 
-            with patch(
-                "lam.interface.search_agent._write_email_triage_artifacts",
-                return_value={
-                    "directory": str(out_dir),
-                    "email_tasks_csv": str(csv_path),
-                    "summary_md": str(md_path),
-                    "email_triage_html": str(html_path),
-                    "primary_open_file": str(html_path),
-                },
-            ), patch(
-                "lam.interface.search_agent._start_email_auth_session",
-                return_value={"ok": True, "auth_session_id": "sid2"},
-            ), patch(
-                "lam.interface.search_agent.focus_auth_session",
-                return_value={"ok": True, "opened_url": "https://mail.google.com/"},
-            ):
-                result = execute_instruction(
-                    "Scan my inbox (cmajeff@gmail.com) for emails from the last 48 hours, identify anything requiring action, create a task list in a spreadsheet, and draft replies for each.",
-                    control_granted=True,
-                    manual_auth_phase=False,
-                    auth_session_id="",
-                )
-                self.assertFalse(result["ok"])
-                self.assertTrue(result.get("paused_for_credentials", False))
-                self.assertEqual(result.get("error_code"), "credential_missing")
-                self.assertEqual(result.get("source_status", {}).get("gmail_ui"), "manual_auth_phase")
-                self.assertEqual(result.get("auth_session_id"), "sid2")
-                self.assertGreaterEqual(mock_open.call_count, 0)
+        with patch(
+            "lam.interface.search_agent._write_email_triage_artifacts",
+            return_value={
+                "directory": str(out_dir),
+                "email_tasks_csv": str(csv_path),
+                "summary_md": str(md_path),
+                "email_triage_html": str(html_path),
+                "primary_open_file": str(html_path),
+            },
+        ), patch(
+            "lam.interface.search_agent._start_email_auth_session",
+            return_value={"ok": True, "auth_session_id": "sid2"},
+        ), patch(
+            "lam.interface.search_agent.focus_auth_session",
+            return_value={"ok": True, "opened_url": "https://mail.google.com/"},
+        ):
+            result = execute_instruction(
+                "Scan my inbox (cmajeff@gmail.com) for emails from the last 48 hours, identify anything requiring action, create a task list in a spreadsheet, and draft replies for each.",
+                control_granted=True,
+                manual_auth_phase=False,
+                auth_session_id="",
+            )
+            self.assertFalse(result["ok"])
+            self.assertTrue(result.get("paused_for_credentials", False))
+            self.assertEqual(result.get("error_code"), "credential_missing")
+            self.assertEqual(result.get("source_status", {}).get("gmail_ui"), "manual_auth_phase")
+            self.assertEqual(result.get("auth_session_id"), "sid2")
+            self.assertGreaterEqual(mock_open.call_count, 0)
 
     @patch("lam.interface.search_agent._run_email_triage_imap_fallback")
     @patch("lam.interface.search_agent._attach_or_launch_auth_context")

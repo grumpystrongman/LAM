@@ -51,6 +51,21 @@ from lam.interface.operator_contract import attach_operator_contract
 from lam.interface.password_vault import LocalPasswordVault
 from lam.interface.session_manager import SessionManager
 from lam.interface.world_model import build_run_world_model
+from lam.operator_platform import (
+    ArtifactFactory,
+    CapabilityPlanner,
+    CompletionCritic as PlatformCompletionCritic,
+    DataQualityCritic as PlatformDataQualityCritic,
+    HumanStyleReporter,
+    MemoryStore,
+    PresentationCritic as PlatformPresentationCritic,
+    SourceCritic as PlatformSourceCritic,
+    StoryCritic as PlatformStoryCritic,
+    TaskContractEngine,
+    UIUXCritic as PlatformUIUXCritic,
+    WorldModelBuilder,
+    default_capability_registry,
+)
 from lam.deep_workbench.workflow import (
     build_workspace as build_code_workbench_workspace,
     extract_workbench_contract,
@@ -139,6 +154,38 @@ CODE_WORKBENCH_TOKENS = {
     "analysis script",
     "workspace",
     "new codebase",
+}
+
+CODE_WORKBENCH_PIPELINE_TOKENS = {
+    "research",
+    "collect",
+    "source data",
+    "ingest",
+    "normalize",
+    "analy",
+    "build",
+    "write",
+    "test",
+    "fix",
+    "package",
+    "deliverable",
+    "submit the finished result",
+}
+
+CODE_WORKBENCH_DELIVERABLE_TOKENS = {
+    "code",
+    "script",
+    "app",
+    "cli",
+    "web app",
+    "analysis app",
+    "analysis script",
+    "rag",
+    "vector store",
+    "retriever",
+    "unit test",
+    "smoke test",
+    "stakeholder deliverable",
 }
 
 PAYER_PRICING_INTENT_TOKENS = {
@@ -1985,6 +2032,9 @@ def _finalize_operator_result(result: Dict[str, Any], instruction: str, plan_ste
     out["undo_plan"] = _build_undo_plan(plan_steps)
     plan = out.get("plan", {}) if isinstance(out.get("plan"), dict) else {}
     domain = str(plan.get("domain", out.get("mode", "general") or "general"))
+    task_contract = TaskContractEngine().extract(instruction)
+    registry = default_capability_registry()
+    execution_graph = CapabilityPlanner(registry=registry).plan(task_contract)
     playbook = select_playbook(domain=domain, instruction=instruction)
     out["playbook"] = playbook
     out["narration"] = _build_run_narration(out=out, playbook=playbook)
@@ -2012,12 +2062,110 @@ def _finalize_operator_result(result: Dict[str, Any], instruction: str, plan_ste
         playbook_graph_validation=plan.get("playbook_graph_validation", {}) if isinstance(plan.get("playbook_graph_validation"), dict) else {},
         playbook_step_obligations=plan.get("playbook_step_obligations", {}) if isinstance(plan.get("playbook_step_obligations"), dict) else {},
     )
+    out["task_contract"] = task_contract.to_dict()
+    out["capability_execution_graph"] = execution_graph.to_dict()
+    out["capability_registry"] = [spec.to_dict() for spec in registry.list()]
+    out["world_model"]["capability_context"] = WorldModelBuilder.from_run(
+        session_snapshot=dict(out["world_model"].get("environment", {}).get("session", {}) or {}),
+        artifacts=out.get("artifacts", {}) if isinstance(out.get("artifacts"), dict) else {},
+        task_contract=task_contract.to_dict(),
+        summary=summary,
+        opened_url=str(out.get("opened_url", "")),
+    ).to_dict()
     out["operator_contract"] = {
         "instruction": instruction,
         "model": "plan_validate_execute_verify_report",
         "least_privilege": True,
     }
-    return attach_operator_contract(instruction=instruction, result=out, plan_steps=plan_steps)
+    attached = attach_operator_contract(instruction=instruction, result=out, plan_steps=plan_steps)
+    task_id = str(attached.get("task_id", uuid.uuid4().hex))
+    artifact_factory = ArtifactFactory()
+    capabilities = [str(node.get("capability", "")) for node in execution_graph.to_dict().get("nodes", [])]
+    source_data = [
+        str(v)
+        for v in (attached.get("source_status", {}) or {}).values()
+        if isinstance(v, str) and v.strip()
+    ]
+    manifest_path = artifact_factory.write_manifest(
+        task_id=task_id,
+        task_contract=task_contract.to_dict(),
+        artifacts=attached.get("artifacts", {}) if isinstance(attached.get("artifacts"), dict) else {},
+        generated_by_capabilities=capabilities,
+        validation_status=str((attached.get("verification_report", {}) or {}).get("final_verification", "unknown")),
+        source_data=source_data,
+    )
+    artifacts = attached.get("artifacts", {}) if isinstance(attached.get("artifacts"), dict) else {}
+    artifacts["artifact_manifest_json"] = str(manifest_path.resolve())
+    attached["artifacts"] = artifacts
+    memory = MemoryStore()
+    invalidation_key = json.dumps(task_contract.invalidation_keys, sort_keys=True)
+    for key, value in artifacts.items():
+        if isinstance(value, str) and value.strip():
+            memory.remember_artifact(
+                task_id=task_id,
+                path=value,
+                domain=task_contract.domain,
+                geography=task_contract.geography,
+                invalidation_key=invalidation_key,
+                status="created",
+                metadata={"artifact_key": key, "task_contract": task_contract.to_dict()},
+            )
+    invalidated = summary.get("invalidated_artifacts", []) if isinstance(summary.get("invalidated_artifacts"), list) else []
+    for item in invalidated:
+        memory.remember_artifact(
+            task_id=task_id,
+            path=str(item),
+            domain=task_contract.domain,
+            geography=task_contract.geography,
+            invalidation_key=invalidation_key,
+            status="rejected",
+            metadata={"reason": "stale_or_invalidated", "task_contract": task_contract.to_dict()},
+        )
+    platform_story = {
+        "executive_summary": str((attached.get("report", {}) or {}).get("summary", "")),
+        "key_findings": [str(x) for x in ((attached.get("results", []) or [])[:3])],
+        "so_what": "Outputs are attached for review.",
+        "recommended_actions": list((attached.get("report", {}) or {}).get("next_actions", [])),
+        "caveats": list((attached.get("verification_report", {}) or {}).get("failed_checks", [])),
+    }
+    platform_critics = {
+        "source": PlatformSourceCritic().evaluate(
+            [{"url": str(r.get("url", "")), "source": str(r.get("source", ""))} for r in (attached.get("results", []) or [])[:8]]
+        ).to_dict(),
+        "data_quality": PlatformDataQualityCritic().evaluate(
+            int(attached.get("results_count", 0) or 0),
+            0.0 if int(attached.get("results_count", 0) or 0) else 1.0,
+        ).to_dict(),
+        "story": PlatformStoryCritic().evaluate(platform_story, task_contract.audience).to_dict(),
+        "uiux": PlatformUIUXCritic().evaluate(
+            {
+                "chat_workspace": True,
+                "canvas_panel": bool((attached.get("canvas", {}) or {}).get("title")),
+            }
+        ).to_dict(),
+        "presentation": PlatformPresentationCritic().evaluate(
+            {"slides": [{"title": "Summary"}, {"title": "Method"}, {"title": "Findings"}, {"title": "Actions"}, {"title": "Appendix"}]}
+        ).to_dict(),
+        "completion": PlatformCompletionCritic().evaluate(
+            task_contract.requested_outputs,
+            artifacts,
+            str((attached.get("verification_report", {}) or {}).get("final_verification", "")),
+        ).to_dict(),
+    }
+    attached["critics"]["platform"] = platform_critics
+    attached["human_report"] = HumanStyleReporter().build(
+        task_contract=task_contract.to_dict(),
+        execution_graph=execution_graph.to_dict(),
+        result=attached,
+    )
+    attached["platform"] = {
+        "task_contract_engine": task_contract.to_dict(),
+        "capability_execution_graph": execution_graph.to_dict(),
+        "artifact_manifest_json": str(manifest_path.resolve()),
+        "memory_invalidation_key": invalidation_key,
+        "architecture_version": "capability-foundation-v1",
+    }
+    return attached
 
 
 def _build_run_narration(out: Dict[str, Any], playbook: Dict[str, Any]) -> List[str]:
@@ -2651,13 +2799,27 @@ def _is_desktop_sequence_intent(instruction: str) -> bool:
 
 def _is_code_workbench_intent(instruction: str) -> bool:
     low = str(instruction or "").lower()
+    if _is_email_triage_intent(instruction):
+        return False
+    if _is_payer_pricing_review_intent(instruction):
+        return False
+    if _is_job_research_intent(instruction):
+        return False
+    if _is_competitor_analysis_intent(instruction):
+        return False
+    if _is_study_pack_intent(instruction):
+        return False
+
     has_tooling_signal = any(token in low for token in CODE_WORKBENCH_TOKENS)
     has_build_signal = any(token in low for token in ["analy", "research", "fulfill", "build", "create", "scaffold", "prototype"])
     has_editor_phrase = (
         any(token in low for token in ["vscode", "vs code", "visual studio code"])
         and any(token in low for token in ["write", "build", "open", "create", "launch"])
     )
-    return bool(has_editor_phrase or (has_tooling_signal and has_build_signal))
+    pipeline_hits = sum(1 for token in CODE_WORKBENCH_PIPELINE_TOKENS if token in low)
+    deliverable_hits = sum(1 for token in CODE_WORKBENCH_DELIVERABLE_TOKENS if token in low)
+    deep_build_prompt = pipeline_hits >= 3 and deliverable_hits >= 2
+    return bool(has_editor_phrase or (has_tooling_signal and has_build_signal) or deep_build_prompt)
 
 
 def _is_native_planning_intent(instruction: str) -> bool:
@@ -2798,8 +2960,6 @@ def _payer_service_keywords(instruction: str) -> List[str]:
 def _build_native_plan(instruction: str) -> Dict[str, Any]:
     if _is_email_triage_intent(instruction):
         domain = "email_triage"
-    elif _is_code_workbench_intent(instruction):
-        domain = "code_workbench"
     elif _is_payer_pricing_review_intent(instruction):
         domain = "payer_pricing_review"
     elif _is_study_pack_intent(instruction):
@@ -2808,6 +2968,8 @@ def _build_native_plan(instruction: str) -> Dict[str, Any]:
         domain = "job_market"
     elif _is_competitor_analysis_intent(instruction):
         domain = "competitor_analysis"
+    elif _is_code_workbench_intent(instruction):
+        domain = "code_workbench"
     else:
         domain = "web_research"
     deliverables: List[str] = []
@@ -5544,6 +5706,29 @@ def _run_generic_research(
                 constraints=constraints,
             )
 
+    if constraints.get("locality_required"):
+        local_hits = _count_locality_matches(ranked=ranked, locality_terms=constraints.get("locality_terms", []))
+        if local_hits <= 0:
+            return {
+                "ok": False,
+                "query": query,
+                "results_count": len(ranked),
+                "results": [asdict(x) for x in ranked[:10]],
+                "artifacts": {},
+                "summary": {
+                    "error": "locality_not_satisfied",
+                    "detail": "Request requires local relevance, but no strong locality-matching results were found.",
+                    "constraints": constraints,
+                    "elegance_budget": elegance.snapshot(),
+                },
+                "source_status": source_status,
+                "opened_url": "",
+                "canvas": {
+                    "title": "Research Blocked By Locality Gate",
+                    "subtitle": "Locality constraint was not satisfied by candidate results.",
+                    "cards": [],
+                },
+            }
     if constraints.get("compare_required") and len(ranked) < 2:
         return {
             "ok": False,
@@ -5621,29 +5806,6 @@ def _run_generic_research(
                 "cards": [{"title": "Low relevance", "price": str(round(top_score, 3)), "source": "validator", "url": ""}],
             },
         }
-    if constraints.get("locality_required"):
-        local_hits = _count_locality_matches(ranked=ranked, locality_terms=constraints.get("locality_terms", []))
-        if local_hits <= 0:
-            return {
-                "ok": False,
-                "query": query,
-                "results_count": len(ranked),
-                "results": [asdict(x) for x in ranked[:10]],
-                "artifacts": {},
-                "summary": {
-                    "error": "locality_not_satisfied",
-                    "detail": "Request requires local relevance, but no strong locality-matching results were found.",
-                    "constraints": constraints,
-                    "elegance_budget": elegance.snapshot(),
-                },
-                "source_status": source_status,
-                "opened_url": "",
-                "canvas": {
-                    "title": "Research Blocked By Locality Gate",
-                    "subtitle": "Locality constraint was not satisfied by candidate results.",
-                    "cards": [],
-                },
-            }
     # Persist negative memory for weak trailing results so future runs avoid them.
     for r in ranked[10:]:
         q = quality_critic.evaluate(
@@ -6568,11 +6730,12 @@ def _extract_generic_query(instruction: str) -> str:
         flags=re.IGNORECASE,
     )
     q = re.sub(
-        r"\b(?:build|create|make|save|write|draft|summari[sz]e|return)\b.*$",
+        r"\b(?:build|create|make|save|write|draft|summari[sz]e|return|produce|generate|prepare|package|export)\b.*$",
         "",
         q,
         flags=re.IGNORECASE,
     )
+    q = re.sub(r"\b(?:and|then)\s+(?:produce|generate|prepare|package|export)\b.*$", "", q, flags=re.IGNORECASE)
     q = re.sub(r"\b(from there|then|and then)\b.*$", "", q, flags=re.IGNORECASE)
     q = re.sub(r"\s+", " ", q).strip(" .,:;")
     return q or raw

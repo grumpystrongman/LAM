@@ -1,4 +1,4 @@
-import tempfile
+import shutil
 import time
 import unittest
 from pathlib import Path
@@ -8,6 +8,15 @@ from lam.interface import web_ui
 
 
 class TestWebUiHumanSuite(unittest.TestCase):
+    def _case_dir(self, name: str) -> Path:
+        root = Path("data") / "test_artifacts" / "web_ui_human_suite"
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / name
+        shutil.rmtree(path, ignore_errors=True)
+        path.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(path, ignore_errors=True))
+        return path
+
     def test_start_human_suite_task_stores_result(self) -> None:
         state = web_ui.UiState()
         fake_result = {
@@ -18,17 +27,17 @@ class TestWebUiHumanSuite(unittest.TestCase):
             "results": [],
             "report_path": "C:\\temp\\suite_result.json",
         }
-        with tempfile.TemporaryDirectory() as td:
-            with patch("lam.interface.web_ui.run_human_operator_20_suite", return_value=fake_result):
-                with patch("lam.interface.web_ui._history_path", return_value=Path(td) / "history.json"):
-                    task_id = web_ui._start_human_operator_20_suite_task(state)
-                    deadline = time.time() + 3
-                    while time.time() < deadline:
-                        with state.lock:
-                            task = dict(state.tasks.get(task_id, {}))
-                        if task.get("status") in {"done", "error"}:
-                            break
-                        time.sleep(0.05)
+        case_dir = self._case_dir("core20")
+        with patch("lam.interface.web_ui.run_human_operator_20_suite", return_value=fake_result):
+            with patch("lam.interface.web_ui._history_path", return_value=case_dir / "history.json"):
+                task_id = web_ui._start_human_operator_20_suite_task(state)
+                deadline = time.time() + 3
+                while time.time() < deadline:
+                    with state.lock:
+                        task = dict(state.tasks.get(task_id, {}))
+                    if task.get("status") in {"done", "error"}:
+                        break
+                    time.sleep(0.05)
 
         self.assertEqual(task.get("status"), "done")
         self.assertEqual(task.get("result", {}).get("mode"), "human_operator_20_test_suite")
@@ -46,17 +55,17 @@ class TestWebUiHumanSuite(unittest.TestCase):
             "results": [],
             "report_path": "C:\\temp\\killer_suite_result.json",
         }
-        with tempfile.TemporaryDirectory() as td:
-            with patch("lam.interface.web_ui.run_human_operator_killer_suite", return_value=fake_result):
-                with patch("lam.interface.web_ui._history_path", return_value=Path(td) / "history.json"):
-                    task_id = web_ui._start_human_operator_killer_suite_task(state)
-                    deadline = time.time() + 3
-                    while time.time() < deadline:
-                        with state.lock:
-                            task = dict(state.tasks.get(task_id, {}))
-                        if task.get("status") in {"done", "error"}:
-                            break
-                        time.sleep(0.05)
+        case_dir = self._case_dir("killer5")
+        with patch("lam.interface.web_ui.run_human_operator_killer_suite", return_value=fake_result):
+            with patch("lam.interface.web_ui._history_path", return_value=case_dir / "history.json"):
+                task_id = web_ui._start_human_operator_killer_suite_task(state)
+                deadline = time.time() + 3
+                while time.time() < deadline:
+                    with state.lock:
+                        task = dict(state.tasks.get(task_id, {}))
+                    if task.get("status") in {"done", "error"}:
+                        break
+                    time.sleep(0.05)
 
         self.assertEqual(task.get("status"), "done")
         self.assertEqual(task.get("result", {}).get("mode"), "human_operator_killer_5_suite")

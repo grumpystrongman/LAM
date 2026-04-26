@@ -176,7 +176,27 @@
       "prompt": "Integrate open doc, sheet, and browser source into a final executive brief.",
       "environment_setup": "Three active sources open",
       "required_outputs": ["final_brief"]
+    },
+    {
+      "scenario_id": "N1",
+      "scenario_name": "New Geography Must Invalidate Old Market",
+      "prompt": "Build a payer pricing package for Fairfax, VA and do not reuse stale Durham outputs.",
+      "environment_setup": "Older Durham artifacts exist in prior run folders",
+      "required_outputs": ["fairfax_spreadsheet", "geography_validation"]
+    },
+    {
+      "scenario_id": "N2",
+      "scenario_name": "Deep Analysis Capability Composition",
+      "prompt": "Research public data, run analysis, build a report, and prepare slides for stakeholders.",
+      "environment_setup": "No prior artifacts exist",
+      "required_outputs": ["analysis_report", "presentation_outline", "source_manifest"]
+    },
+    {
+      "scenario_id": "N3",
+      "scenario_name": "Commercial UI Build Acceptance",
+      "prompt": "Design and build a clean chat-first commercial assistant UI instead of a debug dashboard.",
+      "environment_setup": "Existing UI codebase available",
+      "required_outputs": ["ui_spec", "artifact_viewer", "canvas_layout"]
     }
   ]
 }
-

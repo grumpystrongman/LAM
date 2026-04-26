@@ -2693,7 +2693,46 @@ def _infer_instruction_domain(instruction: str) -> str:
     low = str(instruction or "").lower()
     if any(x in low for x in ["gmail", "inbox", "email", "draft replies"]):
         return "email_triage"
-    if any(x in low for x in ["vscode", "vs code", "visual studio code", "write code", "analysis script", "workspace scaffold"]):
+    if any(x in low for x in ["payer", "insurance", "health plan", "transparency in coverage"]):
+        return "payer_pricing_review"
+    if any(x in low for x in ["vscode", "vs code", "visual studio code"]):
+        return "code_workbench"
+    code_pipeline_hits = sum(
+        1
+        for x in [
+            "research",
+            "collect",
+            "source data",
+            "ingest",
+            "analy",
+            "build",
+            "write",
+            "test",
+            "fix",
+            "package",
+        ]
+        if x in low
+    )
+    code_deliverable_hits = sum(
+        1
+        for x in [
+            "vscode",
+            "vs code",
+            "visual studio code",
+            "write code",
+            "analysis script",
+            "workspace scaffold",
+            "rag",
+            "vector store",
+            "retriever",
+            "web app",
+            "analysis app",
+            "unit test",
+            "smoke test",
+        ]
+        if x in low
+    )
+    if code_deliverable_hits >= 1 and code_pipeline_hits >= 3:
         return "code_workbench"
     if any(x in low for x in ["job", "linkedin", "indeed", "salary"]):
         return "job_market"
