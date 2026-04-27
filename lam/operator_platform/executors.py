@@ -18,6 +18,8 @@ from .data_science import (
 )
 from .data_storytelling import build_story_package
 from .presentation_build import build_presentation_outline
+from .research_backend import relevance_score
+from .research_primitives import collect_generic_research
 from .ui_build import build_ui_delivery
 
 
@@ -204,6 +206,42 @@ class DeepResearchExecutor(BaseCapabilityExecutor):
         )
 
 
+class ResearchCollectionExecutor(BaseCapabilityExecutor):
+    name = "research_collection"
+    description = "Collect and rank generic research evidence, decision rows, and recommendation notes."
+    input_schema = ["task_contract"]
+    output_schema = ["query", "search_results", "research_notes", "sources", "source_status"]
+
+    def execute(self, context: Dict[str, Any], inputs: Dict[str, Any]) -> CapabilityExecutionResult:
+        contract = dict(inputs.get("task_contract", {}))
+        instruction = str(contract.get("user_goal", ""))
+        browser_worker_mode = str(context.get("browser_worker_mode", "local") or "local")
+        human_like_interaction = bool(context.get("human_like_interaction", False))
+        collected = collect_generic_research(
+            instruction=instruction,
+            browser_worker_mode=browser_worker_mode,
+            human_like_interaction=human_like_interaction,
+        )
+        if not collected.get("ok"):
+            raise ValueError(json.dumps({k: v for k, v in collected.items() if k not in {"evidence", "logs"}}))
+        return CapabilityExecutionResult(
+            outputs={
+                "query": collected.get("query", ""),
+                "search_results": list(collected.get("search_results", []) or []),
+                "decision_rows": list(collected.get("decision_rows", []) or []),
+                "recommendation": dict(collected.get("recommendation", {}) or {}),
+                "browser_notes": [dict(x) for x in (collected.get("browser_notes") or []) if isinstance(x, dict)],
+                "opened_url": str(collected.get("opened_url", "")),
+                "research_summary": dict(collected.get("research_summary", {}) or {}),
+                "research_notes": dict(collected.get("research_notes", {}) or {}),
+                "sources": list(collected.get("sources", []) or []),
+                "source_status": dict(collected.get("source_status", {}) or {}),
+            },
+            evidence=[str(x) for x in (collected.get("evidence") or [])],
+            logs=[str(x) for x in (collected.get("logs") or [])],
+        )
+
+
 class SourceEvaluationExecutor(BaseCapabilityExecutor):
     name = "source_evaluation"
     description = "Score and summarize source quality."
@@ -226,6 +264,115 @@ class SourceEvaluationExecutor(BaseCapabilityExecutor):
                 },
             },
             evidence=[f"evaluated {len(scores)} source reference(s)"],
+        )
+
+
+class CompetitorResearchExecutor(BaseCapabilityExecutor):
+    name = "competitor_research"
+    description = "Collect competitor evidence and build a ranked shortlist."
+    input_schema = ["task_contract"]
+    output_schema = ["research_notes", "structured_rows", "sources", "analysis_results"]
+
+    def execute(self, context: Dict[str, Any], inputs: Dict[str, Any]) -> CapabilityExecutionResult:
+        from lam.interface import search_agent as search_agent_mod
+
+        contract = dict(inputs.get("task_contract", {}))
+        instruction = str(contract.get("user_goal", ""))
+        min_live = search_agent_mod._effective_min_live_non_curated_citations(context.get("min_live_non_curated_citations"))  # type: ignore[attr-defined]
+        target = search_agent_mod._extract_competitor_target(instruction)  # type: ignore[attr-defined]
+        queries = search_agent_mod._competitor_queries(target)  # type: ignore[attr-defined]
+        must_terms = search_agent_mod._competitor_must_terms(target)  # type: ignore[attr-defined]
+        collected: List[Any] = []
+        for q in queries:
+            rows = search_agent_mod._search_web(q, limit=16)  # type: ignore[attr-defined]
+            filtered = search_agent_mod._filter_relevant_results(  # type: ignore[attr-defined]
+                rows,
+                must_terms=must_terms,
+                banned_domains={
+                    "filmaffinity.com",
+                    "dailymotion.com",
+                    "justwatch.com",
+                    "youtube.com",
+                    "m.youtube.com",
+                    "support.google.com",
+                    "mail.google.com",
+                    "gmail.com",
+                },
+                min_score=2.0,
+                preferred_domains=[],
+            )
+            collected.extend(filtered)
+        dedup = {row.url: row for row in collected}
+        ranked = sorted(dedup.values(), key=lambda x: relevance_score(x, " ".join(must_terms)), reverse=True)
+        if not ranked:
+            relaxed = []
+            for q in queries:
+                rows = search_agent_mod._search_web(q, limit=12)  # type: ignore[attr-defined]
+                relaxed.extend(
+                    search_agent_mod._filter_relevant_results(  # type: ignore[attr-defined]
+                        rows,
+                        must_terms=must_terms,
+                        banned_domains={
+                            "filmaffinity.com",
+                            "dailymotion.com",
+                            "justwatch.com",
+                            "youtube.com",
+                            "m.youtube.com",
+                        },
+                        min_score=1.0,
+                        preferred_domains=[],
+                    )
+                )
+            if not relaxed:
+                relaxed = search_agent_mod._curated_ehr_competitor_sources(target)  # type: ignore[attr-defined]
+            ranked = sorted({row.url: row for row in relaxed}.values(), key=lambda x: relevance_score(x, "ehr competitor healthcare"), reverse=True)
+        live_non_curated = search_agent_mod._count_live_non_curated_citations(ranked)  # type: ignore[attr-defined]
+        if live_non_curated < min_live:
+            raise ValueError(f"insufficient_live_non_curated_citations:{live_non_curated}:{min_live}")
+        competitors = search_agent_mod._select_top_competitors(target=target, results=ranked, top_n=5)  # type: ignore[attr-defined]
+        rows = [
+            {
+                "rank": idx,
+                "name": row.get("name", ""),
+                "segment": row.get("segment", ""),
+                "why": row.get("why", ""),
+                "citations": " | ".join(row.get("citations", [])[:3]),
+                "score": row.get("score", ""),
+            }
+            for idx, row in enumerate(competitors, start=1)
+        ]
+        notes = {
+            "objective": instruction,
+            "audience": contract.get("audience", "stakeholder"),
+            "domain": "competitor_analysis",
+            "summary": f"Prepared a competitor landscape brief for {target}.",
+            "findings": [f"{row.get('name','')} appears in the shortlist for {target}." for row in competitors[:5]],
+            "target": target,
+            "live_non_curated_citations": live_non_curated,
+            "required_live_non_curated_citations": min_live,
+        }
+        sources = [{"name": row.title, "url": row.url, "source_type": row.source, "snippet": row.snippet} for row in ranked[:20]]
+        analysis_results = {
+            "findings": [str(x) for x in notes["findings"]],
+            "recommended_actions": [
+                "Validate the shortlist against your buyer segment and implementation model.",
+                "Build a weighted scorecard for interoperability, cost, and deployment risk.",
+                "Run focused diligence on migration tooling and executive sponsorship requirements.",
+            ],
+            "caveats": [
+                "This competitor package requires segment-specific validation before executive use.",
+            ],
+            "insights": [str(row.get("why", "")) for row in competitors[:5]],
+        }
+        return CapabilityExecutionResult(
+            outputs={
+                "research_notes": notes,
+                "structured_rows": rows,
+                "sources": sources,
+                "analysis_results": analysis_results,
+            },
+            evidence=[notes["summary"], f"live_non_curated_citations={live_non_curated}"],
+            logs=[f"target={target}", f"ranked_sources={len(ranked)}"],
         )
 
 
@@ -737,6 +884,67 @@ class ArtifactExportExecutor(BaseCapabilityExecutor):
                 evidence=list(artifacts.keys()),
             )
 
+        if domain in {"generic_research", "web_research"}:
+            from lam.interface import search_agent as search_agent_mod
+
+            raw_results = list(inputs.get("search_results", []) or [])
+            results = []
+            for row in raw_results:
+                if isinstance(row, search_agent_mod.SearchResult):  # type: ignore[attr-defined]
+                    results.append(row)
+                elif isinstance(row, dict):
+                    results.append(
+                        search_agent_mod.SearchResult(  # type: ignore[attr-defined]
+                            title=str(row.get("title", "")),
+                            url=str(row.get("url", "")),
+                            price=row.get("price"),
+                            source=str(row.get("source", "")),
+                            snippet=str(row.get("snippet", "")),
+                        )
+                    )
+            generated = search_agent_mod._write_generic_research_artifacts(  # type: ignore[attr-defined]
+                instruction=str(contract.get("user_goal", "")),
+                query=str(inputs.get("query", contract.get("user_goal", ""))),
+                results=results,
+                decision_rows=list(inputs.get("decision_rows", []) or []),
+                recommendation=dict(inputs.get("recommendation", {}) or {}),
+                browser_notes=[dict(x) for x in (inputs.get("browser_notes", []) or []) if isinstance(x, dict)],
+            )
+            artifacts.update({k: v for k, v in generated.items() if isinstance(v, str) and v})
+            type_map = {
+                "results_csv": ("spreadsheet", "Results CSV"),
+                "decision_matrix_csv": ("spreadsheet", "Decision Matrix"),
+                "report_md": ("report", "Research Report"),
+                "recommendation_md": ("report", "Recommendation"),
+                "browser_research_md": ("report", "Browser Research Log"),
+                "browser_research_json": ("json", "Browser Research Data"),
+                "dashboard_html": ("dashboard", "Research Dashboard"),
+                "research_dashboard_html": ("dashboard", "Research Dashboard"),
+                "executive_brief_md": ("report", "Executive Brief"),
+                "executive_brief_html": ("html", "Executive Brief HTML"),
+                "powerpoint_pptx": ("presentation", "PowerPoint Deck"),
+                "directory": ("directory", "Research Output Directory"),
+                "primary_open_file": ("pointer", "Primary Open File"),
+            }
+            for key, value in artifacts.items():
+                if key in artifact_metadata:
+                    continue
+                artifact_type, title = type_map.get(key, ("file", key))
+                artifact_metadata[key] = _artifact_detail(
+                    key=key,
+                    path=value,
+                    artifact_type=artifact_type,
+                    title=title,
+                    evidence_summary=f"Generic research artifact exported through artifact_export: {title}.",
+                )
+            export_bundle = {"workspace": str(workspace.resolve()), "artifact_count": len(artifacts), "artifact_keys": sorted(artifacts.keys())}
+            return CapabilityExecutionResult(
+                outputs={"artifacts": artifacts, "export_bundle": export_bundle},
+                artifacts=artifacts,
+                artifact_metadata=artifact_metadata,
+                evidence=list(artifacts.keys()),
+            )
+
         report = dict(inputs.get("report", {}))
         stakeholder = dict(inputs.get("stakeholder_summary", {}))
         if report or "report" in requested:
@@ -889,6 +1097,8 @@ class ApprovalGateExecutor(BaseCapabilityExecutor):
 def default_executors() -> Dict[str, BaseCapabilityExecutor]:
     rows: Iterable[BaseCapabilityExecutor] = [
         DeepResearchExecutor(),
+        ResearchCollectionExecutor(),
+        CompetitorResearchExecutor(),
         SourceEvaluationExecutor(),
         FileInspectionExecutor(),
         DataCleaningExecutor(),

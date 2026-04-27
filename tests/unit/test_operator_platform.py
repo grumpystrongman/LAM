@@ -245,6 +245,7 @@ class TestOperatorPlatform(unittest.TestCase):
         self.assertTrue(result.artifacts)
         self.assertTrue(result.verification_report.get("final_verification") == "passed")
         self.assertTrue(result.artifact_metadata)
+        self.assertTrue(any(item.get("validation_history") for item in result.artifact_metadata.values() if isinstance(item, dict)))
         self.assertTrue(any(evt.get("event") == "graph_started" for evt in result.events))
         self.assertTrue(any(evt.get("event") == "revision_started" for evt in result.events))
         self.assertTrue(any(node.status in {"revised", "succeeded"} for node in result.graph.nodes))
@@ -258,6 +259,11 @@ class TestOperatorPlatform(unittest.TestCase):
             "capability_execution_graph": {"status": "succeeded", "nodes": [{"node_id": "n01", "capability": "report_build", "status": "succeeded", "attempts": 1}], "events": [{"event": "graph_started"}]},
             "memory_context": {"used": [{"type": "project_context", "content": {"note": "Use concise style"}}], "rejected": [], "retrieval_confidence": 0.9},
             "revisions_performed": [{"critic": "story", "required_fix": "Add so-what"}],
+            "runtime_events": [
+                {"event": "node_started", "node_id": "n01_report_build", "capability": "report_build", "status": "running"},
+                {"event": "critic_failed", "node_id": "n01_report_build", "capability": "report_build", "critic": "story"},
+                {"event": "revision_completed", "node_id": "n01_report_build", "capability": "report_build", "critic": "story", "status": "revised"},
+            ],
         }
         cards = build_platform_cards(payload)
         self.assertIn("task_contract", cards)
@@ -265,6 +271,8 @@ class TestOperatorPlatform(unittest.TestCase):
         self.assertIn("items", cards["artifact_manifest"])
         self.assertIn("critic_results", cards)
         self.assertIn("execution_graph", cards)
+        self.assertIn("runtime_timeline", cards)
+        self.assertTrue(cards["runtime_timeline"]["groups"])
         self.assertIn("memory_context", cards)
 
 

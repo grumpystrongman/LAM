@@ -38,6 +38,7 @@ class ArtifactFactory:
                     "title": str(detail.get("title", key)),
                     "evidence_summary": str(detail.get("evidence_summary", "")),
                     "validation_state": str(detail.get("validation_state", validation_status or "unknown")),
+                    "validation_history": list(detail.get("validation_history", []) or []),
                     "created_at": str(detail.get("created_at", datetime.now().isoformat(timespec="seconds"))),
                 }
             )

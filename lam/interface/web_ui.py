@@ -194,6 +194,18 @@ HTML_PAGE = """<!doctype html>
     .summary-card { border:1px solid #e2e8f0; border-radius:10px; background:#ffffff; padding:10px; }
     .summary-card .t { font-size:13px; color:#0f172a; font-weight:600; }
     .summary-card .m { font-size:12px; color:#64748b; margin-top:4px; word-break:break-word; }
+    .badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:11px; font-weight:600; border:1px solid #cbd5e1; background:#eef2ff; color:#334155; }
+    .summary-card .badge { margin-top:6px; }
+    .badge.validated, .badge.revised_validated { background:#ecfdf5; color:#166534; border-color:#bbf7d0; }
+    .badge.pending_critic_review, .badge.revision_required { background:#fff7ed; color:#9a3412; border-color:#fed7aa; }
+    .badge.failed_review { background:#fef2f2; color:#991b1b; border-color:#fecaca; }
+    .artifact-chip-list { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
+    .artifact-chip { border:1px solid #e2e8f0; border-radius:12px; padding:8px 10px; background:#fff; min-width:180px; }
+    .artifact-chip-head { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+    .artifact-chip-title { font-size:12px; font-weight:600; color:#0f172a; word-break:break-word; }
+    .artifact-chip-actions { display:flex; align-items:center; gap:8px; margin-top:6px; }
+    .artifact-open { font-size:12px; color:#0f766e; text-decoration:none; font-weight:600; }
+    .timeline-filter-btn.active { background:#dbeafe; color:#1d4ed8; border:1px solid #93c5fd; }
     .artifact-list a { color:#0f766e; text-decoration:none; }
     .json-box { white-space:pre-wrap; max-height:260px; overflow:auto; font-size:12px; color:#0f172a; background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; padding:10px; }
     .small { color:var(--muted); font-size:12px; }
@@ -254,6 +266,11 @@ HTML_PAGE = """<!doctype html>
     body.canvas-open #canvasPanel { right:0; }
     #canvasPanel .canvas-header { position:sticky; top:0; background:#fff; z-index:2; border-bottom:1px solid #e2e8f0; padding-bottom:8px; }
     #canvasPanel .canvas-section { margin-top:10px; }
+    .timeline-group { border:1px solid #e2e8f0; border-radius:10px; background:#fff; margin-bottom:8px; }
+    .timeline-group summary { cursor:pointer; padding:10px; font-weight:600; color:#0f172a; }
+    .timeline-group-body { padding:0 10px 10px 10px; }
+    .timeline-event { font-size:12px; color:#475569; margin-top:4px; }
+    .timeline-critic { font-size:12px; color:#334155; margin-top:6px; padding-top:6px; border-top:1px dashed #e2e8f0; }
     #canvasPanel .canvas-debug details { margin-top:8px; }
     #developerDetailsMount .panel { display:none; }
     #canvasPanel details[open] #developerDetailsMount .panel { display:block; margin-top:10px; }
@@ -432,6 +449,18 @@ HTML_PAGE = """<!doctype html>
         <div class="small">Task Context</div>
         <div class="summary-grid" id="platformCardsCanvas"></div>
       </div>
+      <div class="canvas-section" id="timelineCanvasSection">
+        <div class="row" style="justify-content:space-between;">
+          <div class="small">Runtime Timeline</div>
+          <div class="row" style="margin-top:0;">
+            <button class="timeline-filter-btn" data-filter="all" onclick="setTimelineFilter('all')">all</button>
+            <button class="timeline-filter-btn" data-filter="node" onclick="setTimelineFilter('node')">node-only</button>
+            <button class="timeline-filter-btn" data-filter="critic" onclick="setTimelineFilter('critic')">critic-only</button>
+            <button class="timeline-filter-btn" data-filter="revision" onclick="setTimelineFilter('revision')">revisions-only</button>
+          </div>
+        </div>
+        <div id="runtimeTimelineCanvas">No runtime timeline yet.</div>
+      </div>
       <div class="canvas-section canvas-debug">
         <details>
           <summary>Developer Details</summary>
@@ -551,6 +580,7 @@ let strictRulesVisible = false;
 let lastRaw = {};
 let lastCanvasUrl = "";
 let lastTaskFeedKey = "";
+let timelineFilter = localStorage.getItem("lam_timeline_filter") || "all";
 function persistHistory(){ localStorage.setItem("lam_ui_history", JSON.stringify(ui.history.slice(-300))); }
 function toggleCanvas(forceOpen){
   const shouldOpen = (forceOpen === undefined) ? !document.body.classList.contains("canvas-open") : !!forceOpen;
@@ -558,6 +588,18 @@ function toggleCanvas(forceOpen){
 }
 function toggleSidebarCompact(){
   document.body.classList.toggle("sidebar-compact");
+}
+function setTimelineFilter(mode){
+  timelineFilter = String(mode || "all");
+  localStorage.setItem("lam_timeline_filter", timelineFilter);
+  updateTimelineFilterButtons();
+  renderRuntimeTimelineCanvas(lastRaw||{});
+}
+function updateTimelineFilterButtons(){
+  document.querySelectorAll(".timeline-filter-btn").forEach(btn=>{
+    const active = String(btn?.dataset?.filter || "") === timelineFilter;
+    btn.classList.toggle("active", active);
+  });
 }
 function newTaskFromUI(){
   document.getElementById("instruction").value = "";
@@ -691,18 +733,35 @@ function renderSummary(r){
   (r?.canvas?.cards||[]).slice(0,4).forEach(c=>cards.push({t:c.title||"Item",m:`${c.price||""} ${c.source?`| ${c.source}`:""}`.trim()}));
   if(cards.length===0){ cards.push({t:"Status",m:ok?"Completed":"Needs input"}); }
   const artifacts = r?.artifacts || {};
-  let entries = Object.entries(artifacts).filter(([k,v])=>typeof v==="string" && v.trim().length>0);
+  const manifestItems = Array.isArray(r?.artifact_manifest?.items) ? r.artifact_manifest.items.filter(item => item && typeof item.path==="string" && item.path.trim().length>0) : [];
+  let entries = manifestItems.length
+    ? manifestItems.map(item => ({ key: String(item.key||item.title||"artifact"), path: String(item.path||""), meta: item }))
+    : Object.entries(artifacts)
+        .filter(([k,v])=>typeof v==="string" && v.trim().length>0)
+        .map(([k,v])=>({ key: k, path: String(v||""), meta: null }));
   if(entries.length===0){
     const recentOutputs = Array.isArray(ui?.latestState?.world_model?.created_outputs)
       ? ui.latestState.world_model.created_outputs.filter(v=>typeof v==="string" && v.trim().length>0)
       : [];
-    entries = recentOutputs.slice(0,6).map((path, idx)=>[`recent_output_${idx+1}`, path]);
+    entries = recentOutputs.slice(0,6).map((path, idx)=>({ key: `recent_output_${idx+1}`, path: String(path||""), meta: null }));
     if(entries.length){
       cards.push({t:"Recent outputs", m:`${entries.length} file(s) available in session history`});
     }
   }
   if(entries.length){
-    const links = entries.map(([k,v])=>`<div><a href="${escapeHtml(artifactHref(v))}" target="_blank" rel="noopener">${escapeHtml(k)}</a></div>`).join("");
+    const links = entries.map(entry=>{
+      const meta = entry?.meta || {};
+      const state = String(meta?.validation_state || "").trim();
+      const history = Array.isArray(meta?.validation_history) && meta.validation_history.length
+        ? meta.validation_history.map(h=>String(h?.state||"")).filter(Boolean).join(" -> ")
+        : "";
+      const evidence = String(meta?.evidence_summary || "").trim();
+      const detailBits = [
+        state ? `state: ${state}` : "",
+        history ? `history: ${history}` : "",
+      ].filter(Boolean).join(" | ");
+      return `<div style="margin-bottom:8px"><a href="${escapeHtml(artifactHref(entry.path))}" target="_blank" rel="noopener">${escapeHtml(entry.key)}</a>${detailBits ? `<div class="small">${escapeHtml(detailBits)}</div>` : ""}${evidence ? `<div class="small">${escapeHtml(evidence)}</div>` : ""}</div>`;
+    }).join("");
     document.getElementById("artifactList").innerHTML = `<div class="small" style="margin-top:8px">Outputs</div>${links}`;
     const canvasList = document.getElementById("artifactListCanvas");
     if(canvasList){ canvasList.innerHTML = links; }
@@ -711,8 +770,16 @@ function renderSummary(r){
     const canvasList = document.getElementById("artifactListCanvas");
     if(canvasList){ canvasList.innerText = "No artifacts yet."; }
   }
-  document.getElementById("summaryCards").innerHTML = cards.slice(0,6).map(c=>`<div class="summary-card"><div class="t">${escapeHtml(c.t||"")}</div><div class="m">${escapeHtml(c.m||"")}</div></div>`).join("");
+  manifestItems.slice(0,3).forEach(item=>{
+    cards.push({
+      t:`Artifact: ${String(item?.title || item?.key || "artifact")}`,
+      m:String(item?.type || "file"),
+      badge:String(item?.validation_state || "ready"),
+    });
+  });
+  document.getElementById("summaryCards").innerHTML = cards.slice(0,6).map(c=>`<div class="summary-card"><div class="t">${escapeHtml(c.t||"")}</div><div class="m">${escapeHtml(c.m||"")}</div>${c.badge ? `<div class="badge ${escapeHtml(String(c.badge||"").replace(/[^a-z_]/gi,'_').toLowerCase())}">${escapeHtml(c.badge)}</div>` : ""}</div>`).join("");
   renderPlatformCards(r||{});
+  renderRuntimeTimelineCanvas(r||{});
 
   const activity=[];
   if(Array.isArray(r?.narration)){ r.narration.forEach(x=>activity.push(`- ${x}`)); }
@@ -746,6 +813,52 @@ function renderSummary(r){
   }
   renderStrictRules(r||{});
 }
+function renderRuntimeTimelineCanvas(r){
+  const mount = document.getElementById("runtimeTimelineCanvas");
+  if(!mount){ return; }
+  const groups = Array.isArray(r?.ui_cards?.runtime_timeline?.groups) ? r.ui_cards.runtime_timeline.groups : [];
+  if(!groups.length){
+    mount.innerHTML = "<div class='small'>No runtime timeline yet.</div>";
+    return;
+  }
+  const filteredGroups = groups.map(group=>{
+    const events = Array.isArray(group.events) ? group.events.filter(item=>{
+      if(timelineFilter === "node"){ return !String(item?.critic||"").trim() && !String(item?.event||"").includes("revision"); }
+      if(timelineFilter === "critic"){ return !!String(item?.critic||"").trim() || String(item?.event||"").includes("critic"); }
+      if(timelineFilter === "revision"){ return String(item?.event||"").includes("revision"); }
+      return true;
+    }) : [];
+    const critics = Array.isArray(group.critics) ? group.critics.filter(entry=>{
+      if(timelineFilter === "node"){ return false; }
+      if(timelineFilter === "critic"){ return true; }
+      if(timelineFilter === "revision"){
+        return Array.isArray(entry.events) && entry.events.some(item=>String(item?.event||"").includes("revision"));
+      }
+      return true;
+    }) : [];
+    return {...group, events, critics};
+  }).filter(group => (group.events && group.events.length) || (group.critics && group.critics.length));
+  if(!filteredGroups.length){
+    mount.innerHTML = `<div class='small'>No timeline entries for filter: ${escapeHtml(timelineFilter)}</div>`;
+    return;
+  }
+  mount.innerHTML = filteredGroups.map((group, idx)=>{
+    const heading = `${group.capability || group.node_id || "graph"}${group.status ? ` | ${group.status}` : ""}`;
+    const events = Array.isArray(group.events) ? group.events.map(item=>{
+      const parts = [
+        item.event || "",
+        item.critic ? `critic=${item.critic}` : "",
+        item.status ? `status=${item.status}` : "",
+      ].filter(Boolean).join(" | ");
+      return `<div class="timeline-event">${escapeHtml(parts)}</div>`;
+    }).join("") : "";
+    const critics = Array.isArray(group.critics) ? group.critics.map(entry=>{
+      const items = Array.isArray(entry.events) ? entry.events.map(item=>`${item.event}${item.status ? ` (${item.status})` : ""}`).join(", ") : "";
+      return `<div class="timeline-critic"><strong>${escapeHtml(entry.critic || "critic")}</strong>: ${escapeHtml(items)}</div>`;
+    }).join("") : "";
+    return `<details class="timeline-group" ${idx===0 ? "open" : ""}><summary>${escapeHtml(heading)}</summary><div class="timeline-group-body">${events}${critics}</div></details>`;
+  }).join("");
+}
 function renderPlatformCards(r){
   const cards = r?.ui_cards || {};
   const sections = [];
@@ -777,7 +890,10 @@ function renderPlatformCards(r){
           item.validation_state ? `state: ${item.validation_state}` : "",
         ].filter(Boolean).join(" | ");
         const evidence = item.evidence_summary ? `<div class="small">${escapeHtml(item.evidence_summary)}</div>` : "";
-        return `<div style="margin-bottom:10px"><a href="${escapeHtml(href)}" target="_blank" rel="noopener">${escapeHtml(label)}</a>${meta ? ` <span class="small">${escapeHtml(meta)}</span>` : ""}${evidence}</div>`;
+        const history = Array.isArray(item.validation_history) && item.validation_history.length
+          ? `<div class="small">history: ${escapeHtml(item.validation_history.map(h=>String(h.state||"")).join(" -> "))}</div>`
+          : "";
+        return `<div style="margin-bottom:10px"><a href="${escapeHtml(href)}" target="_blank" rel="noopener">${escapeHtml(label)}</a>${meta ? ` <span class="small">${escapeHtml(meta)}</span>` : ""}${evidence}${history}</div>`;
       }).join("")
     );
   }
@@ -795,6 +911,38 @@ function renderPlatformCards(r){
   if(Array.isArray(graph?.nodes) && graph.nodes.length){
     pushSection("Execution Graph",
       graph.nodes.slice(0,10).map(node=>`<div><strong>${escapeHtml(node.capability || "")}</strong>: ${escapeHtml(node.status || "")}${node.attempts ? ` (${escapeHtml(String(node.attempts))} attempt)` : ""}</div>`).join("")
+    );
+  }
+  const timeline = cards?.runtime_timeline || {};
+  if(Array.isArray(timeline?.groups) && timeline.groups.length){
+    pushSection("Runtime Timeline",
+      timeline.groups.map(group=>{
+        const heading = `${group.capability || group.node_id || "graph"}${group.status ? ` | ${group.status}` : ""}`;
+        const events = Array.isArray(group.events) ? group.events.map(item=>{
+          const parts = [
+            item.event || "",
+            item.status ? `status=${item.status}` : "",
+          ].filter(Boolean).join(" | ");
+          return `<div class="small">${escapeHtml(parts)}</div>`;
+        }).join("") : "";
+        const critics = Array.isArray(group.critics) ? group.critics.map(entry=>{
+          const items = Array.isArray(entry.events) ? entry.events.map(item=>`${item.event}${item.status ? ` (${item.status})` : ""}`).join(", ") : "";
+          return `<div class="small"><strong>${escapeHtml(entry.critic || "critic")}</strong>: ${escapeHtml(items)}</div>`;
+        }).join("") : "";
+        return `<div style="margin-bottom:10px"><div><strong>${escapeHtml(heading)}</strong></div>${events}${critics}</div>`;
+      }).join("")
+    );
+  } else if(Array.isArray(timeline?.items) && timeline.items.length){
+    pushSection("Runtime Timeline",
+      timeline.items.slice(-12).map(item=>{
+        const parts = [
+          item.event || "",
+          item.capability || item.node_id || "",
+          item.critic ? `critic=${item.critic}` : "",
+          item.status ? `status=${item.status}` : "",
+        ].filter(Boolean).join(" | ");
+        return `<div class="small">${escapeHtml(parts)}</div>`;
+      }).join("")
     );
   }
   const memory = cards?.memory_context || {};
@@ -824,6 +972,18 @@ function renderAssistantFeedFromResult(r){
   if(pauseReason){ lines.push(`<div>${escapeHtml(pauseReason)}</div>`); }
   const ok = !!r?.ok;
   const doneLine = ok ? (r?.canvas?.title || "Task completed.") : (r?.error || "Task needs input.");
+  const manifestItems = Array.isArray(r?.artifact_manifest?.items) ? r.artifact_manifest.items : [];
+  if(manifestItems.length){
+    const counts = {};
+    manifestItems.forEach(item=>{
+      const key = String(item?.validation_state || "ready");
+      counts[key] = (counts[key] || 0) + 1;
+    });
+    const badges = Object.entries(counts).map(([state,count])=>`<span class="badge ${stateClassName(state)}">${escapeHtml(state)}: ${escapeHtml(String(count))}</span>`).join(" ");
+    if(badges){ lines.push(`<div>${badges}</div>`); }
+    const inlineArtifacts = renderInlineArtifactChips(manifestItems);
+    if(inlineArtifacts){ lines.push(inlineArtifacts); }
+  }
   lines.push(`<div><strong>${escapeHtml(doneLine)}</strong></div>`);
   lines.push(`<div class="feedback-row">
     <button onclick="submitFeedback('thumbs_up')">thumbs up</button>
@@ -871,6 +1031,21 @@ function renderWorldModel(model){
   document.getElementById("worldModelBox").innerText = JSON.stringify(compact, null, 2);
 }
 function escapeHtml(s){ return String(s||"").replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function stateClassName(state){
+  return escapeHtml(String(state||"").replace(/[^a-z_]/gi,'_').toLowerCase());
+}
+function artifactDisplayName(item){
+  return String(item?.title || item?.key || "artifact");
+}
+function renderInlineArtifactChips(items){
+  const rows = Array.isArray(items) ? items.filter(item => item && typeof item.path === "string" && item.path.trim().length > 0).slice(0,4) : [];
+  if(!rows.length){ return ""; }
+  return `<div class="artifact-chip-list">${rows.map(item=>{
+    const state = String(item?.validation_state || "ready");
+    const evidence = String(item?.evidence_summary || "").trim();
+    return `<div class="artifact-chip"><div class="artifact-chip-head"><span class="artifact-chip-title">${escapeHtml(artifactDisplayName(item))}</span><span class="badge ${stateClassName(state)}">${escapeHtml(state)}</span></div>${evidence ? `<div class="small">${escapeHtml(evidence)}</div>` : ""}<div class="artifact-chip-actions"><a class="artifact-open" href="${escapeHtml(artifactHref(item.path || ""))}" target="_blank" rel="noopener">Open</a></div></div>`;
+  }).join("")}</div>`;
+}
 function isLikelyLocalPath(path){
   const p = String(path||"").trim();
   if(!p){ return false; }
@@ -1351,6 +1526,7 @@ window.onload=async()=>{
   if(showStrictBox){ showStrictBox.checked = strictRulesVisible; }
   toggleDetails(detailsVisible);
   toggleStrictRules(strictRulesVisible);
+  updateTimelineFilterButtons();
   renderHistory();
   await refreshState();
   const instructionInput=document.getElementById("instruction");

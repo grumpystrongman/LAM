@@ -48,7 +48,18 @@ class TestWebUiHumanSuite(unittest.TestCase):
     def test_html_contains_platform_card_mounts(self) -> None:
         self.assertIn('id="platformCards"', web_ui.HTML_PAGE)
         self.assertIn('id="platformCardsCanvas"', web_ui.HTML_PAGE)
+        self.assertIn('id="runtimeTimelineCanvas"', web_ui.HTML_PAGE)
         self.assertIn("function renderPlatformCards", web_ui.HTML_PAGE)
+        self.assertIn("function renderRuntimeTimelineCanvas", web_ui.HTML_PAGE)
+        self.assertIn("function setTimelineFilter", web_ui.HTML_PAGE)
+        self.assertIn("lam_timeline_filter", web_ui.HTML_PAGE)
+        self.assertIn("node-only", web_ui.HTML_PAGE)
+        self.assertIn("critic-only", web_ui.HTML_PAGE)
+        self.assertIn("revisions-only", web_ui.HTML_PAGE)
+        self.assertIn("Runtime Timeline", web_ui.HTML_PAGE)
+        self.assertIn("validation_history", web_ui.HTML_PAGE)
+        self.assertIn("renderInlineArtifactChips", web_ui.HTML_PAGE)
+        self.assertIn('class="artifact-open"', web_ui.HTML_PAGE)
 
     def test_start_killer_suite_task_stores_result(self) -> None:
         state = web_ui.UiState()

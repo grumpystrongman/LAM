@@ -106,6 +106,7 @@ class ExecutionGraphRuntime:
             node.evidence = list(node_result.evidence)
             artifacts.update(node_result.artifacts)
             artifact_metadata.update(node_result.artifact_metadata)
+            self._update_artifact_validation_state(artifact_metadata, list(node_result.artifacts.keys()), "pending_critic_review", f"{node.capability} completed; critics pending")
             node_critics = self.run_critics(node=node, context=context, outputs=node_result.outputs, artifacts=artifacts)
             node.critics = [{"critic": name, **result.to_dict()} for name, result in node_critics]
             for critic_name, critic_result in node_critics:
@@ -134,6 +135,7 @@ class ExecutionGraphRuntime:
                         node_outputs=node_outputs,
                         node_critic=(critic_name, critic_result),
                         artifacts=artifacts,
+                        artifact_metadata=artifact_metadata,
                     )
                     if revised:
                         revisions.append(revised)
@@ -144,6 +146,7 @@ class ExecutionGraphRuntime:
                         )
                         critics[critic_name] = dict(revised.get("critic_after", {}))
                     else:
+                        self._update_artifact_validation_state(artifact_metadata, list(node_result.artifacts.keys()), "failed_review", critic_result.reason)
                         node.status = "failed"
                         node.error = critic_result.reason
                         graph.status = "failed"
@@ -164,6 +167,9 @@ class ExecutionGraphRuntime:
                             final_report={},
                             error=critic_result.reason,
                         )
+            if node.status in {"revised", "succeeded"}:
+                final_state = "revised_validated" if node.status == "revised" else "validated"
+                self._update_artifact_validation_state(artifact_metadata, list(node_result.artifacts.keys()), final_state, f"{node.capability} passed critics")
             if node.status not in {"revised", "failed"}:
                 node.status = "succeeded"
                 self._emit_event(graph, "node_completed", node_id=node.node_id, capability=node.capability, status=node.status)
@@ -313,6 +319,7 @@ class ExecutionGraphRuntime:
         node_outputs: Dict[str, Dict[str, Any]],
         node_critic: tuple[str, CriticResult],
         artifacts: Dict[str, str],
+        artifact_metadata: Dict[str, Dict[str, Any]],
     ) -> Optional[Dict[str, Any]]:
         critic_name, critic_result = node_critic
         target_capability = ""
@@ -350,10 +357,19 @@ class ExecutionGraphRuntime:
         target_node.artifact_details = dict(revised_result.artifact_metadata)
         node_outputs[target_node.node_id] = dict(revised_result.outputs)
         artifacts.update(revised_result.artifacts)
+        artifact_metadata.update(revised_result.artifact_metadata)
+        self._update_artifact_validation_state(artifact_metadata, list(revised_result.artifacts.keys()), "revision_required", critic_result.required_fix or critic_result.reason)
         rerun = self.run_critics(node=target_node, context=context, outputs=revised_result.outputs, artifacts=artifacts)
         target_after = next((res for name, res in rerun if name == critic_name), CriticResult(True, 1.0, "passed after revision", "", "low"))
         target_node.critics = [res.to_dict() for _, res in rerun]
         target_node.status = "revised" if target_after.passed else "failed"
+        self._update_artifact_validation_state(
+            artifact_metadata,
+            list(revised_result.artifacts.keys()),
+            "revised_validated" if target_after.passed else "failed_review",
+            "revision passed" if target_after.passed else target_after.reason,
+        )
+        target_node.artifact_details = {key: artifact_metadata.get(key, {}) for key in revised_result.artifacts.keys()}
         self._emit_event(
             graph,
             "revision_completed",
@@ -379,6 +395,22 @@ class ExecutionGraphRuntime:
 
     def _emit_event(self, graph: ExecutionGraph, event_type: str, **payload: Any) -> None:
         graph.events.append({"event": event_type, "ts": round(time.time(), 3), **payload})
+
+    def _update_artifact_validation_state(
+        self,
+        artifact_metadata: Dict[str, Dict[str, Any]],
+        artifact_keys: List[str],
+        state: str,
+        note: str,
+    ) -> None:
+        for key in artifact_keys:
+            item = artifact_metadata.get(key)
+            if not isinstance(item, dict):
+                continue
+            history = list(item.get("validation_history", []) or [])
+            history.append({"state": state, "note": note, "ts": round(time.time(), 3)})
+            item["validation_state"] = state
+            item["validation_history"] = history[-6:]
 
     def _build_verification_report(
         self,

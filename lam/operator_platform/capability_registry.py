@@ -40,6 +40,8 @@ class CapabilityRegistry:
 def default_capability_registry() -> CapabilityRegistry:
     rows = [
         ("deep_research", "Collect and synthesize multi-source evidence.", ["task_contract"], ["research_notes"], ["browser", "search"], "medium"),
+        ("research_collection", "Collect search results, browser notes, and recommendation evidence for a research task.", ["task_contract"], ["research_notes"], ["browser", "search"], "medium"),
+        ("competitor_research", "Research and rank competitor evidence for a target market.", ["task_contract"], ["research_notes"], ["browser", "search"], "medium"),
         ("source_evaluation", "Score source credibility and fit.", ["research_notes"], ["source_scores"], ["critic"], "low"),
         ("web_browse", "Interact with browser targets and collect observations.", ["url", "query"], ["browser_notes"], ["browser", "playwright"], "medium"),
         ("file_inspection", "Inspect files, folders, and local inputs.", ["paths"], ["file_inventory"], ["filesystem"], "low"),

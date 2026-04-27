@@ -4,6 +4,52 @@ from datetime import datetime
 from typing import Any, Dict, List
 
 
+def _group_runtime_events(runtime_events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    grouped: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+    for item in runtime_events:
+        if not isinstance(item, dict):
+            continue
+        node_id = str(item.get("node_id", "") or "")
+        capability = str(item.get("capability", "") or "")
+        key = node_id or capability or "graph"
+        if key not in grouped:
+            grouped[key] = {
+                "node_id": node_id,
+                "capability": capability,
+                "status": "",
+                "events": [],
+                "critics": {},
+            }
+            order.append(key)
+        bucket = grouped[key]
+        event_payload = {
+            "event": str(item.get("event", "")),
+            "critic": str(item.get("critic", "")),
+            "status": str(item.get("status", "")),
+            "ts": item.get("ts", ""),
+        }
+        bucket["events"].append(event_payload)
+        if event_payload["status"]:
+            bucket["status"] = event_payload["status"]
+        if event_payload["critic"]:
+            critic_bucket = bucket["critics"].setdefault(event_payload["critic"], [])
+            critic_bucket.append(event_payload)
+    return [
+        {
+            "node_id": grouped[key]["node_id"],
+            "capability": grouped[key]["capability"],
+            "status": grouped[key]["status"],
+            "events": list(grouped[key]["events"][-8:]),
+            "critics": [
+                {"critic": critic_name, "events": list(events[-6:])}
+                for critic_name, events in grouped[key]["critics"].items()
+            ],
+        }
+        for key in order[-10:]
+    ]
+
+
 def build_platform_cards(result: Dict[str, Any]) -> Dict[str, Any]:
     task_contract = result.get("task_contract", {}) if isinstance(result.get("task_contract"), dict) else {}
     artifacts = result.get("artifacts", {}) if isinstance(result.get("artifacts"), dict) else {}
@@ -15,6 +61,7 @@ def build_platform_cards(result: Dict[str, Any]) -> Dict[str, Any]:
     graph = result.get("capability_execution_graph", {}) if isinstance(result.get("capability_execution_graph"), dict) else {}
     memory_context = result.get("memory_context", {}) if isinstance(result.get("memory_context"), dict) else {}
     manifest = result.get("artifact_manifest", {}) if isinstance(result.get("artifact_manifest"), dict) else {}
+    runtime_events = result.get("runtime_events", []) if isinstance(result.get("runtime_events"), list) else []
     return {
         "task_contract": {
             "title": "Task Contract",
@@ -44,6 +91,7 @@ def build_platform_cards(result: Dict[str, Any]) -> Dict[str, Any]:
                     "title": key,
                     "evidence_summary": "",
                     "validation_state": "ready",
+                    "validation_history": [],
                 }
                 for key, value in artifacts.items()
                 if isinstance(value, str) and value.strip()
@@ -85,6 +133,23 @@ def build_platform_cards(result: Dict[str, Any]) -> Dict[str, Any]:
                 if isinstance(node, dict)
             ],
             "events_count": len(graph.get("events", []) or []),
+        },
+        "runtime_timeline": {
+            "title": "Runtime Timeline",
+            "compact": True,
+            "groups": _group_runtime_events(runtime_events),
+            "items": [
+                {
+                    "event": str(item.get("event", "")),
+                    "node_id": str(item.get("node_id", "")),
+                    "capability": str(item.get("capability", "")),
+                    "critic": str(item.get("critic", "")),
+                    "status": str(item.get("status", "")),
+                    "ts": item.get("ts", ""),
+                }
+                for item in runtime_events[-20:]
+                if isinstance(item, dict)
+            ],
         },
         "memory_context": {
             "title": "Memory Context",

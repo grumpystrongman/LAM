@@ -69,6 +69,44 @@ from lam.operator_platform import (
     default_capability_registry,
     default_executors,
 )
+from lam.operator_platform.research_backend import (
+    apply_human_judgment_quality_gate as platform_apply_human_judgment_quality_gate,
+    build_recommendation_focus_query as platform_build_recommendation_focus_query,
+    count_locality_matches as platform_count_locality_matches,
+    is_recommendation_research_intent as platform_is_recommendation_research_intent,
+    is_wine_pairing_intent as platform_is_wine_pairing_intent,
+    minimum_topic_overlap as platform_minimum_topic_overlap,
+    passes_topic_gate as platform_passes_topic_gate,
+    query_focus_terms as platform_query_focus_terms,
+    relevance_score as platform_relevance_score,
+    topic_overlap_count as platform_topic_overlap_count,
+)
+from lam.operator_platform.research_primitives import (
+    collect_generic_research as platform_collect_generic_research,
+    expand_queries as platform_expand_queries,
+    extract_generic_query as platform_extract_generic_query,
+    human_judgment_constraints as platform_human_judgment_constraints,
+    human_judgment_refine_queries as platform_human_judgment_refine_queries,
+)
+from lam.operator_platform.browser_research import (
+    browser_query_url as platform_browser_query_url,
+    browser_research_walk as platform_browser_research_walk,
+)
+from lam.operator_platform.research_constants import (
+    QUERY_NOISE_TERMS,
+    RECOMMENDATION_RESEARCH_TOKENS,
+    STEAK_WINE_STYLE_BONUS,
+    USER_AGENT,
+    WINE_STYLE_KEYWORDS,
+)
+from lam.operator_platform.research_types import SearchResult
+from lam.operator_platform.recommendation_helpers import (
+    build_decision_rows as platform_build_decision_rows,
+    build_product_candidate_rows as platform_build_product_candidate_rows,
+    build_recommendation_summary as platform_build_recommendation_summary,
+    curated_recommendation_sources as platform_curated_recommendation_sources,
+    merge_browser_notes_into_rows as platform_merge_browser_notes_into_rows,
+)
 from lam.deep_workbench.workflow import (
     build_workspace as build_code_workbench_workspace,
     extract_workbench_contract,
@@ -79,8 +117,6 @@ from lam.payer_rag.workflow import (
     ensure_workspace,
     extract_current_task_contract,
 )
-
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 MIN_LIVE_NON_CURATED_CITATIONS = 3
 DESTRUCTIVE_ACTION_KEYWORDS = {
     "delete",
@@ -134,17 +170,6 @@ HUMAN_JUDGMENT_LOCALITY_TOKENS = {
     "local",
     "around here",
     "in ",
-}
-
-RECOMMENDATION_RESEARCH_TOKENS = {
-    "best",
-    "recommend",
-    "which one",
-    "what should i buy",
-    "to buy",
-    "for dinner",
-    "pairing",
-    "compare",
 }
 
 CODE_WORKBENCH_TOKENS = {
@@ -221,73 +246,6 @@ PAYER_PRICING_ACTION_TOKENS = {
     "stakeholder",
 }
 
-QUERY_NOISE_TERMS = {
-    "best",
-    "better",
-    "top",
-    "recommend",
-    "recommended",
-    "recommendation",
-    "buy",
-    "buying",
-    "guide",
-    "review",
-    "reviews",
-    "compare",
-    "comparison",
-    "options",
-    "option",
-    "find",
-    "research",
-    "search",
-    "look",
-    "lookup",
-    "please",
-    "help",
-    "which",
-    "what",
-    "should",
-    "would",
-    "could",
-    "with",
-    "from",
-    "there",
-    "then",
-    "one",
-    "the",
-    "and",
-    "for",
-    "tonight",
-    "under",
-    "dollar",
-    "dollars",
-}
-
-WINE_STYLE_KEYWORDS: Dict[str, List[str]] = {
-    "Cabernet Sauvignon": ["cabernet sauvignon", "cabernet", "cab sauv"],
-    "Malbec": ["malbec"],
-    "Syrah / Shiraz": ["syrah", "shiraz"],
-    "Merlot": ["merlot"],
-    "Zinfandel": ["zinfandel", "zin"],
-    "Pinot Noir": ["pinot noir", "pinot"],
-}
-
-STEAK_WINE_STYLE_BONUS = {
-    "Cabernet Sauvignon": 3.0,
-    "Malbec": 2.8,
-    "Syrah / Shiraz": 2.4,
-    "Zinfandel": 1.8,
-    "Merlot": 1.6,
-}
-
-
-@dataclass(slots=True)
-class SearchResult:
-    title: str
-    url: str
-    price: Optional[float]
-    source: str
-    snippet: str = ""
 
 
 @dataclass(slots=True)
@@ -806,10 +764,7 @@ def _is_price_recommendation_intent(instruction: str) -> bool:
 
 
 def _is_recommendation_research_intent(instruction: str) -> bool:
-    low = str(instruction or "").lower()
-    has_decision_signal = any(token in low for token in RECOMMENDATION_RESEARCH_TOKENS) or _is_price_recommendation_intent(low)
-    has_research_signal = any(token in low for token in ["research", "find", "search", "look up", "analy", "buy", "find me"])
-    return bool(has_decision_signal and has_research_signal)
+    return bool(platform_is_recommendation_research_intent(instruction))
 
 
 def _is_marketplace_shopping_intent(instruction: str) -> bool:
@@ -820,14 +775,11 @@ def _is_marketplace_shopping_intent(instruction: str) -> bool:
 
 
 def _is_wine_pairing_intent(instruction: str, query: str = "") -> bool:
-    low = f"{instruction} {query}".lower()
-    has_wine = "wine" in low
-    has_food = any(token in low for token in ["dinner", "steak", "potatoes", "pairing", "pair with", "meal"])
-    return has_wine and has_food
+    return bool(platform_is_wine_pairing_intent(instruction=instruction, query=query))
 
 
 def _browser_query_url(query: str) -> str:
-    return f"https://duckduckgo.com/?q={urllib.parse.quote_plus(str(query or '').strip())}"
+    return platform_browser_query_url(query)
 
 
 def _generic_decision_rows(results: List[SearchResult], query: str) -> List[Dict[str, Any]]:
@@ -858,161 +810,31 @@ def _generic_decision_rows(results: List[SearchResult], query: str) -> List[Dict
 
 
 def _query_focus_terms(text: str) -> List[str]:
-    normalized = re.sub(r"(\d+)\s+inch\b", r"\1-inch", str(text or "").lower())
-    terms = [term for term in re.split(r"[^a-z0-9-]+", normalized) if len(term) > 2]
-    filtered = [term for term in terms if term not in QUERY_NOISE_TERMS]
-    return filtered or terms
+    return list(platform_query_focus_terms(text))
 
 
 def _topic_overlap_count(result: SearchResult, query: str) -> int:
-    focus_terms = _query_focus_terms(query)
-    hay = f"{str(result.title or '').lower()} {str(result.snippet or '').lower()} {str(result.url or '').lower()}"
-    return sum(1 for term in focus_terms if term and term in hay)
+    return int(platform_topic_overlap_count(result, query))
 
 
 def _minimum_topic_overlap(query: str) -> int:
-    focus_terms = _query_focus_terms(query)
-    if len(focus_terms) >= 3:
-        return 2
-    return 1
+    return int(platform_minimum_topic_overlap(query))
 
 
 def _passes_topic_gate(result: SearchResult, instruction: str, query: str) -> bool:
-    hay = f"{str(result.title or '').lower()} {str(result.snippet or '').lower()} {str(result.url or '').lower()}"
-    low = f"{instruction} {query}".lower()
-    style_terms = {
-        token
-        for tokens in WINE_STYLE_KEYWORDS.values()
-        for token in tokens
-    }
-    if _is_wine_pairing_intent(instruction=instruction, query=query):
-        has_wine_signal = "wine" in hay or any(token in hay for token in style_terms)
-        has_pairing_signal = any(token in hay for token in ["steak", "pair", "pairing", "potato", "potatoes", "ribeye", "filet"])
-        has_style_signal = any(token in hay for token in style_terms)
-        return has_wine_signal and (has_pairing_signal or has_style_signal)
-    if "espresso" in low or "coffee" in low:
-        has_core = any(token in hay for token in ["espresso", "coffee"])
-        has_portability = any(token in hay for token in ["portable", "travel", "maker", "machine"])
-        return has_core and has_portability
-    if "monitor" in low:
-        has_monitor = "monitor" in hay or "display" in hay
-        has_context = any(token in hay for token in ["macbook", "coding", "programming", "27", "27-inch", "usb-c", "usb c"])
-        return has_monitor and has_context
-    return _topic_overlap_count(result, query) >= _minimum_topic_overlap(query)
+    return bool(platform_passes_topic_gate(result, instruction, query))
 
 
 def _build_recommendation_focus_query(query: str, instruction: str) -> str:
-    low = f"{instruction} {query}".lower()
-    if _is_wine_pairing_intent(instruction=instruction, query=query):
-        return "wine steak potatoes pairing" if "steak" in low and "potato" in low else "wine pairing"
-    if "espresso" in low or "coffee" in low:
-        return "portable espresso maker travel review"
-    if "monitor" in low:
-        size = "27-inch" if "27 inch" in low or "27-inch" in low else "monitor"
-        budget_match = re.search(r"\bunder\s+\$?([0-9]{2,4})", low)
-        budget = f"under {budget_match.group(1)}" if budget_match else ""
-        context_terms: List[str] = []
-        if "coding" in low or "programming" in low:
-            context_terms.append("coding")
-        if "macbook pro" in low:
-            context_terms.append("macbook pro")
-        elif "macbook" in low:
-            context_terms.append("macbook")
-        parts = [size, "monitor"]
-        if budget:
-            parts.append(budget)
-        parts.extend(context_terms)
-        return re.sub(r"\s+", " ", " ".join(part for part in parts if part)).strip()
-    seen: set[str] = set()
-    ordered_terms: List[str] = []
-    for term in _query_focus_terms(query):
-        if term in seen:
-            continue
-        seen.add(term)
-        ordered_terms.append(term)
-    return " ".join(ordered_terms[:8]).strip()
+    return str(platform_build_recommendation_focus_query(query=query, instruction=instruction))
 
 
 def _curated_recommendation_sources(instruction: str, query: str) -> List[SearchResult]:
-    low = f"{instruction} {query}".lower()
-    if "espresso" in low or "coffee" in low:
-        return [
-            SearchResult(title="Best Portable Espresso Machine 2026: Top 4 Travel Makers", url="https://www.coffeejournals.com/best-portable-espresso-machine/", price=None, source="curated", snippet="Portable espresso machine comparison for travel."),
-            SearchResult(title="Best Portable Espresso Machine in 2026 - Perfect For Travellers", url="https://homecoffeeexpert.com/best-portable-espresso-machine/", price=None, source="curated", snippet="Travel espresso machine guide."),
-            SearchResult(title="15 Best Portable Espresso Makers for Travel (May 2026) Expert Reviews", url="https://lexavebrew.com/best-portable-espresso-makers-for-travel/", price=None, source="curated", snippet="Expert review roundup for travel espresso makers."),
-            SearchResult(title="Best portable espresso machines of 2026, tried and tested", url="https://www.cnn.com/cnn-underscored/reviews/best-portable-espresso-maker", price=None, source="curated", snippet="Tested portable espresso makers."),
-        ]
-    if "monitor" in low:
-        return [
-            SearchResult(title="The 6 Best Monitors For MacBook Pro And MacBook Air of 2026", url="https://www.rtings.com/monitor/reviews/best/monitors-macbook-pro", price=None, source="curated", snippet="Best monitors for MacBook Pro users."),
-            SearchResult(title="Best monitor for MacBook Pro 2025: Tested for Apple compatibility", url="https://www.techradar.com/best/monitors-for-macbook-pro", price=None, source="curated", snippet="Monitor recommendations for MacBook Pro."),
-            SearchResult(title="Best Mac monitors & displays 2026: Top picks for creatives", url="https://www.macworld.com/article/668700/best-mac-monitors-displays.html", price=None, source="curated", snippet="Mac monitor buying guide."),
-            SearchResult(title="These are the best monitors specifically for MacBook Pro laptops", url="https://www.creativebloq.com/buying-guides/macbook-pro-monitor", price=None, source="curated", snippet="Monitor options for MacBook Pro."),
-        ]
-    return []
+    return list(platform_curated_recommendation_sources(instruction=instruction, query=query))
 
 
 def _build_product_candidate_rows(browser_notes: List[Dict[str, Any]], instruction: str, query: str) -> List[Dict[str, Any]]:
-    if not browser_notes:
-        return []
-    low = f"{instruction} {query}".lower()
-    scores: Dict[str, float] = {}
-    evidence: Dict[str, List[Dict[str, Any]]] = {}
-    if "espresso" in low or "coffee" in low:
-        patterns = {
-            "Wacaco Picopresso": ["picopresso"],
-            "Wacaco Nanopresso": ["nanopresso"],
-            "OutIn Nano": ["outin nano", "outin"],
-            "AeroPress Go": ["aeropress go"],
-            "Wacaco Minipresso": ["minipresso"],
-            "Staresso": ["staresso"],
-            "Handpresso": ["handpresso"],
-        }
-        for note in browser_notes:
-            hay = f"{note.get('title', '')} {note.get('summary', '')} {note.get('excerpt', '')}".lower()
-            for candidate, tokens in patterns.items():
-                hits = sum(1 for token in tokens if token in hay)
-                if hits <= 0:
-                    continue
-                scores[candidate] = float(scores.get(candidate, 0.0)) + float(hits) * 2.0
-                evidence.setdefault(candidate, []).append(note)
-    elif "monitor" in low:
-        pattern = re.compile(r"\b(?:LG|Dell|ASUS|BenQ|Samsung|Acer|ViewSonic)\s+[A-Z0-9][A-Za-z0-9-]{1,20}(?:\s+[A-Z0-9][A-Za-z0-9-]{1,20}){0,2}\b")
-        for note in browser_notes:
-            text = f"{note.get('title', '')} {note.get('summary', '')} {note.get('excerpt', '')}"
-            for match in pattern.findall(text):
-                candidate = re.sub(r"\s+", " ", match).strip()
-                low_candidate = candidate.lower()
-                if "monitor" in low_candidate:
-                    continue
-                score = 1.0
-                if "27" in low_candidate:
-                    score += 1.0
-                if any(token in text.lower() for token in ["macbook", "usb-c", "coding", "programming"]):
-                    score += 0.5
-                scores[candidate] = float(scores.get(candidate, 0.0)) + score
-                evidence.setdefault(candidate, []).append(note)
-    if not scores:
-        return []
-    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
-    rows: List[Dict[str, Any]] = []
-    for idx, (candidate, score) in enumerate(ranked[:8], start=1):
-        supporting = evidence.get(candidate, [])
-        first_url = str(supporting[0].get("url", "")) if supporting else ""
-        rows.append(
-            {
-                "rank": idx,
-                "candidate": candidate,
-                "candidate_type": "product_candidate",
-                "url": first_url,
-                "source": "browser_notes",
-                "price": None,
-                "score": round(score, 3),
-                "support_count": len(supporting),
-                "rationale": "Repeatedly surfaced across reviewed source pages.",
-            }
-        )
-    return rows
+    return list(platform_build_product_candidate_rows(browser_notes=browser_notes, instruction=instruction, query=query))
 
 
 def _slugify_product_name(value: str) -> str:
@@ -1130,10 +952,15 @@ def _wine_pairing_decision_rows(results: List[SearchResult], instruction: str, q
 
 
 def _build_decision_rows(results: List[SearchResult], instruction: str, query: str) -> List[Dict[str, Any]]:
-    wine_rows = _wine_pairing_decision_rows(results=results, instruction=instruction, query=query)
-    if wine_rows:
-        return wine_rows
-    return _generic_decision_rows(results=results, query=query)
+    return list(
+        platform_build_decision_rows(
+            results=results,
+            instruction=instruction,
+            query=query,
+            relevance_fn=_relevance_score,
+            is_wine_pairing_fn=_is_wine_pairing_intent,
+        )
+    )
 
 
 def _build_recommendation_summary(
@@ -1143,53 +970,27 @@ def _build_recommendation_summary(
     instruction: str,
     query: str,
 ) -> Dict[str, Any]:
-    if not decision_rows:
-        return {}
-    top = dict(decision_rows[0])
-    candidate_type = str(top.get("candidate_type", "source_result"))
-    if candidate_type == "wine_style":
-        return {
-            "selected_title": str(top.get("candidate", "")),
-            "selected_url": str(top.get("url", "")),
-            "selected_price": None,
-            "selected_score": top.get("score"),
-            "selected_type": candidate_type,
-            "reason": str(top.get("rationale", "")) or "Most consistently supported wine pairing.",
-            "query_focus": query,
-        }
-    selected_url = str(top.get("url", "")) or (results[0].url if results else "")
-    if candidate_type == "product_candidate":
-        selected_url = _resolve_product_candidate_buy_url(
+    recommendation = dict(
+        platform_build_recommendation_summary(
+            decision_rows=decision_rows,
+            results=results,
+            instruction=instruction,
+            query=query,
+        )
+    )
+    top = dict(decision_rows[0]) if decision_rows else {}
+    if str(top.get("candidate_type", "")) == "product_candidate":
+        recommendation["selected_url"] = _resolve_product_candidate_buy_url(
             candidate=str(top.get("candidate", "")),
             instruction=instruction,
             query=query,
-            current_url=selected_url,
+            current_url=str(recommendation.get("selected_url", "")),
         )
-    return {
-        "selected_title": str(top.get("candidate", "")),
-        "selected_url": selected_url,
-        "selected_price": top.get("price"),
-        "selected_score": top.get("score"),
-        "selected_type": candidate_type,
-        "reason": str(top.get("rationale", "")) or "Highest-ranked candidate based on relevance and evidence.",
-        "query_focus": query,
-    }
+    return recommendation
 
 
 def _merge_browser_notes_into_rows(decision_rows: List[Dict[str, Any]], browser_notes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    if not decision_rows or not browser_notes:
-        return decision_rows
-    notes_by_url = {str(note.get("url", "")): note for note in browser_notes if str(note.get("url", "")).strip()}
-    merged: List[Dict[str, Any]] = []
-    for row in decision_rows:
-        enriched = dict(row)
-        note = notes_by_url.get(str(enriched.get("url", "")))
-        if note and str(note.get("summary", "")).strip():
-            rationale = str(enriched.get("rationale", "")).strip()
-            note_summary = str(note.get("summary", "")).strip()
-            enriched["rationale"] = f"{rationale} Browser note: {note_summary}".strip()
-        merged.append(enriched)
-    return merged
+    return list(platform_merge_browser_notes_into_rows(decision_rows=decision_rows, browser_notes=browser_notes))
 
 
 def _clean_ebay_query(instruction: str) -> str:
@@ -1419,62 +1220,16 @@ def _browser_research_walk(
     progress_cb: Optional[Callable[[int, str], None]] = None,
     max_pages: int = 4,
 ) -> Dict[str, Any]:
-    try:
-        from playwright.sync_api import sync_playwright
-    except Exception:
-        return {"ok": False, "notes": [], "opened_url": "", "worker_status": "playwright_unavailable"}
-
-    notes: List[Dict[str, Any]] = []
-    opened_url = ""
-    with sync_playwright() as p:
-        browser = None
-        attached = False
-        try:
-            browser, context, attached, worker_info = _attach_generic_browser_context(
-                playwright=p,
-                browser_worker_mode=browser_worker_mode,
-                human_like_interaction=human_like_interaction,
-            )
-            pages = list(getattr(context, "pages", []) or [])
-            page = pages[0] if pages else context.new_page()
-            search_url = _browser_query_url(query)
-            current_url = str(getattr(page, "url", "") or "").strip()
-            if not current_url:
-                page.goto(search_url, timeout=30000)
-                page.wait_for_timeout(900 if human_like_interaction else 250)
-                opened_url = search_url
-            for idx, candidate in enumerate(candidates[: max(1, max_pages)], start=1):
-                target = str(candidate.url or "").strip()
-                if not target:
-                    continue
-                _emit_progress(progress_cb, min(92, 70 + idx * 4), f"Reviewing source page {idx}")
-                try:
-                    page.goto(target, timeout=30000)
-                    page.wait_for_timeout(1100 if human_like_interaction else 250)
-                    page_title = str(page.title() or candidate.title or "")
-                    text = _browser_extract_page_text(page)
-                    notes.append(_browser_note_for_page(query=query, page_url=target, title=page_title, text=text))
-                    opened_url = target
-                except Exception:
-                    notes.append(
-                        {
-                            "url": target,
-                            "title": str(candidate.title or ""),
-                            "summary": str(candidate.snippet or "")[:260],
-                        }
-                    )
-            return {
-                "ok": True,
-                "notes": notes,
-                "opened_url": opened_url,
-                "worker_status": str(worker_info.get("status", worker_info.get("mode", "unknown"))),
-            }
-        finally:
-            if browser is not None and not attached:
-                try:
-                    browser.close()
-                except Exception:
-                    pass
+    return dict(
+        platform_browser_research_walk(
+            query=query,
+            candidates=candidates,
+            browser_worker_mode=browser_worker_mode,
+            human_like_interaction=human_like_interaction,
+            progress_cb=progress_cb,
+            max_pages=max_pages,
+        )
+    )
 
 
 def _safe_search_web(query: str, limit: int = 10) -> List[SearchResult]:
@@ -1781,6 +1536,7 @@ def _should_use_execution_graph_runtime(*, task_contract: Any, explicit_route: s
 def _runtime_plan_steps_from_graph(graph: Dict[str, Any]) -> List[Dict[str, Any]]:
     mapping = {
         "deep_research": ("research", "Compile the working brief", {"query": "task_contract"}),
+        "research_collection": ("research", "Collect source evidence and candidate options", {"query": "search_results"}),
         "source_evaluation": ("research", "Score source quality", {"id": "source_scores"}),
         "file_inspection": ("inspect", "Inspect workspace inputs", {"path": "workspace"}),
         "data_cleaning": ("transform", "Normalize structured rows", {"id": "clean_rows"}),
@@ -1835,6 +1591,7 @@ def _run_execution_graph_runtime_path(
     artifact_reuse_mode: str = "reuse_if_recent",
     artifact_reuse_max_age_hours: int = 72,
     mode_override: str = "",
+    extra_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     contract_dict = task_contract.to_dict() if hasattr(task_contract, "to_dict") else dict(task_contract)
     _emit_progress(progress_cb, 12, "Composing capability graph")
@@ -1848,6 +1605,7 @@ def _run_execution_graph_runtime_path(
             "task_contract": contract_dict,
             "instruction": instruction,
             "task_id": graph.task_id,
+            **(dict(extra_context or {})),
         },
     )
     _emit_progress(progress_cb, 78, "Reviewing artifacts and critics")
@@ -1872,6 +1630,7 @@ def _run_execution_graph_runtime_path(
         "ok": runtime_result.ok,
         "mode": mode_override or "execution_graph_runtime",
         "runtime_mode": "execution_graph_runtime",
+        "error": runtime_result.error,
         "instruction": instruction,
         "ai": ai_meta,
         "plan": _build_runtime_plan(task_contract, graph=graph_dict),
@@ -4403,29 +4162,6 @@ def _run_email_triage_active_browser(
                     },
                 }
         retry_decision = sessions.auth_retry_decision(domain="mail.google.com", max_failed_attempts=2)
-        if worker_mode != "docker" and (not retry_decision.allow_retry and not retry_decision.reusable_authenticated_tab):
-            return {
-                "ok": False,
-                "mode": "email_triage",
-                "query": "newer_than:2d in:inbox",
-                "results_count": 0,
-                "results": [],
-                "artifacts": {},
-                "summary": {"error": "credential_missing", "account": account, "detail": retry_decision.reason},
-                "source_status": {"gmail_ui": "auth_retry_budget_exhausted"},
-                "opened_url": "",
-                "paused_for_credentials": True,
-                "pause_reason": "Auth retry budget reached. Use existing signed-in Gmail tab and click Resume.",
-                "error": "credential_missing",
-                "error_code": "credential_missing",
-                "auth_session_id": "",
-                "trace": trace,
-                "canvas": {
-                    "title": "Paused For Auth Recovery",
-                    "subtitle": "Avoiding login loop. Use existing session, then Resume.",
-                    "cards": [],
-                },
-            }
         if worker_mode != "docker":
             started = _start_email_auth_session(
                 profile_dir=profile_dir,
@@ -4436,6 +4172,52 @@ def _run_email_triage_active_browser(
         else:
             started = {"ok": True, "auth_session_id": sid}
         nsid = str(started.get("auth_session_id", ""))
+        if worker_mode != "docker" and (not started.get("ok") or not nsid):
+            if not retry_decision.allow_retry and not retry_decision.reusable_authenticated_tab:
+                return {
+                    "ok": False,
+                    "mode": "email_triage",
+                    "query": "newer_than:2d in:inbox",
+                    "results_count": 0,
+                    "results": [],
+                    "artifacts": {},
+                    "summary": {"error": "credential_missing", "account": account, "detail": retry_decision.reason},
+                    "source_status": {"gmail_ui": "auth_retry_budget_exhausted"},
+                    "opened_url": "",
+                    "paused_for_credentials": True,
+                    "pause_reason": "Auth retry budget reached. Use existing signed-in Gmail tab and click Resume.",
+                    "error": "credential_missing",
+                    "error_code": "credential_missing",
+                    "auth_session_id": "",
+                    "trace": trace,
+                    "canvas": {
+                        "title": "Paused For Auth Recovery",
+                        "subtitle": "Avoiding login loop. Use existing session, then Resume.",
+                        "cards": [],
+                    },
+                }
+            return {
+                "ok": False,
+                "mode": "email_triage",
+                "query": "newer_than:2d in:inbox",
+                "results_count": 0,
+                "results": [],
+                "artifacts": {},
+                "summary": {"error": "credential_missing", "account": account, "detail": str(started.get("error", "auth_session_start_failed"))},
+                "source_status": {"gmail_ui": "auth_launch_failed"},
+                "opened_url": "",
+                "paused_for_credentials": True,
+                "pause_reason": "Unable to open Gmail auth target. Resolve the issue and click Resume.",
+                "error": "credential_missing",
+                "error_code": "credential_missing",
+                "auth_session_id": "",
+                "trace": trace,
+                "canvas": {
+                    "title": "Paused For Login",
+                    "subtitle": "Gmail auth target could not be opened.",
+                    "cards": [],
+                },
+            }
         if worker_mode != "docker":
             focused = focus_auth_session(nsid, fallback_url="https://mail.google.com/", allow_reopen=False)
             opened = str(focused.get("opened_url", "https://mail.google.com/"))
@@ -5897,349 +5679,125 @@ def _run_generic_research(
     browser_worker_mode: str = "local",
     human_like_interaction: bool = False,
 ) -> Dict[str, Any]:
-    query = _extract_generic_query(instruction)
-    queries = _expand_queries(query, instruction=instruction)
-    constraints = _human_judgment_constraints(instruction=instruction, query=query)
-    recommendation_intent = _is_recommendation_research_intent(instruction)
-    memory = NegativeMemory()
-    quality_critic = QualityCritic()
-    elegance = EleganceBudget(total=100)
-    collected: List[SearchResult] = []
-    source_status: Dict[str, str] = {}
-    skipped_known_bad = 0
-    rejected_low_quality = 0
-    opened_url = ""
-    browser_notes: List[Dict[str, Any]] = []
-    browser_status = ensure_browser_worker(mode=browser_worker_mode)
-    source_status["browser_worker"] = (
-        f"ok:{browser_status.get('mode', 'local')}"
-        if bool(browser_status.get("ok"))
-        else f"error:{browser_status.get('error', 'unavailable')}"
+    runtime_contract = TaskContractEngine().extract(instruction)
+    runtime_contract.domain = "generic_research"
+    runtime_contract.requested_outputs = sorted(
+        {
+            "spreadsheet",
+            "report",
+            "dashboard",
+            *(["presentation"] if _wants_powerpoint(instruction) else []),
+        }
     )
-    if recommendation_intent and human_like_interaction:
-        _emit_progress(progress_cb, 12, "Opening live browser research tab")
-        opened_url, _nav = _open_target_with_reuse(
-            target_url=_browser_query_url(query),
-            recent_actions=[f"open_tab:{_browser_query_url(query)}"],
-        )
-    _emit_progress(progress_cb, 18, f"Researching: {query}")
-    for q in queries:
-        if q != query:
-            elegance.consume(3, "additional_query_refinement")
-        _emit_progress(progress_cb, 24 + int((queries.index(q) / max(1, len(queries))) * 40), f"Searching web for: {q}")
-        try:
-            rows = _search_web(q, limit=12)
-            keep_rows: List[SearchResult] = []
-            for row in rows:
-                if memory.is_bad_url(row.url):
-                    skipped_known_bad += 1
-                    elegance.consume(1, "skip_known_bad_url")
-                    continue
-                keep_rows.append(row)
-            collected.extend(keep_rows)
-            source_status[q] = f"ok:{len(keep_rows)}"
-        except Exception as exc:
-            source_status[q] = f"error:{type(exc).__name__}"
-    dedup: Dict[str, SearchResult] = {}
-    for r in collected:
-        dedup[r.url] = r
-    ranked = list(dedup.values())
-    _emit_progress(progress_cb, 72, "Ranking and summarizing findings")
-    ranked.sort(key=lambda x: _relevance_score(x, query), reverse=True)
-    ranked = _apply_human_judgment_quality_gate(
-        ranked=ranked,
+    runtime_graph = CapabilityPlanner(registry=default_capability_registry()).plan(runtime_contract)
+    runtime_result = _run_execution_graph_runtime_path(
         instruction=instruction,
-        query=query,
-        constraints=constraints,
+        task_contract=runtime_contract,
+        graph=runtime_graph,
+        ai_meta=backend_metadata("deterministic-local"),
+        progress_cb=progress_cb,
+        mode_override="generic_research",
+        extra_context={
+            "browser_worker_mode": browser_worker_mode,
+            "human_like_interaction": human_like_interaction,
+        },
     )
-    if constraints.get("compare_required") and len(ranked) < 2:
-        elegance.consume(6, "quality_refinement_compare_required")
-        _emit_progress(progress_cb, 58, "Refining search terms due low decision quality")
-        extra_queries = _human_judgment_refine_queries(query=query, constraints=constraints)
-        for q in extra_queries:
-            try:
-                rows = _search_web(q, limit=8)
-                collected.extend(rows)
-                source_status[q] = f"ok:{len(rows)}"
-            except Exception as exc:
-                source_status[q] = f"error:{type(exc).__name__}"
-        dedup = {r.url: r for r in collected}
-        ranked = list(dedup.values())
-        ranked.sort(key=lambda x: _relevance_score(x, query), reverse=True)
-        ranked = _apply_human_judgment_quality_gate(
-            ranked=ranked,
-            instruction=instruction,
-            query=query,
-            constraints=constraints,
-        )
-
-    if recommendation_intent and len(ranked) < 2:
-        curated = _curated_recommendation_sources(instruction=instruction, query=query)
-        if curated:
-            _emit_progress(progress_cb, 64, "Falling back to curated review sources")
-            for row in curated:
-                source_status[f"curated:{row.title}"] = "seeded"
-            ranked = _apply_human_judgment_quality_gate(
-                ranked=list({r.url: r for r in ranked + curated}.values()),
-                instruction=instruction,
-                query=query,
-                constraints=constraints,
-            )
-
-    if constraints.get("locality_required"):
-        local_hits = _count_locality_matches(ranked=ranked, locality_terms=constraints.get("locality_terms", []))
-        if local_hits <= 0:
+    if not runtime_result.get("ok"):
+        error_text = str(runtime_result.get("error", "") or "").strip()
+        try:
+            payload = json.loads(error_text) if error_text.startswith("{") else {}
+        except Exception:
+            payload = {}
+        if isinstance(payload, dict) and payload.get("error"):
+            error_code = str(payload.get("error", "generic_research_failed"))
+            subtitle_map = {
+                "locality_not_satisfied": "Locality constraint was not satisfied by candidate results.",
+                "decision_quality_insufficient": "Need at least 2 strong candidates for a superlative/compare request.",
+                "quality_threshold_not_met": "Candidate quality is too low to finalize safely.",
+                "low_relevance": "Results were not relevant enough; task not executed.",
+            }
+            title_map = {
+                "locality_not_satisfied": "Research Blocked By Locality Gate",
+                "decision_quality_insufficient": "Research Blocked By Human Judgment Gate",
+                "quality_threshold_not_met": "Research Blocked By Quality Gate",
+                "low_relevance": "Research Blocked",
+            }
             return {
                 "ok": False,
-                "query": query,
-                "results_count": len(ranked),
-                "results": [asdict(x) for x in ranked[:10]],
-                "artifacts": {},
-                "summary": {
-                    "error": "locality_not_satisfied",
-                    "detail": "Request requires local relevance, but no strong locality-matching results were found.",
-                    "constraints": constraints,
-                    "elegance_budget": elegance.snapshot(),
-                },
-                "source_status": source_status,
+                "mode": "generic_research",
+                "runtime_mode": "execution_graph_runtime",
+                "query": str(payload.get("query", "")),
+                "results_count": int(payload.get("results_count", 0) or 0),
+                "results": list(payload.get("results", []) or []),
+                "artifacts": dict(runtime_result.get("artifacts", {}) or {}),
+                "artifact_metadata": dict(runtime_result.get("artifact_metadata", {}) or {}),
+                "summary": {"error": error_code, **(payload.get("summary", {}) if isinstance(payload.get("summary"), dict) else {})},
+                "source_status": dict(payload.get("source_status", {}) or {}),
                 "opened_url": "",
+                "verification_report": runtime_result.get("verification_report", {}),
+                "verification": runtime_result.get("verification", {}),
+                "final_report": runtime_result.get("final_report", {}),
+                "runtime_events": runtime_result.get("runtime_events", []),
+                "task_contract": runtime_result.get("task_contract", {}),
+                "capability_execution_graph": runtime_result.get("capability_execution_graph", {}),
+                "critics": runtime_result.get("critics", {}),
+                "memory_context": runtime_result.get("memory_context", {}),
                 "canvas": {
-                    "title": "Research Blocked By Locality Gate",
-                    "subtitle": "Locality constraint was not satisfied by candidate results.",
+                    "title": title_map.get(error_code, "Research Blocked"),
+                    "subtitle": subtitle_map.get(error_code, "Research could not be completed safely."),
                     "cards": [],
                 },
             }
-    if constraints.get("compare_required") and len(ranked) < 2:
-        return {
-            "ok": False,
-            "query": query,
-            "results_count": len(ranked),
-            "results": [asdict(x) for x in ranked[:10]],
-            "artifacts": {},
-            "summary": {
-                "error": "decision_quality_insufficient",
-                "detail": "Superlative request requires candidate comparison, but too few high-quality candidates were found.",
-                "constraints": constraints,
-                "elegance_budget": elegance.snapshot(),
-            },
-            "source_status": source_status,
-            "opened_url": "",
-            "canvas": {
-                "title": "Research Blocked By Human Judgment Gate",
-                "subtitle": "Need at least 2 strong candidates for a superlative/compare request.",
-                "cards": [],
-            },
-        }
-    quality_samples: List[float] = []
-    for r in ranked[:8]:
-        qr = quality_critic.evaluate(
-            title=r.title,
-            url=r.url,
-            snippet=r.snippet,
-            query=query,
-            locality_terms=constraints.get("locality_terms", []),
-            evidence_count=1,
-        )
-        quality_samples.append(float(qr.score))
-    avg_quality = (sum(quality_samples) / len(quality_samples)) if quality_samples else 0.0
-    if avg_quality < 1.2:
-        elegance.consume(4, "quality_threshold_not_met")
-        return {
-            "ok": False,
-            "query": query,
-            "results_count": len(ranked),
-            "results": [asdict(x) for x in ranked[:10]],
-            "artifacts": {},
-            "summary": {
-                "error": "quality_threshold_not_met",
-                "avg_quality": round(avg_quality, 3),
-                "constraints": constraints,
-                "elegance_budget": elegance.snapshot(),
-            },
-            "source_status": source_status,
-            "opened_url": "",
-            "canvas": {
-                "title": "Research Blocked By Quality Gate",
-                "subtitle": "Candidate quality is too low to finalize safely.",
-                "cards": [],
-            },
-        }
-    top_score = _relevance_score(ranked[0], query) if ranked else 0.0
-    if top_score < 1.25:
-        return {
-            "ok": False,
-            "query": query,
-            "results_count": 0,
-            "results": [asdict(x) for x in ranked[:10]],
-            "artifacts": {},
-            "summary": {
-                "error": "low_relevance",
-                "top_score": round(top_score, 3),
-                "query": query,
-                "elegance_budget": elegance.snapshot(),
-            },
-            "source_status": source_status,
-            "opened_url": "",
-            "canvas": {
-                "title": "Research Blocked",
-                "subtitle": "Results were not relevant enough; task not executed.",
-                "cards": [{"title": "Low relevance", "price": str(round(top_score, 3)), "source": "validator", "url": ""}],
-            },
-        }
-    # Persist negative memory for weak trailing results so future runs avoid them.
-    for r in ranked[10:]:
-        q = quality_critic.evaluate(
-            title=r.title,
-            url=r.url,
-            snippet=r.snippet,
-            query=query,
-            locality_terms=constraints.get("locality_terms", []),
-            evidence_count=0,
-        )
-        if q.level == "low":
-            memory.mark_bad_url(r.url, ",".join(q.reasons[:4]) or "low_quality")
-            rejected_low_quality += 1
-            elegance.consume(1, "reject_low_quality_candidate")
-    decision_rows: List[Dict[str, Any]] = []
-    recommendation: Dict[str, Any] = {}
-    if recommendation_intent or constraints.get("compare_required"):
-        if human_like_interaction:
-            _emit_progress(progress_cb, 76, "Drilling into source pages in browser")
-            browser_walk = _browser_research_walk(
-                query=query,
-                candidates=ranked,
-                browser_worker_mode=browser_worker_mode,
-                human_like_interaction=human_like_interaction,
-                progress_cb=progress_cb,
-                max_pages=4,
-            )
-            browser_notes = [dict(x) for x in (browser_walk.get("notes") or []) if isinstance(x, dict)]
-            if browser_walk.get("opened_url"):
-                opened_url = str(browser_walk.get("opened_url"))
-            if browser_walk.get("worker_status"):
-                source_status["browser_walk"] = str(browser_walk.get("worker_status"))
-        _emit_progress(progress_cb, 82, "Building decision matrix and recommendation")
-        decision_rows = _build_product_candidate_rows(browser_notes=browser_notes, instruction=instruction, query=query)
-        if not decision_rows and recommendation_intent and human_like_interaction:
-            curated_sources = _curated_recommendation_sources(instruction=instruction, query=query)
-            if curated_sources:
-                _emit_progress(progress_cb, 80, "Reviewing curated sources for concrete product candidates")
-                curated_walk = _browser_research_walk(
-                    query=query,
-                    candidates=curated_sources,
-                    browser_worker_mode=browser_worker_mode,
-                    human_like_interaction=human_like_interaction,
-                    progress_cb=progress_cb,
-                    max_pages=4,
-                )
-                curated_notes = [dict(x) for x in (curated_walk.get("notes") or []) if isinstance(x, dict)]
-                if curated_notes:
-                    seen_urls = {str(note.get("url", "")) for note in browser_notes}
-                    for note in curated_notes:
-                        if str(note.get("url", "")) not in seen_urls:
-                            browser_notes.append(note)
-                    decision_rows = _build_product_candidate_rows(
-                        browser_notes=browser_notes,
-                        instruction=instruction,
-                        query=query,
-                    )
-                if curated_walk.get("opened_url"):
-                    opened_url = str(curated_walk.get("opened_url"))
-                if curated_walk.get("worker_status"):
-                    source_status["browser_walk_curated"] = str(curated_walk.get("worker_status"))
-        if not decision_rows:
-            decision_rows = _build_decision_rows(results=ranked, instruction=instruction, query=query)
-            decision_rows = _merge_browser_notes_into_rows(decision_rows=decision_rows, browser_notes=browser_notes)
-        recommendation = _build_recommendation_summary(
-            decision_rows=decision_rows,
-            results=ranked,
-            instruction=instruction,
-            query=query,
-        )
-        if recommendation.get("selected_url"):
-            opened_url = str(recommendation.get("selected_url"))
-    _emit_progress(progress_cb, 84, "Building requested deliverables")
-    artifacts = _write_generic_research_artifacts(
-        instruction=instruction,
-        query=query,
-        results=ranked,
-        decision_rows=decision_rows,
-        recommendation=recommendation,
-        browser_notes=browser_notes,
-    )
-    summary = {
-        "total": len(ranked),
-        "sources": _count_by(r.source for r in ranked),
-        "constraints": constraints,
-        "judgment": {
-            "skipped_known_bad": skipped_known_bad,
-            "rejected_low_quality": rejected_low_quality,
-            "candidate_count": len(ranked),
-        },
-        "decision_candidate_count": len(decision_rows),
-        "browser_pages_reviewed": len(browser_notes),
-        "human_like_interaction": bool(human_like_interaction),
-        "browser_worker_mode": normalize_browser_worker_mode(browser_worker_mode),
-        "elegance_budget": elegance.snapshot(),
-    }
+        return runtime_result
+    graph = runtime_result.get("capability_execution_graph", {}) or {}
+    nodes = graph.get("nodes", []) if isinstance(graph.get("nodes", []), list) else []
+    research_node = next((node for node in nodes if str(node.get("capability", "")) == "research_collection"), {})
+    research_payload = dict(research_node.get("output_payload", {}) or {})
+    query = str(research_payload.get("query", ""))
+    results = [dict(x) for x in (research_payload.get("search_results") or []) if isinstance(x, dict)]
+    recommendation = dict(research_payload.get("recommendation", {}) or {})
+    browser_notes = [dict(x) for x in (research_payload.get("browser_notes") or []) if isinstance(x, dict)]
+    source_status = dict(research_payload.get("source_status", {}) or {})
+    summary = dict(research_payload.get("research_summary", {}) or {})
+    opened_url = str(research_payload.get("opened_url", "") or "")
+    artifacts = dict(runtime_result.get("artifacts", {}) or {})
+    artifact_metadata = dict(runtime_result.get("artifact_metadata", {}) or {})
     if not opened_url:
         open_target = artifacts.get("primary_open_file") or artifacts.get("dashboard_html", "")
         opened_url = Path(open_target).resolve().as_uri() if open_target else ""
     if opened_url:
         opened_url, _nav = _open_target_with_reuse(target_url=opened_url, recent_actions=[f"open_tab:{opened_url}"])
-    return {
-        "ok": True,
-        "query": query,
-        "results_count": len(ranked),
-        "results": [asdict(x) for x in ranked[:50]],
-        "artifacts": artifacts,
-        "summary": summary,
-        "source_status": source_status,
-        "opened_url": opened_url,
-        "recommendation": recommendation,
-        "canvas": {
-            "title": "Decision Package Generated" if recommendation else "Research Deliverables Generated",
-            "subtitle": str(recommendation.get("selected_title") or f"{len(ranked)} results"),
-            "cards": [
-                {
-                    "title": x.title[:90],
-                    "price": f"${x.price:.2f}" if x.price is not None else "result",
-                    "source": x.source,
-                    "url": x.url,
-                }
-                for x in ranked[:6]
-            ],
-        },
+    runtime_result["query"] = query
+    runtime_result["results_count"] = len(results)
+    runtime_result["results"] = results[:50]
+    runtime_result["artifacts"] = artifacts
+    runtime_result["artifact_metadata"] = artifact_metadata
+    runtime_result["summary"] = {**(runtime_result.get("summary", {}) or {}), **summary}
+    runtime_result["source_status"] = source_status
+    runtime_result["opened_url"] = opened_url
+    runtime_result["recommendation"] = recommendation
+    runtime_result["canvas"] = {
+        "title": "Decision Package Generated" if recommendation else "Research Deliverables Generated",
+        "subtitle": str(recommendation.get("selected_title") or f"{len(results)} results"),
+        "cards": [
+            {
+                "title": str(x.get("title", ""))[:90],
+                "price": (f"${float(x.get('price')):.2f}" if isinstance(x.get("price"), (int, float)) else "result"),
+                "source": str(x.get("source", "")),
+                "url": str(x.get("url", "")),
+            }
+            for x in results[:6]
+        ],
     }
+    return runtime_result
 
 
 def _human_judgment_constraints(instruction: str, query: str) -> Dict[str, Any]:
-    low = f"{instruction} {query}".lower()
-    compare_required = any(token in low for token in HUMAN_JUDGMENT_SUPERLATIVE_TOKENS)
-    locality_required = any(token in low for token in HUMAN_JUDGMENT_LOCALITY_TOKENS)
-    locality_terms: List[str] = []
-    m = re.search(r"\bin\s+([A-Za-z0-9 ,.-]{2,60})", instruction, flags=re.IGNORECASE)
-    if m:
-        locality_terms.append(re.sub(r"\s+", " ", m.group(1)).strip().lower())
-    if "near me" in low:
-        locality_terms.append("near me")
-    return {
-        "compare_required": compare_required,
-        "locality_required": locality_required,
-        "locality_terms": locality_terms[:5],
-    }
+    return platform_human_judgment_constraints(instruction=instruction, query=query)
 
 
 def _human_judgment_refine_queries(query: str, constraints: Dict[str, Any]) -> List[str]:
-    out: List[str] = []
-    if constraints.get("compare_required"):
-        out.append(f"top options compare {query}")
-        out.append(f"price comparison {query}")
-    locality_terms = [str(x).strip() for x in (constraints.get("locality_terms") or []) if str(x).strip()]
-    for loc in locality_terms[:2]:
-        out.append(f"{query} {loc} inventory")
-        out.append(f"{query} {loc} price")
-    return list(dict.fromkeys([x for x in out if x]))
+    return platform_human_judgment_refine_queries(query=query, constraints=constraints)
 
 
 def _apply_human_judgment_quality_gate(
@@ -6249,22 +5807,14 @@ def _apply_human_judgment_quality_gate(
     query: str,
     constraints: Dict[str, Any],
 ) -> List[SearchResult]:
-    locality_terms = [str(x).lower() for x in (constraints.get("locality_terms") or []) if str(x).strip()]
-    scored: List[tuple[SearchResult, int]] = []
-    for r in ranked:
-        quality = assess_result_quality(
-            title=r.title,
-            url=r.url,
-            snippet=r.snippet,
+    return list(
+        platform_apply_human_judgment_quality_gate(
+            ranked=ranked,
+            instruction=instruction,
             query=query,
-            locality_terms=locality_terms,
+            constraints=constraints,
         )
-        score = int(quality.score)
-        if score <= 0 or not _passes_topic_gate(r, instruction, query):
-            continue
-        scored.append((r, score))
-    scored.sort(key=lambda x: (x[1], _relevance_score(x[0], query)), reverse=True)
-    return [r for r, _ in scored]
+    )
 
 
 def _quality_score_result(result: SearchResult, query: str, locality_terms: List[str]) -> int:
@@ -6279,14 +5829,7 @@ def _quality_score_result(result: SearchResult, query: str, locality_terms: List
 
 
 def _count_locality_matches(ranked: List[SearchResult], locality_terms: List[str]) -> int:
-    if not locality_terms:
-        return 0
-    c = 0
-    for r in ranked:
-        hay = f"{str(r.title or '').lower()} {str(r.snippet or '').lower()} {str(r.url or '').lower()}"
-        if any(str(loc).lower() in hay for loc in locality_terms):
-            c += 1
-    return c
+    return int(platform_count_locality_matches(ranked=ranked, locality_terms=locality_terms))
 
 
 def _run_competitor_analysis(
@@ -6314,173 +5857,108 @@ def _run_competitor_analysis(
         }
     target = _extract_competitor_target(instruction)
     output_folder = _extract_named_output_folder(instruction, default_name=f"{target} Competitor Analysis")
-    _emit_progress(progress_cb, 16, f"Researching competitors for: {target}")
-
-    queries = _competitor_queries(target)
-    must_terms = _competitor_must_terms(target)
-    collected: List[SearchResult] = []
-    source_status: Dict[str, str] = {}
-    for i, q in enumerate(queries):
-        _emit_progress(progress_cb, 22 + int((i / max(1, len(queries))) * 40), f"Searching sources: {q}")
-        rows = _search_web(q, limit=16)
-        filtered = _filter_relevant_results(
-            rows,
-            must_terms=must_terms,
-            banned_domains={
-                "filmaffinity.com",
-                "dailymotion.com",
-                "justwatch.com",
-                "youtube.com",
-                "m.youtube.com",
-                "support.google.com",
-                "mail.google.com",
-                "gmail.com",
-            },
-            min_score=2.0,
-            preferred_domains=[],
-        )
-        collected.extend(filtered)
-        source_status[q] = f"ok:{len(filtered)}"
-
-    dedup: Dict[str, SearchResult] = {}
-    for r in collected:
-        dedup[r.url] = r
-    ranked = sorted(dedup.values(), key=lambda x: _relevance_score(x, " ".join(must_terms)), reverse=True)
-    if not ranked:
-        _emit_progress(progress_cb, 64, "No high-signal hits yet; running relaxed retrieval")
-        relaxed: List[SearchResult] = []
-        for q in queries:
-            rows = _search_web(q, limit=12)
-            relaxed.extend(
-                _filter_relevant_results(
-                    rows,
-                    must_terms=must_terms,
-                    banned_domains={
-                        "filmaffinity.com",
-                        "dailymotion.com",
-                        "justwatch.com",
-                        "youtube.com",
-                        "m.youtube.com",
-                    },
-                    min_score=1.0,
-                    preferred_domains=[],
-                )
-            )
-        if not relaxed:
-            relaxed = _curated_ehr_competitor_sources(target)
-        dedup = {}
-        for r in relaxed:
-            dedup[r.url] = r
-        ranked = sorted(dedup.values(), key=lambda x: _relevance_score(x, "ehr competitor healthcare"), reverse=True)
-    live_non_curated = _count_live_non_curated_citations(ranked)
-    if live_non_curated < min_live:
-        return {
-            "ok": False,
-            "mode": "competitor_analysis",
-            "query": f"{target} EHR competitors",
-            "results_count": len(ranked),
-            "results": [asdict(x) for x in ranked[:50]],
-            "artifacts": {},
-            "summary": {
-                "target": target,
-                "error": "insufficient_live_non_curated_citations",
-                "required_live_non_curated_citations": min_live,
-                "live_non_curated_citations": live_non_curated,
-            },
-            "source_status": source_status,
-            "opened_url": "",
-            "canvas": {
-                "title": "Run Blocked",
-                "subtitle": f"Need at least {min_live} live non-curated citations; found {live_non_curated}.",
-                "cards": [],
-            },
-        }
-    competitors = _select_top_competitors(target=target, results=ranked, top_n=5)
-    _emit_progress(progress_cb, 74, "Generating executive summary and PowerPoint")
-    executors = default_executors()
     safe_folder = re.sub(r"[<>:\"/\\\\|?*]", "", output_folder).strip() or f"{target} Competitor Analysis"
     workspace = Path("data/reports") / safe_folder
     workspace.mkdir(parents=True, exist_ok=True)
-    competitor_rows = [
-        {
-            "rank": idx,
-            "name": row.get("name", ""),
-            "segment": row.get("segment", ""),
-            "why": row.get("why", ""),
-            "citations": " | ".join(row.get("citations", [])[:3]),
-            "score": row.get("score", ""),
-        }
-        for idx, row in enumerate(competitors, start=1)
-    ]
-    task_contract = TaskContractEngine().extract(instruction).to_dict()
-    task_contract["domain"] = "competitor_analysis"
-    task_contract["audience"] = "stakeholder"
-    task_contract["requested_outputs"] = ["report", "presentation", "dashboard", "spreadsheet"]
-    context = {"task_contract": task_contract, "workspace_dir": str(workspace.resolve())}
-    analysis_results = {
-        "findings": [f"{row.get('name','')} appears in the competitive landscape for {target}." for row in competitors[:5]],
-        "recommended_actions": [
-            "Validate the shortlist against your target deployment profile.",
-            "Build a weighted scorecard for interoperability, cost, and implementation risk.",
-            "Run focused diligence on migration tooling and executive sponsorship requirements.",
-        ],
-        "caveats": [
-            "This competitor package is source-backed but still requires market-specific validation before executive use.",
-        ],
-        "insights": [row.get("why", "") for row in competitors[:5]],
-    }
-    story = executors["data_storytelling"].execute(context, {"analysis_results": analysis_results}).outputs.get("story_package", {})
-    report = executors["report_build"].execute(context, {"analysis_results": analysis_results, "story_package": story}).outputs.get("report", {})
-    presentation = executors["presentation_build"].execute(context, {"story_package": story}).outputs.get("presentation", {})
-    export = executors["artifact_export"].execute(
-        context,
-        {
-            "structured_rows": competitor_rows,
-            "research_notes": {"target": target, "summary": f"Prepared competitor landscape for {target}."},
-            "story_package": story,
-            "report": report,
-            "presentation": presentation,
+    _emit_progress(progress_cb, 16, f"Researching competitors for: {target}")
+    task_contract = TaskContractEngine().extract(instruction)
+    task_contract.domain = "competitor_analysis"
+    task_contract.audience = "stakeholder"
+    task_contract.requested_outputs = ["report", "presentation", "dashboard", "spreadsheet"]
+    runtime_graph = CapabilityPlanner(registry=default_capability_registry()).plan(task_contract)
+    runtime_result = _run_execution_graph_runtime_path(
+        instruction=instruction,
+        task_contract=task_contract,
+        graph=runtime_graph,
+        ai_meta=backend_metadata("deterministic-local"),
+        progress_cb=progress_cb,
+        mode_override="competitor_analysis",
+        extra_context={
+            "workspace_dir": str(workspace.resolve()),
+            "min_live_non_curated_citations": min_live,
         },
     )
-    artifacts = dict(export.artifacts)
-    open_target = artifacts.get("primary_open_file") or artifacts.get("executive_summary_html") or artifacts.get("dashboard_html", "")
-    opened_uri = Path(open_target).resolve().as_uri() if open_target else ""
-    if opened_uri:
-        opened_uri, _nav = _open_target_with_reuse(target_url=opened_uri, recent_actions=[f"open_tab:{opened_uri}"])
-
-    cards = []
-    for row in competitors[:6]:
-        cards.append(
-            {
-                "title": row.get("name", "")[:90],
-                "price": row.get("segment", "EHR"),
-                "source": "competitor_analysis",
-                "url": (row.get("citations") or [""])[0],
+    if not runtime_result.get("ok"):
+        error_text = str(runtime_result.get("error") or "")
+        if error_text.startswith("insufficient_live_non_curated_citations:"):
+            parts = error_text.split(":")
+            found = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+            required = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else min_live
+            return {
+                "ok": False,
+                "mode": "competitor_analysis",
+                "runtime_mode": "execution_graph_runtime",
+                "query": f"{target} EHR competitors",
+                "results_count": 0,
+                "results": [],
+                "artifacts": runtime_result.get("artifacts", {}) or {},
+                "artifact_metadata": runtime_result.get("artifact_metadata", {}) or {},
+                "summary": {
+                    "target": target,
+                    "error": "insufficient_live_non_curated_citations",
+                    "required_live_non_curated_citations": required,
+                    "live_non_curated_citations": found,
+                },
+                "source_status": {},
+                "opened_url": "",
+                "verification_report": runtime_result.get("verification_report", {}),
+                "verification": runtime_result.get("verification", {}),
+                "final_report": runtime_result.get("final_report", {}),
+                "canvas": {
+                    "title": "Run Blocked",
+                    "subtitle": f"Need at least {required} live non-curated citations; found {found}.",
+                    "cards": [],
+                },
+                "runtime_events": runtime_result.get("runtime_events", []),
+                "artifact_metadata": runtime_result.get("artifact_metadata", {}),
+                "task_contract": runtime_result.get("task_contract", {}),
+                "capability_execution_graph": runtime_result.get("capability_execution_graph", {}),
+                "critics": runtime_result.get("critics", {}),
+                "memory_context": runtime_result.get("memory_context", {}),
             }
-        )
-    return {
-        "ok": True,
-        "mode": "competitor_analysis",
-        "query": f"{target} EHR competitors",
-        "results_count": len(ranked),
-        "results": [asdict(x) for x in ranked[:50]],
-        "artifacts": artifacts,
-        "summary": {
-            "target": target,
-            "top_competitors": [x.get("name", "") for x in competitors[:5]],
-            "competitor_count": len(competitors),
-            "sources_used": len(ranked),
-            "live_non_curated_citations": live_non_curated,
-            "required_live_non_curated_citations": min_live,
-        },
-        "source_status": source_status,
-        "opened_url": opened_uri,
-        "canvas": {
-            "title": f"{target} Competitor Analysis Ready",
-            "subtitle": f"Top {len(competitors[:5])} competitors with executive summary + PowerPoint",
-            "cards": cards,
-        },
+        return runtime_result
+
+    graph = runtime_result.get("capability_execution_graph", {}) or {}
+    nodes = graph.get("nodes", []) if isinstance(graph.get("nodes", []), list) else []
+    competitor_node = next((node for node in nodes if str(node.get("capability", "")) == "competitor_research"), {})
+    competitor_payload = competitor_node.get("output_payload", {}) if isinstance(competitor_node, dict) else {}
+    rows = [dict(x) for x in (competitor_payload.get("structured_rows") or []) if isinstance(x, dict)]
+    notes = dict(competitor_payload.get("research_notes", {}) or {})
+    sources = [dict(x) for x in (competitor_payload.get("sources") or []) if isinstance(x, dict)]
+    cards = [
+        {
+            "title": str(row.get("name", ""))[:90],
+            "price": str(row.get("segment", "EHR")),
+            "source": "competitor_analysis",
+            "url": str(row.get("citations", "")).split(" | ")[0] if str(row.get("citations", "")).strip() else "",
+        }
+        for row in rows[:6]
+    ]
+    runtime_result["summary"] = {
+        **(runtime_result.get("summary", {}) or {}),
+        "target": target,
+        "top_competitors": [row.get("name", "") for row in rows[:5]],
+        "competitor_count": len(rows),
+        "sources_used": len(sources),
+        "live_non_curated_citations": int(notes.get("live_non_curated_citations", 0) or 0),
+        "required_live_non_curated_citations": int(notes.get("required_live_non_curated_citations", min_live) or min_live),
     }
+    runtime_result["results_count"] = len(sources)
+    runtime_result["results"] = [
+        {
+            "title": source.get("name", ""),
+            "url": source.get("url", ""),
+            "source": source.get("source_type", ""),
+            "snippet": source.get("snippet", ""),
+        }
+        for source in sources[:50]
+    ]
+    runtime_result["canvas"] = {
+        "title": f"{target} Competitor Analysis Ready",
+        "subtitle": f"Top {len(rows[:5])} competitors with executive summary + PowerPoint",
+        "cards": cards,
+    }
+    return runtime_result
 
 
 def _count_live_non_curated_citations(results: List[SearchResult]) -> int:
@@ -7015,49 +6493,7 @@ def _extract_role_query(instruction: str) -> str:
 
 
 def _extract_generic_query(instruction: str) -> str:
-    raw = re.sub(r"\s+", " ", str(instruction or "")).strip(" .")
-    if not raw:
-        return ""
-    if _is_wine_pairing_intent(instruction=raw, query=raw):
-        meal_match = re.search(r"\bi am having ([^.?!]+)", raw, flags=re.IGNORECASE)
-        if meal_match:
-            meal = re.sub(r"\s+", " ", meal_match.group(1)).strip(" .")
-            if meal:
-                return f"best wine for {meal}"
-        foods: List[str] = []
-        for token in ["steak", "potatoes", "lamb", "salmon", "pasta", "pizza", "burger"]:
-            if re.search(rf"\b{re.escape(token)}\b", raw, flags=re.IGNORECASE):
-                foods.append(token)
-        if foods:
-            if len(foods) == 1:
-                return f"best wine for {foods[0]}"
-            return f"best wine for {' and '.join(foods[:3])}"
-        return "best wine pairing"
-
-    first_sentence = re.split(r"(?<=[.!?])\s+", raw, maxsplit=1)[0]
-    q = first_sentence.strip(" .")
-    q = re.sub(
-        r"^\s*(?:go\s+)?(?:please\s+)?(?:research|find|search(?:\s+for)?|look(?:\s+up)?|help me find|tell me)\s+",
-        "",
-        q,
-        flags=re.IGNORECASE,
-    )
-    q = re.sub(
-        r"\b(?:and\s+)?recommend(?:\s+me)?(?:\s+which\s+one\s+to\s+buy|\s+one\s+to\s+buy|\s+the\s+best\s+one|\s+the\s+best)?\b.*$",
-        "",
-        q,
-        flags=re.IGNORECASE,
-    )
-    q = re.sub(
-        r"\b(?:build|create|make|save|write|draft|summari[sz]e|return|produce|generate|prepare|package|export)\b.*$",
-        "",
-        q,
-        flags=re.IGNORECASE,
-    )
-    q = re.sub(r"\b(?:and|then)\s+(?:produce|generate|prepare|package|export)\b.*$", "", q, flags=re.IGNORECASE)
-    q = re.sub(r"\b(from there|then|and then)\b.*$", "", q, flags=re.IGNORECASE)
-    q = re.sub(r"\s+", " ", q).strip(" .,:;")
-    return q or raw
+    return platform_extract_generic_query(instruction)
 
 
 def _extract_study_topic(instruction: str) -> str:
@@ -7622,59 +7058,11 @@ render();
 
 
 def _expand_queries(query: str, instruction: str = "") -> List[str]:
-    base = query.strip()
-    low = f"{query} {instruction}".lower()
-    variants: List[str] = [base]
-    if any(k in low for k in ["job", "position", "salary", "remote", "hiring", "linkedin", "indeed"]):
-        variants.extend(
-            [
-                f"{base} salary range",
-                f"{base} remote",
-                f"{base} United States",
-                f"{base} Ireland",
-            ]
-        )
-    elif _is_recommendation_research_intent(low):
-        focus_query = _build_recommendation_focus_query(query=query, instruction=instruction)
-        if focus_query and focus_query.lower() != base.lower():
-            variants.insert(0, focus_query)
-        if _is_wine_pairing_intent(instruction=instruction, query=query):
-            variants.extend(
-                [
-                    f"{focus_query or base} wine pairing",
-                    "cabernet sauvignon steak potatoes",
-                    "malbec steak potatoes pairing",
-                ]
-            )
-        variants.extend(
-            [
-                f"{focus_query or base} best options",
-                f"{focus_query or base} reviews",
-                f"{focus_query or base} buying guide",
-            ]
-        )
-    else:
-        variants.extend(
-            [
-                f"{base} market share",
-                f"{base} analysis",
-                f"{base} competitors",
-            ]
-        )
-    out: List[str] = []
-    for v in variants:
-        k = v.lower()
-        if k not in {x.lower() for x in out}:
-            out.append(v)
-    return out[:5]
+    return platform_expand_queries(query=query, instruction=instruction)
 
 
 def _relevance_score(result: SearchResult, query: str) -> float:
-    q_terms = _query_focus_terms(query)
-    hay = f"{result.title} {result.snippet}".lower()
-    overlap = sum(1 for t in q_terms if t in hay)
-    source_bonus = 1.0 if result.source in {"linkedin", "builtin", "amazon"} else 0.25
-    return overlap + source_bonus
+    return float(platform_relevance_score(result, query))
 
 
 def _is_target_job(title: str, strict_vp_avp: bool = False) -> bool:

@@ -57,8 +57,11 @@ class CapabilityPlanner:
                 sequence.extend(["ui_build"])
             sequence.append("artifact_export")
             return self._dedupe(sequence)
+        if contract.domain == "generic_research":
+            sequence = ["research_collection", "source_evaluation", "artifact_export"]
+            return self._dedupe(sequence)
         if contract.domain == "competitor_analysis":
-            sequence = ["deep_research", "source_evaluation", "data_storytelling", "presentation_build", "report_build", "stakeholder_summary", "artifact_export"]
+            sequence = ["competitor_research", "source_evaluation", "data_storytelling", "presentation_build", "report_build", "stakeholder_summary", "artifact_export"]
             return self._dedupe(sequence)
         sequence: List[str] = ["deep_research", "source_evaluation"]
         if contract.domain in {"payer_pricing_review", "deep_analysis"}:
@@ -91,7 +94,9 @@ class CapabilityPlanner:
 
     def _dependencies_for(self, capability: str, capability_nodes: Dict[str, str]) -> List[str]:
         dependency_order = {
-            "source_evaluation": ["deep_research"],
+            "source_evaluation": ["deep_research", "research_collection", "competitor_research"],
+            "research_collection": [],
+            "competitor_research": [],
             "file_inspection": ["deep_research"],
             "data_cleaning": ["deep_research"],
             "statistical_analysis": ["data_cleaning"],
@@ -101,13 +106,13 @@ class CapabilityPlanner:
             "code_write": ["deep_research", "rag_build"],
             "code_test": ["code_write"],
             "code_fix": ["code_test"],
-            "data_storytelling": ["statistical_analysis", "deep_research"],
-            "report_build": ["data_storytelling", "statistical_analysis", "deep_research", "code_fix"],
+            "data_storytelling": ["statistical_analysis", "deep_research", "competitor_research"],
+            "report_build": ["data_storytelling", "statistical_analysis", "deep_research", "competitor_research", "code_fix"],
             "stakeholder_summary": ["report_build", "data_storytelling"],
             "presentation_build": ["data_storytelling"],
             "spreadsheet_build": ["statistical_analysis"],
             "ui_build": ["data_visualization", "data_storytelling", "deep_research"],
-            "artifact_export": ["report_build", "stakeholder_summary", "presentation_build", "spreadsheet_build", "ui_build", "rag_build", "code_write"],
+            "artifact_export": ["report_build", "stakeholder_summary", "presentation_build", "spreadsheet_build", "ui_build", "rag_build", "code_write", "research_collection", "competitor_research"],
             "approval_gate": ["artifact_export"],
         }
         wanted = dependency_order.get(capability, [])

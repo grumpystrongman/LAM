@@ -619,7 +619,7 @@ class TestSearchAgent(unittest.TestCase):
         self.assertNotIn("email_triage", seen[:1])
         self.assertEqual(out.get("recommendation", {}).get("selected_title"), "Cabernet Sauvignon")
 
-    @patch("lam.interface.search_agent._search_web")
+    @patch("lam.operator_platform.research_primitives.search_web")
     def test_generic_research_superlative_requires_comparison_candidates(self, mock_search) -> None:
         mock_search.return_value = [
             search_agent_mod.SearchResult(
@@ -637,7 +637,7 @@ class TestSearchAgent(unittest.TestCase):
         self.assertFalse(out.get("ok"))
         self.assertEqual(out.get("summary", {}).get("error"), "decision_quality_insufficient")
 
-    @patch("lam.interface.search_agent._search_web")
+    @patch("lam.operator_platform.research_primitives.search_web")
     def test_generic_research_locality_gate_blocks_non_local_results(self, mock_search) -> None:
         mock_search.return_value = [
             search_agent_mod.SearchResult(
@@ -937,25 +937,25 @@ class TestSearchAgent(unittest.TestCase):
         self.assertFalse(result.get("ok"))
         self.assertEqual(result.get("error_code"), "geography_consistency_failed")
 
-    @patch("lam.interface.search_agent._search_web")
+    @patch("lam.operator_platform.research_primitives.search_web")
     @patch("lam.interface.search_agent._write_generic_research_artifacts")
     @patch("lam.interface.search_agent.webbrowser.open")
     @patch("lam.interface.search_agent._relevance_score", return_value=2.0)
     def test_generic_research_includes_judgment_summary(self, _mock_rel, _mock_open, mock_write, mock_search) -> None:
         mock_search.return_value = [
             search_agent_mod.SearchResult(
-                title="Concrete product listing in Durham",
+                title="Concrete whiskey product listing in Durham",
                 url="https://store.example.com/product/whiskey/durham-nc",
                 price=199.0,
                 source="duckduckgo",
-                snippet="Durham NC inventory available.",
+                snippet="Durham NC whiskey inventory available.",
             ),
             search_agent_mod.SearchResult(
-                title="Another product listing in Durham",
+                title="Another whiskey product listing in Durham",
                 url="https://shop.example.com/item/rare-whiskey-durham",
                 price=249.0,
                 source="duckduckgo",
-                snippet="Local price and pickup in Durham.",
+                snippet="Local whiskey price and pickup in Durham.",
             ),
         ]
         out_dir = self._case_dir("generic_research_judgment_summary")
@@ -968,10 +968,46 @@ class TestSearchAgent(unittest.TestCase):
         )
         self.assertTrue(out.get("ok"))
         self.assertIn("judgment", out.get("summary", {}))
+        self.assertIn("artifact_metadata", out)
+
+    @patch("lam.operator_platform.research_primitives.search_web")
+    @patch("lam.interface.search_agent._write_generic_research_artifacts")
+    @patch("lam.interface.search_agent.webbrowser.open")
+    @patch("lam.interface.search_agent._relevance_score", return_value=2.0)
+    def test_generic_research_artifacts_are_exported_through_artifact_executor(self, _mock_rel, _mock_open, mock_write, mock_search) -> None:
+        mock_search.return_value = [
+            search_agent_mod.SearchResult(
+                title="Concrete market research report",
+                url="https://example.com/report",
+                price=None,
+                source="duckduckgo",
+                snippet="Strong market research result.",
+            ),
+            search_agent_mod.SearchResult(
+                title="Another market analysis report",
+                url="https://example.com/report-2",
+                price=None,
+                source="duckduckgo",
+                snippet="Another strong market analysis result.",
+            ),
+        ]
+        out_dir = self._case_dir("generic_research_artifact_export")
+        dash_path = out_dir / "dashboard.html"
+        dash_path.write_text("<html></html>", encoding="utf-8")
+        mock_write.return_value = {"dashboard_html": str(dash_path), "primary_open_file": str(dash_path)}
+        out = search_agent_mod._run_generic_research(
+            "Research the market and build a dashboard report.",
+            progress_cb=None,
+        )
+        self.assertTrue(out.get("ok"))
+        self.assertEqual(out.get("runtime_mode"), "execution_graph_runtime")
+        self.assertIn("dashboard_html", out.get("artifacts", {}))
+        self.assertIn("dashboard_html", out.get("artifact_metadata", {}))
+        self.assertTrue(any(evt.get("event") == "graph_started" for evt in out.get("runtime_events", [])))
 
     @patch("lam.interface.search_agent._open_target_with_reuse")
     @patch("lam.interface.search_agent._browser_research_walk")
-    @patch("lam.interface.search_agent._search_web")
+    @patch("lam.operator_platform.research_primitives.search_web")
     def test_generic_research_generates_wine_recommendation(self, mock_search, mock_browser_walk, mock_open_target) -> None:
         mock_open_target.side_effect = lambda target_url, recent_actions=None: (target_url, {"decision": {"score": 80, "reasons": ["ok"]}})
         mock_browser_walk.return_value = {
@@ -1020,6 +1056,42 @@ class TestSearchAgent(unittest.TestCase):
         self.assertIn("browser_research_md", out.get("artifacts", {}))
         self.assertEqual(out.get("recommendation", {}).get("selected_title"), "Cabernet Sauvignon")
         self.assertIn("browser_worker_mode", out.get("summary", {}))
+
+    @patch("lam.interface.search_agent._search_web")
+    def test_competitor_analysis_executes_through_runtime(self, mock_search) -> None:
+        mock_search.return_value = [
+            search_agent_mod.SearchResult(
+                title="Epic vs Oracle Health",
+                url="https://example.com/oracle-health",
+                price=None,
+                source="duckduckgo",
+                snippet="Oracle Health is a common Epic competitor in hospitals.",
+            ),
+            search_agent_mod.SearchResult(
+                title="Epic vs MEDITECH",
+                url="https://example.com/meditech",
+                price=None,
+                source="duckduckgo",
+                snippet="MEDITECH appears in enterprise EHR comparisons with Epic.",
+            ),
+            search_agent_mod.SearchResult(
+                title="Epic vs athenahealth",
+                url="https://example.com/athena",
+                price=None,
+                source="duckduckgo",
+                snippet="athenahealth appears in ambulatory EHR comparisons.",
+            ),
+        ]
+        out = search_agent_mod._run_competitor_analysis(
+            "Research the top 5 competitors to Epic Systems, build a 2-page executive summary, create a PowerPoint, and save everything to a folder called Epic Competitor Analysis.",
+            progress_cb=None,
+            min_live_non_curated_citations=1,
+        )
+        self.assertTrue(out.get("ok"))
+        self.assertEqual(out.get("mode"), "competitor_analysis")
+        self.assertEqual(out.get("runtime_mode"), "execution_graph_runtime")
+        self.assertIn("competitors_csv", out.get("artifacts", {}))
+        self.assertIn("runtime_events", out)
 
     @patch("lam.interface.search_agent.ensure_browser_worker")
     @patch("playwright.sync_api.sync_playwright")
@@ -1119,7 +1191,7 @@ class TestSearchAgent(unittest.TestCase):
 
     @patch("lam.interface.search_agent._open_target_with_reuse")
     @patch("lam.interface.search_agent._browser_research_walk")
-    @patch("lam.interface.search_agent._search_web")
+    @patch("lam.operator_platform.research_primitives.search_web")
     def test_generic_research_product_compare_uses_browser_notes(self, mock_search, mock_browser_walk, mock_open_target) -> None:
         mock_open_target.side_effect = lambda target_url, recent_actions=None: (target_url, {"decision": {"score": 82, "reasons": ["ok"]}})
         mock_search.return_value = [
