@@ -117,3 +117,51 @@ The existing domain flows remain intact. The new platform layer is attached in `
 - capability-oriented world-model context
 
 This moves the repo toward reusable capability composition without breaking working flows.
+
+## Runtime Upgrade
+
+The next vertical slice is now implemented:
+
+- `lam/operator_platform/runtime.py`
+  - `ExecutionGraphRuntime` executes capability graphs in dependency order
+  - emits runtime events
+  - runs critics per node
+  - performs bounded revision loops
+  - writes artifact manifests
+
+- `lam/operator_platform/executors.py`
+  - executable capability layer for:
+    - `deep_research`
+    - `source_evaluation`
+    - `file_inspection`
+    - `data_cleaning`
+    - `statistical_analysis`
+    - `data_visualization`
+    - `rag_build`
+    - `rag_query`
+    - `code_write`
+    - `code_test`
+    - `code_fix`
+    - `data_storytelling`
+    - `report_build`
+    - `stakeholder_summary`
+    - `presentation_build`
+    - `spreadsheet_build`
+    - `ui_build`
+    - `artifact_export`
+    - `approval_gate`
+
+- `lam/operator_platform/ui_cards.py`
+  - first-class UI payload builder for:
+    - task contract card
+    - artifact manifest card
+    - critic results card
+    - execution graph card
+    - memory context card
+
+- `lam/interface/search_agent.py`
+  - now routes true UI-architecture prompts through the graph runtime
+  - preserves existing job, competitor, shopping, payer, and code-workbench routes
+
+- `lam/interface/web_ui.py`
+  - renders platform cards in the main summary and canvas instead of leaving them hidden in raw JSON

@@ -8,12 +8,14 @@ from lam.operator_platform import (
     CapabilityPlanner,
     CompletionCritic,
     DataQualityCritic,
+    ExecutionGraphRuntime,
     MemoryStore,
     PresentationCritic,
     SourceCritic,
     StoryCritic,
     TaskContractEngine,
     UIUXCritic,
+    build_platform_cards,
     build_presentation_outline,
     build_story_package,
     build_ui_delivery,
@@ -24,6 +26,7 @@ from lam.operator_platform import (
     default_capability_registry,
     descriptive_statistics,
     detect_outliers,
+    default_executors,
     generate_chart_spec,
     insight_generation,
     missing_value_report,
@@ -119,6 +122,33 @@ class TestOperatorPlatform(unittest.TestCase):
             metadata={"artifact_key": "report"},
         )
         self.assertEqual(len(store.recent_artifacts("abc")), 1)
+        memory_id = store.save_memory(
+            {
+                "type": "project_context",
+                "scope": "project",
+                "project_id": "proj1",
+                "content": {"note": "Fairfax payer package"},
+                "tags": ["payer", "fairfax"],
+                "source": "unit_test",
+                "confidence": 0.8,
+                "retrieval_policy": "strict",
+                "invalidation_keys": {"geography": "Fairfax, VA", "domain": "payer_pricing_review"},
+            }
+        )
+        retrieved = store.retrieve_relevant_memory(
+            task_contract=TaskContractEngine().extract("Build a payer pricing package for Fairfax, VA.").to_dict(),
+            query="Fairfax payer package",
+            limit=5,
+            project_id="proj1",
+        )
+        self.assertTrue(any(item.get("memory_id") == memory_id for item in retrieved.get("used", [])))
+        rejected = store.retrieve_relevant_memory(
+            task_contract=TaskContractEngine().extract("Build a payer pricing package for Durham, NC.").to_dict(),
+            query="Durham payer package",
+            limit=5,
+            project_id="proj1",
+        )
+        self.assertTrue(any("conflicts on geography" in item.get("reason", "") for item in rejected.get("rejected", [])))
 
     def test_data_science_functions(self) -> None:
         rows = [
@@ -166,6 +196,76 @@ class TestOperatorPlatform(unittest.TestCase):
         self.assertTrue(PresentationCritic().evaluate(outline).passed)
         self.assertTrue(UIUXCritic().evaluate(ui).passed)
         self.assertGreaterEqual(len(outline["slides"]), 5)
+
+    def test_competitor_package_exports_through_executor(self) -> None:
+        executors = default_executors()
+        context = {
+            "task_contract": {
+                "user_goal": "Research the top competitors to Epic Systems and build stakeholder artifacts.",
+                "domain": "competitor_analysis",
+                "audience": "stakeholder",
+                "requested_outputs": ["report", "presentation", "dashboard", "spreadsheet"],
+            },
+            "workspace_dir": str(self.root / "competitor_workspace"),
+        }
+        export = executors["artifact_export"].execute(
+            context,
+            {
+                "structured_rows": [
+                    {"rank": 1, "name": "Oracle Health (Cerner)", "segment": "Enterprise EHR", "why": "Large enterprise overlap.", "citations": "https://www.oracle.com/health/", "score": 0.95},
+                    {"rank": 2, "name": "MEDITECH", "segment": "Enterprise EHR", "why": "Hospital presence.", "citations": "https://ehr.meditech.com/", "score": 0.88},
+                ],
+                "research_notes": {"target": "Epic Systems", "summary": "Prepared competitor landscape."},
+                "story_package": {
+                    "executive_summary": "Epic faces concentrated enterprise competition.",
+                    "key_findings": ["Oracle Health and MEDITECH appear consistently."],
+                    "recommended_actions": ["Validate shortlist with segment-specific criteria."],
+                    "caveats": ["Use live market diligence before executive circulation."],
+                    "so_what": "This narrows the diligence set for leadership.",
+                },
+                "report": {"markdown": "# Executive Summary\nEpic faces concentrated enterprise competition.\n"},
+                "presentation": {"slides": [{"title": "Executive Summary", "bullets": ["Epic faces concentrated enterprise competition."]}]},
+            },
+        )
+        self.assertIn("competitors_csv", export.artifacts)
+        self.assertIn("executive_summary_md", export.artifacts)
+        self.assertIn("powerpoint_pptx", export.artifacts)
+        self.assertIn("dashboard_html", export.artifacts)
+        self.assertIn("dashboard_html", export.artifact_metadata)
+
+    def test_execution_graph_runtime_runs_and_revises(self) -> None:
+        contract = TaskContractEngine().extract("Build an executive summary report and slides for stakeholders.")
+        graph = CapabilityPlanner().plan(contract)
+        runtime = ExecutionGraphRuntime(
+            memory_store=MemoryStore(path=self.root / "runtime_memory.db"),
+            artifact_factory=ArtifactFactory(manifests_root=self.root / "runtime_manifests"),
+        )
+        result = runtime.run(graph, {"task_contract": contract.to_dict(), "workspace_dir": str(self.root / "runtime_workspace")})
+        self.assertTrue(result.ok)
+        self.assertTrue(result.artifacts)
+        self.assertTrue(result.verification_report.get("final_verification") == "passed")
+        self.assertTrue(result.artifact_metadata)
+        self.assertTrue(any(evt.get("event") == "graph_started" for evt in result.events))
+        self.assertTrue(any(evt.get("event") == "revision_started" for evt in result.events))
+        self.assertTrue(any(node.status in {"revised", "succeeded"} for node in result.graph.nodes))
+
+    def test_build_platform_cards(self) -> None:
+        payload = {
+            "task_contract": TaskContractEngine().extract("Build a report for Fairfax, VA stakeholders.").to_dict(),
+            "artifacts": {"summary_report_md": "C:\\temp\\summary_report.md"},
+            "artifact_manifest": {"validation_status": "passed", "created_at": "2026-04-26T12:00:00", "source_data": ["user://instruction"]},
+            "critics": {"platform": {"story": {"passed": True, "score": 0.9, "reason": "ok", "required_fix": ""}}},
+            "capability_execution_graph": {"status": "succeeded", "nodes": [{"node_id": "n01", "capability": "report_build", "status": "succeeded", "attempts": 1}], "events": [{"event": "graph_started"}]},
+            "memory_context": {"used": [{"type": "project_context", "content": {"note": "Use concise style"}}], "rejected": [], "retrieval_confidence": 0.9},
+            "revisions_performed": [{"critic": "story", "required_fix": "Add so-what"}],
+        }
+        cards = build_platform_cards(payload)
+        self.assertIn("task_contract", cards)
+        self.assertIn("artifact_manifest", cards)
+        self.assertIn("items", cards["artifact_manifest"])
+        self.assertIn("critic_results", cards)
+        self.assertIn("execution_graph", cards)
+        self.assertIn("memory_context", cards)
 
 
 if __name__ == "__main__":

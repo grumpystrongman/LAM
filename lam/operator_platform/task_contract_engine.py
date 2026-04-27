@@ -85,6 +85,10 @@ class TaskContractEngine:
             return "payer_pricing_review"
         if any(token in low for token in ["inbox", "gmail", "draft replies", "email triage"]):
             return "email_triage"
+        if any(token in low for token in ["linkedin", "indeed", "job board", "job boards", "salary", "vp of data", "vp data", "avp data"]):
+            return "job_market"
+        if any(token in low for token in ["competitor", "competitors", "oracle health", "epic systems", "market landscape"]):
+            return "competitor_analysis"
         if any(
             token in low
             for token in [

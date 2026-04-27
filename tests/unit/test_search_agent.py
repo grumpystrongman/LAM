@@ -784,32 +784,29 @@ class TestSearchAgent(unittest.TestCase):
         plan_arg = mock_exec_native.call_args.kwargs.get("plan", {})
         self.assertEqual(plan_arg.get("domain"), "code_workbench")
 
-    @patch("lam.interface.search_agent._execute_native_plan")
-    def test_deep_analysis_prompt_routes_into_code_workbench_without_vscode_phrase(self, mock_exec_native) -> None:
-        mock_exec_native.return_value = {
-            "ok": True,
-            "mode": "autonomous_plan_execute",
-            "query": "deep analysis",
-            "results_count": 1,
-            "results": [],
-            "artifacts": {
-                "workspace_directory": "C:\\temp\\deep_work",
-                "analysis_script_py": "C:\\temp\\deep_work\\src\\analysis.py",
-                "workspace_readme_md": "C:\\temp\\deep_work\\README.md",
-                "smoke_log": "C:\\temp\\deep_work\\artifacts\\smoke.log",
-            },
-            "summary": {},
-            "source_status": {"deep_workbench": "ok"},
-            "opened_url": "C:\\temp\\deep_work\\README.md",
-            "canvas": {"title": "Code Workbench Ready", "subtitle": "scaffold", "cards": []},
-        }
+    def test_ui_build_prompt_routes_through_execution_graph_runtime(self) -> None:
+        result = execute_instruction(
+            "Redesign the app into a clean commercial chat and canvas UI with artifact viewers and a polished dashboard.",
+            control_granted=True,
+        )
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(result.get("mode"), "execution_graph_runtime")
+        self.assertIn("ui_cards", result)
+        self.assertIn("artifact_manifest_json", result.get("artifacts", {}))
+        self.assertTrue(any(evt.get("event") == "graph_started" for evt in result.get("runtime_events", [])))
+        self.assertTrue(any(evt.get("event") == "revision_started" for evt in result.get("runtime_events", [])))
+        self.assertEqual(result.get("task_contract", {}).get("domain"), "ui_build")
+
+    def test_deep_analysis_prompt_routes_through_execution_graph_runtime_without_vscode_phrase(self) -> None:
         result = execute_instruction(
             "Research public hospital pricing data, build a RAG model, write and test the code, fix failures, and package the result for stakeholders.",
             control_granted=True,
         )
         self.assertTrue(result.get("ok"))
-        plan_arg = mock_exec_native.call_args.kwargs.get("plan", {})
-        self.assertEqual(plan_arg.get("domain"), "code_workbench")
+        self.assertEqual(result.get("mode"), "execution_graph_runtime")
+        self.assertEqual(result.get("task_contract", {}).get("domain"), "deep_analysis")
+        self.assertIn("artifact_manifest_json", result.get("artifacts", {}))
+        self.assertTrue(any(evt.get("event") == "graph_started" for evt in result.get("runtime_events", [])))
 
     @patch("lam.interface.search_agent.subprocess.run")
     @patch("lam.interface.search_agent.build_code_workbench_workspace")
@@ -1876,6 +1873,8 @@ class TestSearchAgent(unittest.TestCase):
         self.assertIn("document_md", result.get("artifacts", {}))
         self.assertIn("powerpoint_pptx", result.get("artifacts", {}))
         self.assertIn("visual_html", result.get("artifacts", {}))
+        self.assertEqual(result.get("runtime_mode"), "execution_graph_runtime")
+        self.assertIn("artifact_manifest_json", result.get("artifacts", {}))
         mock_search.assert_not_called()
         self.assertTrue(str(result.get("opened_url", "")).startswith("file:///"))
 

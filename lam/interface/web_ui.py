@@ -428,6 +428,10 @@ HTML_PAGE = """<!doctype html>
         <div class="small">Artifacts</div>
         <div class="artifact-list" id="artifactListCanvas">No artifacts yet.</div>
       </div>
+      <div class="canvas-section" id="platformCanvasSection">
+        <div class="small">Task Context</div>
+        <div class="summary-grid" id="platformCardsCanvas"></div>
+      </div>
       <div class="canvas-section canvas-debug">
         <details>
           <summary>Developer Details</summary>
@@ -525,6 +529,7 @@ HTML_PAGE = """<!doctype html>
       <div class="summary-head" id="summaryHead">Waiting for your instruction</div>
       <div class="summary-sub" id="summarySub">Use Preview or Run to start.</div>
       <div class="summary-grid" id="summaryCards"></div>
+      <div class="summary-grid" id="platformCards"></div>
       <div class="artifact-list" id="artifactList"></div>
       <div class="progress-log" id="activityLog">No activity yet.</div>
       <div id="strictDiagWrap" class="strict-wrap" style="display:none;">
@@ -707,6 +712,7 @@ function renderSummary(r){
     if(canvasList){ canvasList.innerText = "No artifacts yet."; }
   }
   document.getElementById("summaryCards").innerHTML = cards.slice(0,6).map(c=>`<div class="summary-card"><div class="t">${escapeHtml(c.t||"")}</div><div class="m">${escapeHtml(c.m||"")}</div></div>`).join("");
+  renderPlatformCards(r||{});
 
   const activity=[];
   if(Array.isArray(r?.narration)){ r.narration.forEach(x=>activity.push(`- ${x}`)); }
@@ -739,6 +745,69 @@ function renderSummary(r){
     toggleCanvas(true);
   }
   renderStrictRules(r||{});
+}
+function renderPlatformCards(r){
+  const cards = r?.ui_cards || {};
+  const sections = [];
+  const pushSection = (title, body) => {
+    if(!body){ return; }
+    sections.push(`<details class="summary-card"><summary class="t">${escapeHtml(title)}</summary><div class="m" style="margin-top:8px;">${body}</div></details>`);
+  };
+  const contract = cards?.task_contract || {};
+  if(contract?.goal || contract?.domain){
+    pushSection("Task Contract",
+      [
+        contract.goal ? `<div><strong>Goal:</strong> ${escapeHtml(contract.goal)}</div>` : "",
+        contract.audience ? `<div><strong>Audience:</strong> ${escapeHtml(contract.audience)}</div>` : "",
+        contract.domain ? `<div><strong>Domain:</strong> ${escapeHtml(contract.domain)}</div>` : "",
+        contract.geography ? `<div><strong>Geography:</strong> ${escapeHtml(contract.geography)}</div>` : "",
+        Array.isArray(contract.requested_outputs) && contract.requested_outputs.length ? `<div><strong>Outputs:</strong> ${escapeHtml(contract.requested_outputs.join(", "))}</div>` : "",
+        Array.isArray(contract.constraints) && contract.constraints.length ? `<div><strong>Constraints:</strong> ${escapeHtml(contract.constraints.join(" | "))}</div>` : "",
+      ].filter(Boolean).join("")
+    );
+  }
+  const manifest = cards?.artifact_manifest || {};
+  if(Array.isArray(manifest?.items) && manifest.items.length){
+    pushSection("Artifact Manifest",
+      manifest.items.slice(0,8).map(item=>{
+        const href = artifactHref(item.path || "");
+        const label = item.title || item.key || "artifact";
+        const meta = [
+          item.type ? `type: ${item.type}` : "",
+          item.validation_state ? `state: ${item.validation_state}` : "",
+        ].filter(Boolean).join(" | ");
+        const evidence = item.evidence_summary ? `<div class="small">${escapeHtml(item.evidence_summary)}</div>` : "";
+        return `<div style="margin-bottom:10px"><a href="${escapeHtml(href)}" target="_blank" rel="noopener">${escapeHtml(label)}</a>${meta ? ` <span class="small">${escapeHtml(meta)}</span>` : ""}${evidence}</div>`;
+      }).join("")
+    );
+  }
+  const critic = cards?.critic_results || {};
+  if(Array.isArray(critic?.items) && critic.items.length){
+    pushSection("Critic Results",
+      critic.items.map(item=>{
+        const state = item.passed ? "pass" : "needs work";
+        const fix = item.required_fix ? ` | fix: ${item.required_fix}` : "";
+        return `<div><strong>${escapeHtml(item.critic || "critic")}</strong>: ${escapeHtml(state)} (${escapeHtml(String(item.score || ""))})${fix ? escapeHtml(fix) : ""}</div>`;
+      }).join("")
+    );
+  }
+  const graph = cards?.execution_graph || {};
+  if(Array.isArray(graph?.nodes) && graph.nodes.length){
+    pushSection("Execution Graph",
+      graph.nodes.slice(0,10).map(node=>`<div><strong>${escapeHtml(node.capability || "")}</strong>: ${escapeHtml(node.status || "")}${node.attempts ? ` (${escapeHtml(String(node.attempts))} attempt)` : ""}</div>`).join("")
+    );
+  }
+  const memory = cards?.memory_context || {};
+  if((Array.isArray(memory?.used) && memory.used.length) || (Array.isArray(memory?.rejected) && memory.rejected.length)){
+    const used = Array.isArray(memory.used) ? memory.used.slice(0,4).map(item=>`<div><strong>${escapeHtml(item.type || "memory")}</strong>: ${escapeHtml(JSON.stringify(item.content || {}).slice(0,120))}</div>`).join("") : "";
+    const rejected = Array.isArray(memory.rejected) ? memory.rejected.slice(0,4).map(item=>`<div class="small">Rejected: ${escapeHtml(item.reason || "")}</div>`).join("") : "";
+    pushSection("Memory Context", `${used}${rejected}`);
+  }
+  const html = sections.join("");
+  const mount = document.getElementById("platformCards");
+  if(mount){ mount.innerHTML = html; }
+  const canvasMount = document.getElementById("platformCardsCanvas");
+  if(canvasMount){ canvasMount.innerHTML = html || "<div class='small'>No task context cards yet.</div>"; }
 }
 function _assistantMessageHtml(text, kind){
   return `<div class="assistant-msg ${escapeHtml(kind||"agent")}">${escapeHtml(String(text||""))}</div>`;

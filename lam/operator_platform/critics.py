@@ -29,7 +29,7 @@ class ActionCritic:
 class SourceCritic:
     def evaluate(self, sources: Iterable[Dict[str, Any]]) -> CriticResult:
         rows = [s for s in sources if isinstance(s, dict)]
-        credible = [s for s in rows if str(s.get("url", "")).startswith(("http://", "https://", "file://", "sample://"))]
+        credible = [s for s in rows if str(s.get("url", "")).startswith(("http://", "https://", "file://", "sample://", "user://"))]
         if not credible:
             return CriticResult(False, 0.1, "No source references available.", "Add source-backed evidence.", "high")
         return CriticResult(True, min(1.0, 0.4 + len(credible) * 0.1), "Source set is referenced.", "", "low")
@@ -87,9 +87,10 @@ class CompletionCritic:
         missing: List[str] = []
         mapping = {
             "spreadsheet": {"spreadsheet", "workbook_xlsx", "decision_matrix_csv", "outreach_candidates_csv"},
-            "report": {"report_md", "summary_report_md", "workspace_readme_md", "recommendation_md"},
+            "report": {"report_md", "summary_report_md", "workspace_readme_md", "recommendation_md", "document_md", "executive_summary_md"},
+            "executive_summary": {"executive_summary_md", "summary_report_md", "report_md", "document_md"},
             "dashboard": {"dashboard_html", "payer_dashboard_html", "shopping_dashboard_html"},
-            "presentation": {"presentation_md", "slides_md"},
+            "presentation": {"presentation_md", "slides_md", "powerpoint_pptx"},
             "rag_index": {"rag_index_db"},
             "code": {"analysis_script_py"},
             "ui": {"ui_spec_json", "dashboard_html"},

@@ -45,6 +45,11 @@ class TestWebUiHumanSuite(unittest.TestCase):
             self.assertEqual(state.human_suite_task_id, task_id)
             self.assertEqual(state.human_suite_result.get("mode"), "human_operator_20_test_suite")
 
+    def test_html_contains_platform_card_mounts(self) -> None:
+        self.assertIn('id="platformCards"', web_ui.HTML_PAGE)
+        self.assertIn('id="platformCardsCanvas"', web_ui.HTML_PAGE)
+        self.assertIn("function renderPlatformCards", web_ui.HTML_PAGE)
+
     def test_start_killer_suite_task_stores_result(self) -> None:
         state = web_ui.UiState()
         fake_result = {

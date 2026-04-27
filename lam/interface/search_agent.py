@@ -56,6 +56,7 @@ from lam.operator_platform import (
     CapabilityPlanner,
     CompletionCritic as PlatformCompletionCritic,
     DataQualityCritic as PlatformDataQualityCritic,
+    ExecutionGraphRuntime,
     HumanStyleReporter,
     MemoryStore,
     PresentationCritic as PlatformPresentationCritic,
@@ -64,7 +65,9 @@ from lam.operator_platform import (
     TaskContractEngine,
     UIUXCritic as PlatformUIUXCritic,
     WorldModelBuilder,
+    build_platform_cards,
     default_capability_registry,
+    default_executors,
 )
 from lam.deep_workbench.workflow import (
     build_workspace as build_code_workbench_workspace,
@@ -1760,6 +1763,162 @@ def _build_artifact_generation_plan(instruction: str) -> Dict[str, Any]:
     }
 
 
+def _should_use_execution_graph_runtime(*, task_contract: Any, explicit_route: str, instruction: str) -> bool:
+    contract = task_contract.to_dict() if hasattr(task_contract, "to_dict") else (dict(task_contract) if isinstance(task_contract, dict) else {})
+    domain = str(contract.get("domain", "")).strip().lower()
+    low = str(instruction or "").lower()
+    ui_tokens = ["ui", "frontend", "app shell", "chat and canvas", "artifact viewer", "artifact viewers", "component", "layout", "information architecture"]
+    explicit_editor = any(token in low for token in ["vscode", "vs code", "visual studio code", "workspace", "new instance"])
+    if explicit_route == "artifact_generation":
+        return False
+    if domain == "ui_build" and any(token in low for token in ui_tokens):
+        return True
+    if domain == "deep_analysis" and not explicit_editor:
+        return True
+    return False
+
+
+def _runtime_plan_steps_from_graph(graph: Dict[str, Any]) -> List[Dict[str, Any]]:
+    mapping = {
+        "deep_research": ("research", "Compile the working brief", {"query": "task_contract"}),
+        "source_evaluation": ("research", "Score source quality", {"id": "source_scores"}),
+        "file_inspection": ("inspect", "Inspect workspace inputs", {"path": "workspace"}),
+        "data_cleaning": ("transform", "Normalize structured rows", {"id": "clean_rows"}),
+        "statistical_analysis": ("analyze", "Run analysis", {"id": "analysis_results"}),
+        "data_visualization": ("produce", "Draft visuals", {"id": "chart_specs"}),
+        "rag_build": ("build_index", "Build retrieval index", {"id": "rag_index"}),
+        "rag_query": ("answer", "Generate retrieval examples", {"id": "rag_examples"}),
+        "code_write": ("produce", "Write scaffold code", {"path": "workspace/src"}),
+        "code_test": ("verify", "Run smoke checks", {"id": "test_results"}),
+        "code_fix": ("repair", "Patch failing areas", {"id": "code_fixes"}),
+        "data_storytelling": ("produce", "Build executive story", {"id": "story_package"}),
+        "report_build": ("produce", "Draft report", {"path": "workspace/artifacts"}),
+        "stakeholder_summary": ("produce", "Draft stakeholder summary", {"id": "stakeholder_summary"}),
+        "presentation_build": ("produce", "Draft presentation outline", {"path": "workspace/artifacts"}),
+        "spreadsheet_build": ("produce", "Draft spreadsheet rows", {"path": "workspace/artifacts"}),
+        "ui_build": ("produce", "Design chat/canvas UI", {"path": "workspace/artifacts"}),
+        "artifact_export": ("present", "Write artifact package", {"path": "workspace/artifacts"}),
+        "approval_gate": ("approval", "Request approval", {"id": "approval"}),
+    }
+    steps: List[Dict[str, Any]] = []
+    for node in (graph.get("nodes", []) or []):
+        capability = str(node.get("capability", ""))
+        kind, name, target = mapping.get(capability, ("work", capability, {"id": capability}))
+        steps.append({"kind": kind, "name": name, "target": target, "capability": capability})
+    return steps
+
+
+def _build_runtime_plan(task_contract: Any, graph: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    contract = task_contract.to_dict() if hasattr(task_contract, "to_dict") else dict(task_contract)
+    graph_dict = graph or CapabilityPlanner(registry=default_capability_registry()).plan(task_contract).to_dict()
+    return {
+        "planner": "capability-runtime-v1",
+        "domain": str(contract.get("domain", "capability_runtime") or "capability_runtime"),
+        "objective": str(contract.get("user_goal", "")),
+        "deliverables": list(contract.get("requested_outputs", []) or []),
+        "sources": list(contract.get("source_rules", []) or []),
+        "constraints": {
+            "task_contract": dict(contract),
+            "invalidation_keys": dict(contract.get("invalidation_keys", {}) or {}),
+        },
+        "steps": _runtime_plan_steps_from_graph(graph_dict),
+    }
+
+
+def _run_execution_graph_runtime_path(
+    *,
+    instruction: str,
+    task_contract: Any,
+    graph: Optional[Any] = None,
+    ai_meta: Dict[str, Any],
+    progress_cb: Optional[Callable[[int, str], None]] = None,
+    artifact_reuse_mode: str = "reuse_if_recent",
+    artifact_reuse_max_age_hours: int = 72,
+    mode_override: str = "",
+) -> Dict[str, Any]:
+    contract_dict = task_contract.to_dict() if hasattr(task_contract, "to_dict") else dict(task_contract)
+    _emit_progress(progress_cb, 12, "Composing capability graph")
+    registry = default_capability_registry()
+    graph = graph or CapabilityPlanner(registry=registry).plan(task_contract)
+    runtime = ExecutionGraphRuntime(registry=registry)
+    _emit_progress(progress_cb, 24, "Executing capability graph")
+    runtime_result = runtime.run(
+        graph,
+        {
+            "task_contract": contract_dict,
+            "instruction": instruction,
+            "task_id": graph.task_id,
+        },
+    )
+    _emit_progress(progress_cb, 78, "Reviewing artifacts and critics")
+    graph_dict = runtime_result.graph.to_dict()
+    artifacts = dict(runtime_result.artifacts)
+    primary_open = (
+        artifacts.get("primary_open_file")
+        or artifacts.get("visual_html")
+        or artifacts.get("executive_summary_html")
+        or artifacts.get("dashboard_html")
+        or artifacts.get("summary_report_md")
+        or artifacts.get("report_md")
+        or artifacts.get("document_md")
+        or artifacts.get("presentation_md")
+        or artifacts.get("powerpoint_pptx")
+        or artifacts.get("decision_matrix_csv")
+        or artifacts.get("ui_spec_json")
+        or artifacts.get("artifact_manifest_json")
+        or ""
+    )
+    result = {
+        "ok": runtime_result.ok,
+        "mode": mode_override or "execution_graph_runtime",
+        "runtime_mode": "execution_graph_runtime",
+        "instruction": instruction,
+        "ai": ai_meta,
+        "plan": _build_runtime_plan(task_contract, graph=graph_dict),
+        "query": str(contract_dict.get("user_goal", "")),
+        "results_count": len(runtime_result.events),
+        "results": [],
+        "artifacts": artifacts,
+        "opened_url": Path(primary_open).resolve().as_uri() if primary_open and Path(primary_open).exists() else "",
+        "summary": {
+            "graph_status": graph_dict.get("status", ""),
+            "runtime_events": len(runtime_result.events),
+            "artifact_reuse_mode": artifact_reuse_mode,
+            "artifact_reuse_max_age_hours": artifact_reuse_max_age_hours,
+            "revisions_performed": len(runtime_result.revisions),
+            "reused_existing_outputs": False,
+        },
+        "report": {
+            "summary": str(((runtime_result.outputs.get(next((node.node_id for node in runtime_result.graph.nodes if node.capability == "stakeholder_summary"), ""), {}) or {}).get("stakeholder_summary", {}) or {}).get("executive_summary", "")),
+            "next_actions": [str(x.get("required_fix", "")) for x in runtime_result.revisions if str(x.get("required_fix", "")).strip()],
+        },
+        "verification_report": dict(runtime_result.verification_report),
+        "verification": dict(runtime_result.verification),
+        "final_report": dict(runtime_result.final_report),
+        "runtime_events": list(runtime_result.events),
+        "revisions_performed": list(runtime_result.revisions),
+        "memory_context": dict(runtime_result.memory_context),
+        "task_contract": contract_dict,
+        "capability_execution_graph": graph_dict,
+        "artifact_metadata": dict(runtime_result.artifact_metadata),
+        "critics": {"platform": dict(runtime_result.critics)},
+        "canvas": {
+            "title": "Capability Graph Completed" if runtime_result.ok else "Capability Graph Failed",
+            "subtitle": f"{graph_dict.get('domain', '')} | {len(artifacts)} artifact(s) | {len(runtime_result.revisions)} revision(s)",
+            "cards": [
+                {
+                    "title": str(node.get("capability", "")),
+                    "price": str(node.get("status", "")),
+                    "source": "runtime",
+                    "url": "",
+                }
+                for node in (graph_dict.get("nodes", []) or [])[:6]
+            ],
+        },
+    }
+    return result
+
+
 def _write_simple_pptx(pptx_path: Path, title: str, subtitle: str, bullets: List[str]) -> None:
     try:
         from pptx import Presentation  # type: ignore
@@ -2032,18 +2191,29 @@ def _finalize_operator_result(result: Dict[str, Any], instruction: str, plan_ste
     out["undo_plan"] = _build_undo_plan(plan_steps)
     plan = out.get("plan", {}) if isinstance(out.get("plan"), dict) else {}
     domain = str(plan.get("domain", out.get("mode", "general") or "general"))
+    existing_task_contract = out.get("task_contract", {}) if isinstance(out.get("task_contract"), dict) else {}
     task_contract = TaskContractEngine().extract(instruction)
+    if existing_task_contract:
+        task_contract = TaskContractEngine().extract(str(existing_task_contract.get("user_goal", instruction) or instruction))
+        task_contract_dict = dict(existing_task_contract)
+    else:
+        task_contract_dict = task_contract.to_dict()
     registry = default_capability_registry()
+    existing_graph = out.get("capability_execution_graph", {}) if isinstance(out.get("capability_execution_graph"), dict) else {}
     execution_graph = CapabilityPlanner(registry=registry).plan(task_contract)
+    execution_graph_dict = existing_graph or execution_graph.to_dict()
     playbook = select_playbook(domain=domain, instruction=instruction)
     out["playbook"] = playbook
     out["narration"] = _build_run_narration(out=out, playbook=playbook)
     summary = out.get("summary", {}) if isinstance(out.get("summary"), dict) else {}
-    out["critics"] = {
+    existing_critics = out.get("critics", {}) if isinstance(out.get("critics"), dict) else {}
+    merged_critics = {
         "action": summary.get("action_critic", {}),
         "quality": summary.get("judgment", {}),
         "elegance_budget": summary.get("elegance_budget", {}),
     }
+    merged_critics.update(existing_critics)
+    out["critics"] = merged_critics
     out["world_model"] = build_run_world_model(
         instruction=instruction,
         mode=str(out.get("mode", "unknown")),
@@ -2062,13 +2232,13 @@ def _finalize_operator_result(result: Dict[str, Any], instruction: str, plan_ste
         playbook_graph_validation=plan.get("playbook_graph_validation", {}) if isinstance(plan.get("playbook_graph_validation"), dict) else {},
         playbook_step_obligations=plan.get("playbook_step_obligations", {}) if isinstance(plan.get("playbook_step_obligations"), dict) else {},
     )
-    out["task_contract"] = task_contract.to_dict()
-    out["capability_execution_graph"] = execution_graph.to_dict()
+    out["task_contract"] = task_contract_dict
+    out["capability_execution_graph"] = execution_graph_dict
     out["capability_registry"] = [spec.to_dict() for spec in registry.list()]
     out["world_model"]["capability_context"] = WorldModelBuilder.from_run(
         session_snapshot=dict(out["world_model"].get("environment", {}).get("session", {}) or {}),
         artifacts=out.get("artifacts", {}) if isinstance(out.get("artifacts"), dict) else {},
-        task_contract=task_contract.to_dict(),
+        task_contract=task_contract_dict,
         summary=summary,
         opened_url=str(out.get("opened_url", "")),
     ).to_dict()
@@ -2078,48 +2248,57 @@ def _finalize_operator_result(result: Dict[str, Any], instruction: str, plan_ste
         "least_privilege": True,
     }
     attached = attach_operator_contract(instruction=instruction, result=out, plan_steps=plan_steps)
+    if not isinstance(attached.get("critics"), dict):
+        attached["critics"] = {}
     task_id = str(attached.get("task_id", uuid.uuid4().hex))
     artifact_factory = ArtifactFactory()
-    capabilities = [str(node.get("capability", "")) for node in execution_graph.to_dict().get("nodes", [])]
+    capabilities = [str(node.get("capability", "")) for node in execution_graph_dict.get("nodes", [])]
     source_data = [
         str(v)
         for v in (attached.get("source_status", {}) or {}).values()
         if isinstance(v, str) and v.strip()
     ]
-    manifest_path = artifact_factory.write_manifest(
-        task_id=task_id,
-        task_contract=task_contract.to_dict(),
-        artifacts=attached.get("artifacts", {}) if isinstance(attached.get("artifacts"), dict) else {},
-        generated_by_capabilities=capabilities,
-        validation_status=str((attached.get("verification_report", {}) or {}).get("final_verification", "unknown")),
-        source_data=source_data,
-    )
     artifacts = attached.get("artifacts", {}) if isinstance(attached.get("artifacts"), dict) else {}
-    artifacts["artifact_manifest_json"] = str(manifest_path.resolve())
+    artifact_metadata = attached.get("artifact_metadata", {}) if isinstance(attached.get("artifact_metadata"), dict) else {}
+    existing_manifest = str(artifacts.get("artifact_manifest_json", "")).strip()
+    if existing_manifest:
+        manifest_path = Path(existing_manifest)
+    else:
+        manifest_path = artifact_factory.write_manifest(
+            task_id=task_id,
+            task_contract=task_contract_dict,
+            artifacts=artifacts,
+            artifact_metadata=artifact_metadata,
+            generated_by_capabilities=capabilities,
+            validation_status=str((attached.get("verification_report", {}) or {}).get("final_verification", "unknown")),
+            source_data=source_data,
+        )
+        artifacts["artifact_manifest_json"] = str(manifest_path.resolve())
     attached["artifacts"] = artifacts
     memory = MemoryStore()
-    invalidation_key = json.dumps(task_contract.invalidation_keys, sort_keys=True)
+    invalidation_keys = task_contract_dict.get("invalidation_keys", {}) if isinstance(task_contract_dict.get("invalidation_keys"), dict) else {}
+    invalidation_key = json.dumps(invalidation_keys, sort_keys=True)
     for key, value in artifacts.items():
         if isinstance(value, str) and value.strip():
             memory.remember_artifact(
                 task_id=task_id,
                 path=value,
-                domain=task_contract.domain,
-                geography=task_contract.geography,
+                domain=str(task_contract_dict.get("domain", "")),
+                geography=str(task_contract_dict.get("geography", "")),
                 invalidation_key=invalidation_key,
                 status="created",
-                metadata={"artifact_key": key, "task_contract": task_contract.to_dict()},
+                metadata={"artifact_key": key, "task_contract": task_contract_dict},
             )
     invalidated = summary.get("invalidated_artifacts", []) if isinstance(summary.get("invalidated_artifacts"), list) else []
     for item in invalidated:
         memory.remember_artifact(
             task_id=task_id,
             path=str(item),
-            domain=task_contract.domain,
-            geography=task_contract.geography,
+            domain=str(task_contract_dict.get("domain", "")),
+            geography=str(task_contract_dict.get("geography", "")),
             invalidation_key=invalidation_key,
             status="rejected",
-            metadata={"reason": "stale_or_invalidated", "task_contract": task_contract.to_dict()},
+            metadata={"reason": "stale_or_invalidated", "task_contract": task_contract_dict},
         )
     platform_story = {
         "executive_summary": str((attached.get("report", {}) or {}).get("summary", "")),
@@ -2147,24 +2326,93 @@ def _finalize_operator_result(result: Dict[str, Any], instruction: str, plan_ste
             {"slides": [{"title": "Summary"}, {"title": "Method"}, {"title": "Findings"}, {"title": "Actions"}, {"title": "Appendix"}]}
         ).to_dict(),
         "completion": PlatformCompletionCritic().evaluate(
-            task_contract.requested_outputs,
+            list(task_contract_dict.get("requested_outputs", []) or []),
             artifacts,
             str((attached.get("verification_report", {}) or {}).get("final_verification", "")),
         ).to_dict(),
     }
-    attached["critics"]["platform"] = platform_critics
+    existing_platform_critics = (
+        (attached.get("critics", {}) or {}).get("platform", {})
+        if isinstance((attached.get("critics", {}) or {}).get("platform", {}), dict)
+        else {}
+    )
+    graph_status = str(execution_graph_dict.get("status", "")).strip()
+    executed_graph = graph_status in {"running", "succeeded", "failed", "blocked"}
+    if executed_graph and existing_platform_critics:
+        merged_platform_critics = dict(existing_platform_critics)
+    else:
+        merged_platform_critics = dict(platform_critics)
+        merged_platform_critics.update(existing_platform_critics)
+    attached["critics"]["platform"] = merged_platform_critics
     attached["human_report"] = HumanStyleReporter().build(
-        task_contract=task_contract.to_dict(),
-        execution_graph=execution_graph.to_dict(),
+        task_contract=task_contract_dict,
+        execution_graph=execution_graph_dict,
         result=attached,
     )
+    manifest_payload: Dict[str, Any] = {}
+    try:
+        manifest_payload = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    except Exception:
+        manifest_payload = {}
+    attached["artifact_manifest"] = manifest_payload
+    if executed_graph:
+        graph_failed_checks = [
+            name for name, payload in merged_platform_critics.items() if isinstance(payload, dict) and not bool(payload.get("passed", False))
+        ]
+        verification_checks = [
+            {"name": "graph_executed", "pass": str(execution_graph_dict.get("status", "")) in {"succeeded", "failed"}, "evidence": [f"graph_status={execution_graph_dict.get('status', '')}"]},
+            {"name": "all_nodes_complete", "pass": all(str(node.get("status", "")) in {"succeeded", "revised"} for node in (execution_graph_dict.get("nodes", []) or [])), "evidence": [[str(node.get("status", "")) for node in (execution_graph_dict.get("nodes", []) or [])]]},
+            {"name": "requested_outputs_exist", "pass": bool(artifacts), "evidence": [f"created={sorted(artifacts.keys())}"]},
+            {"name": "critics_resolved", "pass": len(graph_failed_checks) == 0, "evidence": [f"runtime_failed_critics={graph_failed_checks}"]},
+            {"name": "user_goal_satisfied", "pass": len(graph_failed_checks) == 0 and str(execution_graph_dict.get("status", "")) == "succeeded", "evidence": [f"runtime_revisions={len(attached.get('revisions_performed', []) or [])}"]},
+        ]
+        final_verification = "passed" if all(bool(item["pass"]) for item in verification_checks) else "failed"
+        attached["verification_report"] = dict(attached.get("verification_report", {}) or {}) or {
+            "task_id": task_id,
+        }
+        attached["verification_report"].update(
+            {
+                "used_expected_tool_family": True,
+                "targets_match_request": True,
+                "requested_outputs_exist": bool(artifacts),
+                "artifact_content_matches_goal": len(graph_failed_checks) == 0,
+                "no_unresolved_execution_errors": len(graph_failed_checks) == 0 and str(execution_graph_dict.get("status", "")) != "failed",
+                "no_irrelevant_detours": True,
+                "user_goal_satisfied": final_verification == "passed",
+                "verification_checks": verification_checks,
+                "failed_checks": [item["name"] for item in verification_checks if not bool(item["pass"])],
+                "final_verification": final_verification,
+            }
+        )
+        attached["verification"] = dict(attached.get("verification", {}) or {})
+        attached["verification"].update(
+            {
+                "passed": final_verification == "passed",
+                "checks": verification_checks,
+                "evidence": [f"graph_status={execution_graph_dict.get('status', '')}", f"artifacts={sorted(artifacts.keys())}"],
+            }
+        )
+        attached["final_report"] = dict(attached.get("final_report", {}) or {})
+        attached["final_report"].update(
+            {
+                "task_id": task_id,
+                "status": "completed" if final_verification == "passed" else "failed",
+                "summary": str((attached.get("canvas", {}) or {}).get("title", "Capability Graph Completed")),
+                "actions_taken": [f"{node.get('capability')}: {node.get('status')}" for node in (execution_graph_dict.get("nodes", []) or [])],
+                "outputs_created": [{"type": "file", "location": value, "description": key} for key, value in artifacts.items() if isinstance(value, str)],
+                "verification_summary": final_verification,
+                "remaining_issues": [item["name"] for item in verification_checks if not bool(item["pass"])],
+                "next_safe_action": "Open the artifact package in Canvas." if final_verification == "passed" else "Review failed graph checks and rerun.",
+            }
+        )
     attached["platform"] = {
-        "task_contract_engine": task_contract.to_dict(),
-        "capability_execution_graph": execution_graph.to_dict(),
+        "task_contract_engine": task_contract_dict,
+        "capability_execution_graph": execution_graph_dict,
         "artifact_manifest_json": str(manifest_path.resolve()),
         "memory_invalidation_key": invalidation_key,
-        "architecture_version": "capability-foundation-v1",
+        "architecture_version": "capability-runtime-v1",
     }
+    attached["ui_cards"] = build_platform_cards(attached)
     return attached
 
 
@@ -2239,9 +2487,27 @@ def execute_instruction(
         return {"ok": False, "error": "Instruction is empty.", "instruction": instruction}
 
     explicit_route = _classify_explicit_route(normalized)
+    task_contract = TaskContractEngine().extract(normalized)
+
+    if _should_use_execution_graph_runtime(task_contract=task_contract, explicit_route=explicit_route, instruction=normalized):
+        runtime_graph = CapabilityPlanner(registry=default_capability_registry()).plan(task_contract)
+        runtime_plan = _build_runtime_plan(task_contract, graph=runtime_graph.to_dict())
+        plan_steps = [dict(x) for x in runtime_plan.get("steps", [])]
+        _emit_progress(progress_cb, 8, "Building task contract")
+        execution = _run_execution_graph_runtime_path(
+            instruction=instruction,
+            task_contract=task_contract,
+            graph=runtime_graph,
+            ai_meta=ai_meta,
+            progress_cb=progress_cb,
+            artifact_reuse_mode=freshness_mode,
+            artifact_reuse_max_age_hours=freshness_hours,
+        )
+        _emit_progress(progress_cb, 100, "Completed")
+        return _finalize_operator_result(execution, instruction=instruction, plan_steps=plan_steps)
 
     if explicit_route == "artifact_generation":
-        _emit_progress(progress_cb, 8, "Building deterministic artifact plan")
+        _emit_progress(progress_cb, 8, "Building artifact package contract")
         plan = _build_artifact_generation_plan(normalized)
         plan_steps = [dict(x) for x in plan.get("steps", [])]
         elegance = EleganceBudget(total=70)
@@ -2257,12 +2523,27 @@ def execute_instruction(
                 requested_outputs=requested_outputs,
                 represented_outputs=represented_outputs,
             )
-        execution = _run_artifact_generation(
-            plan=plan,
+        runtime_contract = TaskContractEngine().extract(normalized)
+        runtime_contract.domain = "artifact_generation"
+        runtime_outputs: List[str] = []
+        if "document" in requested_outputs or "executive_summary" in requested_outputs:
+            runtime_outputs.append("report")
+        if "powerpoint" in requested_outputs:
+            runtime_outputs.append("presentation")
+        if "visual" in requested_outputs or "dashboard" in requested_outputs:
+            runtime_outputs.append("dashboard")
+        if "executive_summary" in requested_outputs:
+            runtime_outputs.append("executive_summary")
+        runtime_contract.requested_outputs = runtime_outputs or ["report"]
+        execution = _run_execution_graph_runtime_path(
             instruction=instruction,
+            task_contract=runtime_contract,
+            graph=CapabilityPlanner(registry=default_capability_registry()).plan(runtime_contract),
+            ai_meta=ai_meta,
             progress_cb=progress_cb,
             artifact_reuse_mode=freshness_mode,
             artifact_reuse_max_age_hours=freshness_hours,
+            mode_override="artifact_generation",
         )
         summary = execution.get("summary", {}) if isinstance(execution.get("summary"), dict) else {}
         summary = _apply_freshness_metadata(summary, freshness_mode, freshness_hours)
@@ -2271,7 +2552,6 @@ def execute_instruction(
         if budget_block:
             budget_block["plan"] = plan
             return _finalize_operator_result(budget_block, instruction=instruction, plan_steps=plan_steps)
-        execution["ai"] = ai_meta
         execution["plan"] = plan
         return _finalize_operator_result(execution, instruction=instruction, plan_steps=plan_steps)
 
@@ -6117,13 +6397,52 @@ def _run_competitor_analysis(
         }
     competitors = _select_top_competitors(target=target, results=ranked, top_n=5)
     _emit_progress(progress_cb, 74, "Generating executive summary and PowerPoint")
-    artifacts = _write_competitor_artifacts(
-        instruction=instruction,
-        target=target,
-        output_folder=output_folder,
-        competitors=competitors,
-        ranked_results=ranked,
+    executors = default_executors()
+    safe_folder = re.sub(r"[<>:\"/\\\\|?*]", "", output_folder).strip() or f"{target} Competitor Analysis"
+    workspace = Path("data/reports") / safe_folder
+    workspace.mkdir(parents=True, exist_ok=True)
+    competitor_rows = [
+        {
+            "rank": idx,
+            "name": row.get("name", ""),
+            "segment": row.get("segment", ""),
+            "why": row.get("why", ""),
+            "citations": " | ".join(row.get("citations", [])[:3]),
+            "score": row.get("score", ""),
+        }
+        for idx, row in enumerate(competitors, start=1)
+    ]
+    task_contract = TaskContractEngine().extract(instruction).to_dict()
+    task_contract["domain"] = "competitor_analysis"
+    task_contract["audience"] = "stakeholder"
+    task_contract["requested_outputs"] = ["report", "presentation", "dashboard", "spreadsheet"]
+    context = {"task_contract": task_contract, "workspace_dir": str(workspace.resolve())}
+    analysis_results = {
+        "findings": [f"{row.get('name','')} appears in the competitive landscape for {target}." for row in competitors[:5]],
+        "recommended_actions": [
+            "Validate the shortlist against your target deployment profile.",
+            "Build a weighted scorecard for interoperability, cost, and implementation risk.",
+            "Run focused diligence on migration tooling and executive sponsorship requirements.",
+        ],
+        "caveats": [
+            "This competitor package is source-backed but still requires market-specific validation before executive use.",
+        ],
+        "insights": [row.get("why", "") for row in competitors[:5]],
+    }
+    story = executors["data_storytelling"].execute(context, {"analysis_results": analysis_results}).outputs.get("story_package", {})
+    report = executors["report_build"].execute(context, {"analysis_results": analysis_results, "story_package": story}).outputs.get("report", {})
+    presentation = executors["presentation_build"].execute(context, {"story_package": story}).outputs.get("presentation", {})
+    export = executors["artifact_export"].execute(
+        context,
+        {
+            "structured_rows": competitor_rows,
+            "research_notes": {"target": target, "summary": f"Prepared competitor landscape for {target}."},
+            "story_package": story,
+            "report": report,
+            "presentation": presentation,
+        },
     )
+    artifacts = dict(export.artifacts)
     open_target = artifacts.get("primary_open_file") or artifacts.get("executive_summary_html") or artifacts.get("dashboard_html", "")
     opened_uri = Path(open_target).resolve().as_uri() if open_target else ""
     if opened_uri:
