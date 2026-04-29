@@ -9,9 +9,9 @@ import uuid
 
 from openpyxl import load_workbook
 
-from lam.payer_rag.analyze import analyze_outliers
+from lam.payer_rag.analyze import analyze_outliers, read_csv_rows
 from lam.payer_rag.export import build_validation_queue_rows, export_workbook, write_csv
-from lam.payer_rag.ingest import default_source_manifest, parse_duke_standard_charges_text, parse_shoppable_services_filters_text
+from lam.payer_rag.ingest import _decode_text_bytes, default_source_manifest, parse_duke_standard_charges_text, parse_insurance_reference_page_text, parse_shoppable_services_filters_text
 from lam.payer_rag.rag import ask_question, build_index
 from lam.payer_rag.sample_data import SAMPLE_DUKE_STANDARD_CHARGES
 from lam.payer_rag.workflow import CurrentTaskContract, build_workspace, ensure_workspace, extract_current_task_contract
@@ -40,6 +40,12 @@ class PayerRagTests(unittest.TestCase):
         self.assertIsInstance(rate["negotiated_rate"], float)
         self.assertEqual(rate["source_url"], "sample://duke")
         self.assertIn("row_", rate["raw_reference"])
+
+    def test_decode_text_bytes_handles_cp1252_payloads(self) -> None:
+        payload = b'Description,\x96 test with nonbreaking\xa0space'
+        text = _decode_text_bytes(payload)
+        self.assertIn("Description", text)
+        self.assertIn("space", text)
 
     def test_parse_duke_standard_charges_balances_keyword_coverage(self) -> None:
         bundle = parse_duke_standard_charges_text(
@@ -147,6 +153,30 @@ class PayerRagTests(unittest.TestCase):
         self.assertIn("UNC Health standard charges landing page", names)
         self.assertIn("Blue Cross NC transparency in coverage page", names)
 
+    def test_fairfax_default_manifest_includes_inova_sources(self) -> None:
+        manifest = default_source_manifest("Fairfax, VA")
+        names = {row["source_name"] for row in manifest}
+        self.assertIn("Inova Fairfax Hospital standard charges", names)
+        self.assertIn("Inova Fair Oaks Hospital standard charges", names)
+        self.assertIn("Inova Alexandria Hospital standard charges", names)
+        self.assertIn("Inova Loudoun Hospital standard charges", names)
+        self.assertIn("Inova Mount Vernon Hospital standard charges", names)
+        self.assertIn("Inova hospital charges and price transparency page", names)
+        self.assertIn("Inova health plans page", names)
+
+    def test_parse_insurance_reference_page_text_extracts_payers_and_plans(self) -> None:
+        payload = "<html><body>Aetna Cigna UnitedHealthcare Anthem CareFirst Kaiser Innovation Health</body></html>"
+        bundle = parse_insurance_reference_page_text(
+            payload,
+            source_name="Inova health plans page",
+            source_url="https://www.inova.org/patient-and-visitor-information/health-plans",
+            geography="Fairfax, VA",
+        )
+        payer_names = {row["payer_name"] for row in bundle["payers"]}
+        self.assertIn("Aetna", payer_names)
+        self.assertIn("UnitedHealthcare", payer_names)
+        self.assertTrue(bundle["plans"])
+
     def test_parse_shoppable_services_filters_extracts_consumer_friendly_services(self) -> None:
         payload = """
         {
@@ -213,6 +243,92 @@ class PayerRagTests(unittest.TestCase):
         self.assertTrue(Path(artifacts["task_contract_json"]).exists())
         validation = result.get("geography_validation", {})
         self.assertTrue(validation.get("passed"))
+
+    def test_build_workspace_switches_to_demo_when_fairfax_manifest_only_has_nc_sources(self) -> None:
+        root = self.make_workspace()
+        manifest_path = root / "fairfax_manifest.json"
+        manifest_path.write_text(json.dumps(default_source_manifest(), indent=2), encoding="utf-8")
+        contract = extract_current_task_contract(
+            "Build a Fairfax, VA outpatient imaging payer/pricing review with a spreadsheet and stakeholder summary."
+        )
+        result = build_workspace(contract=contract, workspace=root, manifest_path=manifest_path, service_keywords=["mri", "ct", "x-ray", "ultrasound"], offline_fallback=False)
+        manifest_text = Path(result["all_artifact_paths"]["source_manifest_csv"]).read_text(encoding="utf-8")
+        self.assertTrue(result.get("final_output_gate", {}).get("passed", False))
+        self.assertTrue(result.get("synthetic_only", False))
+        self.assertEqual(result.get("completion_status"), "completed_demo_package")
+        self.assertIn("Synthetic Fairfax, VA outpatient imaging demo dataset".lower(), manifest_text.lower())
+        for banned in ["Duke", "WakeMed", "UNC", "Durham", "Raleigh", "Cary", "North Carolina"]:
+            self.assertNotIn(banned.lower(), manifest_text.lower())
+
+    def test_build_workspace_labels_synthetic_fallback(self) -> None:
+        root = self.make_workspace()
+        manifest_path = root / "synthetic_manifest.json"
+        manifest_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "source_name": "Synthetic Fairfax outpatient imaging demo",
+                        "source_type": "synthetic_fixture",
+                        "source_url_or_path": "sample://fairfax_demo",
+                        "accessed_or_ingested_date": "",
+                        "geography": "Fairfax, VA",
+                        "notes": "Synthetic demo data only.",
+                        "confidence": 0.35,
+                    }
+                ],
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        contract = extract_current_task_contract(
+            "Build a Fairfax, VA outpatient imaging payer/pricing review with synthetic fallback if needed."
+        )
+        result = build_workspace(contract=contract, workspace=root, manifest_path=manifest_path, service_keywords=["mri", "ct"], offline_fallback=True)
+        report_text = Path(result["all_artifact_paths"]["summary_report_md"]).read_text(encoding="utf-8")
+        dash_text = Path(result["all_artifact_paths"]["dashboard_html"]).read_text(encoding="utf-8")
+        checklist_text = Path(result["all_artifact_paths"]["real_data_acquisition_checklist_md"]).read_text(encoding="utf-8")
+        manifest_text = Path(result["all_artifact_paths"]["source_manifest_csv"]).read_text(encoding="utf-8")
+        self.assertIn("Synthetic/demo build", report_text)
+        self.assertIn("Synthetic / demo only", dash_text)
+        self.assertIn("Fairfax, VA", checklist_text)
+        self.assertTrue(result.get("final_output_gate", {}).get("passed", False))
+        self.assertEqual(result.get("completion_status"), "completed_demo_package")
+        for banned in ["Duke", "WakeMed", "UNC", "Durham", "Raleigh", "Cary", "North Carolina", "heart transplant", "cabg", "vein harvest", "thrombolysis", "colonoscopy"]:
+            self.assertNotIn(banned.lower(), report_text.lower())
+            self.assertNotIn(banned.lower(), manifest_text.lower())
+
+    def test_service_scope_repair_filters_non_imaging_outreach_rows(self) -> None:
+        root = self.make_workspace()
+        manifest_path = root / "fairfax_synthetic_manifest.json"
+        manifest_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "source_name": "Synthetic Fairfax imaging demo",
+                        "source_type": "synthetic_fixture",
+                        "source_url_or_path": "sample://fairfax_demo",
+                        "accessed_or_ingested_date": "",
+                        "geography": "Fairfax, VA",
+                        "notes": "Synthetic imaging demo rows.",
+                        "confidence": 0.35,
+                    }
+                ],
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        contract = extract_current_task_contract(
+            "Build a Fairfax, VA outpatient imaging payer/pricing review for MRI and CT only."
+        )
+        result = build_workspace(contract=contract, workspace=root, manifest_path=manifest_path, service_keywords=["mri", "ct", "heart", "transplant"], offline_fallback=True)
+        rows = []
+        csv_path = Path(result["all_artifact_paths"]["outreach_candidates_csv"])
+        if csv_path.exists():
+            rows = list(read_csv_rows(csv_path))
+        self.assertTrue(result.get("repair_state", {}).get("service_scope_repair", {}).get("attempted", False) or not rows or all(
+            "transplant" not in str(row.get("service", "")).lower() and "cabg" not in str(row.get("service", "")).lower()
+            for row in rows
+        ))
 
     def test_ensure_workspace_invalidates_different_geography_runs(self) -> None:
         stale_root = Path("data/payer_rag_runs") / f"durham_nc_{uuid.uuid4().hex}"

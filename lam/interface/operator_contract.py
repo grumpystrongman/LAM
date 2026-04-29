@@ -45,6 +45,7 @@ _ACTION_FAMILY_MAP = {
     "type_text": "filesystem",
     "hotkey": "filesystem",
     "visual_search": "filesystem",
+    "capture_clipboard_image": "filesystem",
     "list_recent_messages": "email",
     "read_message": "email",
     "create_draft": "email",
@@ -159,6 +160,12 @@ def _stringify_target(step: Dict[str, Any]) -> str:
     text = str(step.get("text", "")).strip()
     if text:
         return f"text:{text[:120]}"
+    source = str(step.get("source", "")).strip()
+    if source:
+        return f"source:{source}"
+    output_path = str(step.get("output_path", "")).strip()
+    if output_path:
+        return f"path:{output_path}"
     return ""
 
 

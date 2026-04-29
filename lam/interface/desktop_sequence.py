@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List
 
 from lam.adapters.uia_adapter import UIAAdapter
 from lam.interface.app_launcher import normalize_app_name, open_installed_app
+from lam.interface.clipboard_capture import capture_clipboard_image
 from lam.interface.password_vault import LocalPasswordVault
 
 
@@ -18,6 +21,7 @@ class SequenceResult:
     done: bool
     paused_for_credentials: bool
     pause_reason: str
+    artifacts: Dict[str, str]
     error: str = ""
 
 
@@ -105,6 +109,17 @@ def build_plan(instruction: str) -> Dict[str, Any]:
             steps.append({"action": "use_credentials", "service": m_login.group(1).strip(), "submit": ("submit" in part.lower() or "enter" in part.lower())})
             continue
 
+        m_clipboard = re.match(
+            r"^(?:capture\s+(?:the\s+)?)?clipboard(?:\s+image)?|^(?:save\s+(?:the\s+)?)clipboard(?:\s+image)?|^(?:import\s+)(?:image\s+from\s+)?clipboard(?:\s+image)?",
+            part,
+            flags=re.IGNORECASE,
+        )
+        if m_clipboard:
+            target_match = re.search(r"\s+(?:to|as)\s+(.+)$", part, flags=re.IGNORECASE)
+            target = str(target_match.group(1) if target_match else "").strip().strip("\"'")
+            steps.append({"action": "capture_clipboard_image", "output_path": target, "source": "system_clipboard"})
+            continue
+
         steps.append({"action": "note", "text": part})
 
     if app_name and (not steps or steps[0].get("action") != "open_app"):
@@ -133,6 +148,7 @@ def execute_plan(
     vault = LocalPasswordVault()
     steps: List[Dict[str, Any]] = plan.get("steps", [])
     trace: List[Dict[str, Any]] = []
+    artifacts: Dict[str, str] = {}
     index = start_index
     last_visual_point: Dict[str, int] | None = None
 
@@ -144,7 +160,7 @@ def execute_plan(
                 ok, launched = open_installed_app(step.get("app", ""))
                 trace.append({"step": index, "action": action, "ok": ok, "launched": launched})
                 if not ok:
-                    return SequenceResult(False, steps, trace, index, False, False, "", "App not found")
+                    return SequenceResult(False, steps, trace, index, False, False, "", artifacts, "App not found")
                 if plan.get("checkpoint_after_open") and start_index == 0:
                     return SequenceResult(
                         True,
@@ -154,6 +170,7 @@ def execute_plan(
                         False,
                         True,
                         "Login checkpoint: enter credentials if prompted, then click Resume.",
+                        artifacts,
                     )
             elif action == "focus_window":
                 adapter.focus_window(step.get("selector", {}))
@@ -177,20 +194,20 @@ def execute_plan(
                 found = adapter.visual_search(text=step.get("text", ""), timeout_ms=6000)
                 if not found.get("ok"):
                     trace.append({"step": index, "action": action, "ok": False, "error": found.get("error", "")})
-                    return SequenceResult(False, steps, trace, index, False, False, "", found.get("error", "visual_search_failed"))
+                    return SequenceResult(False, steps, trace, index, False, False, "", artifacts, found.get("error", "visual_search_failed"))
                 last_visual_point = {"x": int(found.get("x", 0)), "y": int(found.get("y", 0))}
                 trace.append({"step": index, "action": action, "ok": True, "found": found})
             elif action == "click_found":
                 if not last_visual_point:
                     trace.append({"step": index, "action": action, "ok": False, "error": "no previous visual target"})
-                    return SequenceResult(False, steps, trace, index, False, False, "", "no previous visual target")
+                    return SequenceResult(False, steps, trace, index, False, False, "", artifacts, "no previous visual target")
                 adapter.click_at(last_visual_point["x"], last_visual_point["y"])
                 trace.append({"step": index, "action": action, "ok": True, "point": last_visual_point})
             elif action == "use_credentials":
                 resolved = vault.find_entry_by_service(step.get("service", ""))
                 if not resolved.get("ok"):
                     trace.append({"step": index, "action": action, "ok": False, "error": resolved.get("error", "credential_not_found")})
-                    return SequenceResult(False, steps, trace, index, False, False, "", str(resolved.get("error", "credential_not_found")))
+                    return SequenceResult(False, steps, trace, index, False, False, "", artifacts, str(resolved.get("error", "credential_not_found")))
                 entry = resolved["entry"]
                 # Fill currently focused username field, tab to password, then fill password.
                 adapter.type({}, entry.get("username", ""))
@@ -209,14 +226,31 @@ def execute_plan(
                         "submitted": bool(step.get("submit", False)),
                     }
                 )
+            elif action == "capture_clipboard_image":
+                requested_output = str(step.get("output_path", "") or "").strip()
+                if requested_output:
+                    output_path = Path(requested_output)
+                else:
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    output_path = Path("data/reports/desktop_sequence") / ts / "clipboard_capture.png"
+                captured = capture_clipboard_image(output_path)
+                if not captured:
+                    trace.append({"step": index, "action": action, "ok": False, "error": "clipboard_capture_empty"})
+                    return SequenceResult(False, steps, trace, index, False, False, "", artifacts, "clipboard_capture_empty")
+                resolved = str(Path(captured).resolve())
+                artifacts["clipboard_image_png"] = resolved
+                artifacts["primary_open_file"] = resolved
+                if requested_output:
+                    artifacts["requested_output_path"] = str(output_path.resolve())
+                trace.append({"step": index, "action": action, "ok": True, "artifact": resolved})
             else:
                 trace.append({"step": index, "action": action, "ok": True, "note": step.get("text", "")})
         except Exception as exc:  # pylint: disable=broad-exception-caught
             trace.append({"step": index, "action": action, "ok": False, "error": str(exc)})
-            return SequenceResult(False, steps, trace, index, False, False, "", str(exc))
+            return SequenceResult(False, steps, trace, index, False, False, "", artifacts, str(exc))
 
         index += 1
         if step_mode:
-            return SequenceResult(True, steps, trace, index, False, False, "Step mode checkpoint.")
+            return SequenceResult(True, steps, trace, index, False, False, "Step mode checkpoint.", artifacts)
 
-    return SequenceResult(True, steps, trace, index, True, False, "")
+    return SequenceResult(True, steps, trace, index, True, False, "", artifacts)

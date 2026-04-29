@@ -185,6 +185,13 @@
       "required_outputs": ["fairfax_spreadsheet", "geography_validation"]
     },
     {
+      "scenario_id": "N1B",
+      "scenario_name": "Fairfax Imaging Package Must Reject Durham Contamination",
+      "prompt": "Generate a Fairfax, VA outpatient imaging payer/pricing package after a prior Durham, NC payer package exists.",
+      "environment_setup": "Older Durham/NC payer artifacts exist and Fairfax task requires fresh outpatient imaging-only evidence",
+      "required_outputs": ["fairfax_imaging_spreadsheet", "validation_card", "final_output_gate"]
+    },
+    {
       "scenario_id": "N2",
       "scenario_name": "Deep Analysis Capability Composition",
       "prompt": "Research public data, run analysis, build a report, and prepare slides for stakeholders.",

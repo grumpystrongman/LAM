@@ -372,6 +372,7 @@ HTML_PAGE = """<!doctype html>
         <input id="instruction" class="wide" type="text" placeholder="Example: Review Durham payer pricing, build a RAG index, create the stakeholder workbook, and show me which plans need outreach."/>
         <button class="primary" onclick="runInstruction()">Run</button>
         <button onclick="previewInstruction()">Preview</button>
+        <button onclick="captureClipboardImageUi()">Capture Clipboard Image</button>
       </div>
       <div class="small advanced-control" id="freshnessPreview">Freshness preview: waiting for instruction.</div>
       <div class="row advanced-control">
@@ -951,6 +952,19 @@ function renderPlatformCards(r){
     const rejected = Array.isArray(memory.rejected) ? memory.rejected.slice(0,4).map(item=>`<div class="small">Rejected: ${escapeHtml(item.reason || "")}</div>`).join("") : "";
     pushSection("Memory Context", `${used}${rejected}`);
   }
+  const validation = cards?.validation || {};
+  const finalOutputGate = validation?.final_output_gate || cards?.final_output_gate || {};
+  if(Array.isArray(validation?.items) && validation.items.length){
+    pushSection("Validation",
+      validation.items.map(item=>{
+        const state = item.passed ? "pass" : "blocked";
+        return `<div><strong>${escapeHtml(item.name || "validation")}</strong>: ${escapeHtml(state)}${item.severity ? ` | ${escapeHtml(item.severity)}` : ""}${Number(item.issue_count||0) ? ` | issues=${escapeHtml(String(item.issue_count))}` : ""}${item.repair_attempted ? " | repair attempted" : ""}</div>`;
+      }).join("")
+      + (finalOutputGate && Object.keys(finalOutputGate).length ? `<div class="small" data-final-output-gate="final_output_gate" style="margin-top:8px;">Gate: ${escapeHtml(String(finalOutputGate.passed ? "passed" : "blocked"))}</div>` : "")
+      + ((Array.isArray(validation?.blocking_failures) && validation.blocking_failures.length) ? `<div class="small" style="margin-top:8px;">Blocking: ${escapeHtml(validation.blocking_failures.join(", "))}</div>` : "")
+      + ((Array.isArray(validation?.required_repairs) && validation.required_repairs.length) ? `<div class="small" style="margin-top:8px;">Repairs: ${escapeHtml(validation.required_repairs.slice(0,4).join(" | "))}</div>` : "")
+    );
+  }
   const html = sections.join("");
   const mount = document.getElementById("platformCards");
   if(mount){ mount.innerHTML = html; }
@@ -1310,6 +1324,13 @@ async function runInstruction(){
   const r=await fetch("/api/instruct_async",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({instruction,ai_backend,min_live_non_curated_citations,manual_auth_phase,browser_worker_mode,human_like_interaction,use_domain_freshness_defaults,artifact_reuse_mode,artifact_reuse_max_age_hours})}).then(r=>r.json());
   if(!r.ok){ showResponse(r); await refreshState(); return; }
   startTaskPolling(r.task_id, { instruction, ai_backend, min_live_non_curated_citations, manual_auth_phase, browser_worker_mode, human_like_interaction, use_domain_freshness_defaults, artifact_reuse_mode, artifact_reuse_max_age_hours, confirm_risky:false });
+}
+async function captureClipboardImageUi(){
+  const instruction="Capture the current clipboard image and save it as an artifact package with base64 output.";
+  _appendAssistantFeed(escapeHtml(instruction), "user");
+  const r=await fetch("/api/clipboard/capture",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({instruction})}).then(r=>r.json());
+  showResponse(r);
+  await refreshState();
 }
 async function previewInstruction(){ const instruction=document.getElementById("instruction").value.trim(); if(!instruction)return; const r=await fetch("/api/preview",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({instruction})}).then(r=>r.json()); showResponse(r); await refreshState(); }
 async function saveAutomation(){ const name=document.getElementById("automationName").value.trim(); const instruction=document.getElementById("instruction").value.trim(); const r=await fetch("/api/automation/save",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name,instruction})}).then(r=>r.json()); showResponse(r); await refreshState(); }
@@ -1844,6 +1865,48 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path == "/api/preview":
             instruction = str(payload.get("instruction", "")).strip()
             self._send_json(200, preview_instruction(instruction))
+            return
+
+        if self.path == "/api/clipboard/capture":
+            instruction = str(payload.get("instruction", "")).strip() or "Capture the current clipboard image and save it as an artifact package with base64 output."
+            with self.state.lock:
+                granted = self.state.control_granted
+                step_mode = self.state.step_mode
+                manual_auth_phase = self.state.manual_auth_phase
+                browser_worker_mode = self.state.browser_worker_mode
+                human_like_interaction = self.state.human_like_interaction
+                ai_backend = self.state.ai_backend
+                min_live = self.state.min_live_non_curated_citations
+                reuse_mode = self.state.artifact_reuse_mode
+                reuse_hours = self.state.artifact_reuse_max_age_hours
+                use_domain_defaults = self.state.use_domain_freshness_defaults
+            if not granted:
+                self._send_json(400, {"ok": False, "error": "Control not granted. Click Accept Control first."})
+                return
+            reuse_mode, reuse_hours, _domain, _source = _resolve_domain_freshness_defaults(
+                instruction=instruction,
+                requested_mode=reuse_mode,
+                requested_hours=reuse_hours,
+                use_domain_defaults=use_domain_defaults,
+            )
+            result = execute_instruction(
+                instruction=instruction,
+                control_granted=True,
+                step_mode=step_mode,
+                confirm_risky=False,
+                ai_backend=ai_backend,
+                min_live_non_curated_citations=min_live,
+                manual_auth_phase=manual_auth_phase,
+                browser_worker_mode=browser_worker_mode,
+                human_like_interaction=human_like_interaction,
+                artifact_reuse_mode=reuse_mode,
+                artifact_reuse_max_age_hours=reuse_hours,
+            )
+            with self.state.lock:
+                self.state.history.append(dict(result))
+                self.state.history = self.state.history[-300:]
+                _save_history(self.state.history)
+            self._send_json(200, result)
             return
 
         if self.path == "/api/reliability/run":

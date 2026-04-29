@@ -38,6 +38,16 @@ from .task_contract_engine import TaskContract, TaskContractEngine
 from .tool_runtime import ToolRuntime
 from .ui_cards import build_platform_cards
 from .ui_build import build_ui_delivery
+from .validators import (
+    ArtifactContaminationValidator,
+    FinalOutputGate,
+    FinalOutputGateResult,
+    GeographyValidator,
+    ServiceScopeValidator,
+    SourceRelevanceValidator,
+    ValidationResult,
+    ValidationViolation,
+)
 from .world_model import WorldModel, WorldModelBuilder
 
 __all__ = [
@@ -66,7 +76,15 @@ __all__ = [
     "UIUXCritic",
     "WorldModel",
     "WorldModelBuilder",
+    "ArtifactContaminationValidator",
+    "FinalOutputGate",
+    "FinalOutputGateResult",
+    "GeographyValidator",
     "RuntimeRunResult",
+    "ServiceScopeValidator",
+    "SourceRelevanceValidator",
+    "ValidationResult",
+    "ValidationViolation",
     "build_presentation_outline",
     "build_platform_cards",
     "build_story_package",

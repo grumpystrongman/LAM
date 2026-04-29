@@ -1,5 +1,6 @@
 import unittest
 from unittest.mock import patch
+from pathlib import Path
 
 from lam.interface.desktop_sequence import assess_risk, build_plan, execute_plan
 
@@ -27,6 +28,11 @@ class TestDesktopSequence(unittest.TestCase):
         actions = [s["action"] for s in plan["steps"]]
         self.assertIn("use_credentials", actions)
 
+    def test_build_plan_capture_clipboard_image(self) -> None:
+        plan = build_plan("open paint then capture clipboard image")
+        actions = [s["action"] for s in plan["steps"]]
+        self.assertIn("capture_clipboard_image", actions)
+
     @patch("lam.interface.desktop_sequence.open_installed_app")
     def test_execute_plan_open_pause(self, mock_open) -> None:
         mock_open.return_value = (True, "chatgpt.exe")
@@ -52,6 +58,21 @@ class TestDesktopSequence(unittest.TestCase):
         mock_adapter.type.assert_any_call({}, "pass1")
         mock_adapter.hotkey.assert_any_call("TAB")
         mock_adapter.hotkey.assert_any_call("ENTER")
+
+    @patch("lam.interface.desktop_sequence.capture_clipboard_image")
+    @patch("lam.interface.desktop_sequence.LocalPasswordVault")
+    @patch("lam.interface.desktop_sequence.UIAAdapter")
+    def test_execute_plan_capture_clipboard_image(self, mock_adapter_cls, mock_vault_cls, mock_capture) -> None:
+        del mock_adapter_cls, mock_vault_cls
+        out = Path("data/reports/desktop_sequence/test_clipboard/clipboard_capture.png").resolve()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"fake-image")
+        mock_capture.return_value = str(out)
+        plan = {"steps": [{"action": "capture_clipboard_image", "output_path": ""}], "checkpoint_after_open": False}
+        result = execute_plan(plan, start_index=0, step_mode=False)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.artifacts.get("clipboard_image_png"), str(out))
+        self.assertEqual(result.artifacts.get("primary_open_file"), str(out))
 
 
 if __name__ == "__main__":

@@ -5,12 +5,17 @@ from pathlib import Path
 
 from lam.operator_platform import (
     ArtifactFactory,
+    ArtifactContaminationValidator,
     CapabilityPlanner,
     CompletionCritic,
     DataQualityCritic,
     ExecutionGraphRuntime,
+    FinalOutputGate,
+    GeographyValidator,
     MemoryStore,
     PresentationCritic,
+    ServiceScopeValidator,
+    SourceRelevanceValidator,
     SourceCritic,
     StoryCritic,
     TaskContractEngine,
@@ -274,6 +279,60 @@ class TestOperatorPlatform(unittest.TestCase):
         self.assertIn("runtime_timeline", cards)
         self.assertTrue(cards["runtime_timeline"]["groups"])
         self.assertIn("memory_context", cards)
+        self.assertIn("validation", cards)
+
+    def test_geography_validator_blocks_fairfax_report_with_nc_sources(self) -> None:
+        contract = {
+            "geography": "Fairfax, VA",
+            "service_focus": "outpatient imaging",
+            "invalid_geography_terms": ["Duke University Hospital", "WakeMed", "UNC Health", "Blue Cross NC", "North Carolina", "Durham", "Raleigh", "Cary"],
+        }
+        source_rows = [
+            {"source_name": "Duke University Hospital standard charges", "geography": "Durham, NC", "source_url_or_path": "https://duke.example"},
+            {"source_name": "WakeMed Cary Hospital standard charges", "geography": "Raleigh-Durham, NC", "source_url_or_path": "https://wakemed.example"},
+        ]
+        geography = GeographyValidator().validate(contract=contract, artifacts={}, source_rows=source_rows)
+        gate = FinalOutputGate().evaluate(validation_results=[geography], completion_passed=False, required_artifacts_exist=False)
+        self.assertFalse(geography.passed)
+        self.assertFalse(gate.passed)
+        self.assertIn("GeographyValidator", gate.blocking_failures)
+
+    def test_service_scope_validator_filters_non_imaging_rows(self) -> None:
+        contract = {"service_focus": "outpatient imaging"}
+        candidates = [
+            {"service": "MRI brain without contrast"},
+            {"service": "Heart transplant"},
+            {"service": "CABG video-assisted vein harvest"},
+            {"service": "CT abdomen and pelvis with contrast"},
+        ]
+        validator = ServiceScopeValidator()
+        filtered, removed = validator.filter_candidate_rows(contract=contract, candidate_rows=candidates)
+        result = validator.validate(contract=contract, candidate_rows=candidates, artifact_paths={})
+        self.assertFalse(result.passed)
+        self.assertEqual(len(filtered), 2)
+        self.assertEqual(len(removed), 2)
+        self.assertTrue(all("mri" in row["service"].lower() or "ct" in row["service"].lower() for row in filtered))
+
+    def test_artifact_contamination_validator_quarantines_conflicting_report(self) -> None:
+        report = self.root / "fairfax_report.md"
+        report.write_text("# Fairfax, VA Payer Pricing Review\n\nSources: Duke University Hospital, WakeMed, UNC Health.\n", encoding="utf-8")
+        contract = {
+            "geography": "Fairfax, VA",
+            "service_focus": "outpatient imaging",
+            "invalid_geography_terms": ["Duke University Hospital", "WakeMed", "UNC Health", "North Carolina", "Durham"],
+        }
+        geography = GeographyValidator().validate(contract=contract, artifacts={"summary_report_md": str(report)}, source_rows=[])
+        service = ServiceScopeValidator().validate(contract=contract, candidate_rows=[], artifact_paths={"summary_report_md": str(report)})
+        source = SourceRelevanceValidator().validate(contract=contract, source_rows=[])
+        artifact = ArtifactContaminationValidator().validate(
+            contract=contract,
+            artifacts={"summary_report_md": str(report)},
+            geography_result=geography,
+            service_result=service,
+            source_result=source,
+        )
+        self.assertFalse(artifact.passed)
+        self.assertIn("summary_report_md", artifact.metadata.get("invalid_artifacts", []))
 
 
 if __name__ == "__main__":

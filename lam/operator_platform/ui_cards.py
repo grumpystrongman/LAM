@@ -62,6 +62,8 @@ def build_platform_cards(result: Dict[str, Any]) -> Dict[str, Any]:
     memory_context = result.get("memory_context", {}) if isinstance(result.get("memory_context"), dict) else {}
     manifest = result.get("artifact_manifest", {}) if isinstance(result.get("artifact_manifest"), dict) else {}
     runtime_events = result.get("runtime_events", []) if isinstance(result.get("runtime_events"), list) else []
+    validation_results = result.get("validation_results", {}) if isinstance(result.get("validation_results"), dict) else {}
+    final_output_gate = result.get("final_output_gate", {}) if isinstance(result.get("final_output_gate"), dict) else {}
     return {
         "task_contract": {
             "title": "Task Contract",
@@ -158,5 +160,54 @@ def build_platform_cards(result: Dict[str, Any]) -> Dict[str, Any]:
             "rejected": list(memory_context.get("rejected", []) or []),
             "project_preferences": list(memory_context.get("project_preferences", []) or []),
             "retrieval_confidence": float(memory_context.get("retrieval_confidence", 0.0) or 0.0),
+        },
+        "validation": {
+            "title": "Validation",
+            "compact": True,
+            "final_output_gate": dict(final_output_gate),
+            "items": [
+                {
+                    "name": "Geography validation",
+                    "passed": bool((validation_results.get("geography", {}) or {}).get("passed", False)),
+                    "severity": str((validation_results.get("geography", {}) or {}).get("severity", "")),
+                    "issue_count": int((validation_results.get("geography", {}) or {}).get("issue_count", 0) or 0),
+                    "repair_attempted": bool((validation_results.get("geography", {}) or {}).get("repair_attempted", False)),
+                    "final_status": str((validation_results.get("geography", {}) or {}).get("final_status", "")),
+                },
+                {
+                    "name": "Service scope validation",
+                    "passed": bool((validation_results.get("service_scope", {}) or {}).get("passed", False)),
+                    "severity": str((validation_results.get("service_scope", {}) or {}).get("severity", "")),
+                    "issue_count": int((validation_results.get("service_scope", {}) or {}).get("issue_count", 0) or 0),
+                    "repair_attempted": bool((validation_results.get("service_scope", {}) or {}).get("repair_attempted", False)),
+                    "final_status": str((validation_results.get("service_scope", {}) or {}).get("final_status", "")),
+                },
+                {
+                    "name": "Source relevance validation",
+                    "passed": bool((validation_results.get("source_relevance", {}) or {}).get("passed", False)),
+                    "severity": str((validation_results.get("source_relevance", {}) or {}).get("severity", "")),
+                    "issue_count": int((validation_results.get("source_relevance", {}) or {}).get("issue_count", 0) or 0),
+                    "repair_attempted": bool((validation_results.get("source_relevance", {}) or {}).get("repair_attempted", False)),
+                    "final_status": str((validation_results.get("source_relevance", {}) or {}).get("final_status", "")),
+                },
+                {
+                    "name": "Artifact contamination validation",
+                    "passed": bool((validation_results.get("artifact_contamination", {}) or {}).get("passed", False)),
+                    "severity": str((validation_results.get("artifact_contamination", {}) or {}).get("severity", "")),
+                    "issue_count": int((validation_results.get("artifact_contamination", {}) or {}).get("issue_count", 0) or 0),
+                    "repair_attempted": bool((validation_results.get("artifact_contamination", {}) or {}).get("repair_attempted", False)),
+                    "final_status": str((validation_results.get("artifact_contamination", {}) or {}).get("final_status", "")),
+                },
+                {
+                    "name": "Final output gate",
+                    "passed": bool(final_output_gate.get("passed", False)),
+                    "severity": str(final_output_gate.get("severity", "")),
+                    "issue_count": int(final_output_gate.get("issue_count", 0) or 0),
+                    "repair_attempted": bool(result.get("repair_state")),
+                    "final_status": "passed" if bool(final_output_gate.get("passed", False)) else "blocked",
+                },
+            ],
+            "blocking_failures": list(final_output_gate.get("blocking_failures", []) or []),
+            "required_repairs": list(final_output_gate.get("required_repairs", []) or []),
         },
     }

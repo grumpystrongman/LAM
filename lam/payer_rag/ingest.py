@@ -3,13 +3,14 @@ from __future__ import annotations
 import csv
 import io
 import json
+import re
 import urllib.request
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Iterator
 
-from .sample_data import SAMPLE_DUKE_STANDARD_CHARGES, sample_source_manifest
+from .sample_data import SAMPLE_DUKE_STANDARD_CHARGES, build_synthetic_imaging_standard_charges, sample_source_manifest
 from .schema import make_id, unique_rows
 
 DEFAULT_SERVICE_KEYWORDS = (
@@ -37,8 +38,20 @@ DEFAULT_SERVICE_KEYWORDS = (
     "endoscopy",
 )
 
+KNOWN_PAYER_MARKERS = (
+    "Aetna",
+    "Anthem",
+    "CareFirst",
+    "Cigna",
+    "Humana",
+    "Innovation Health",
+    "Kaiser",
+    "Sentara Health",
+    "UnitedHealthcare",
+    "United",
+)
 
-def default_source_manifest() -> list[dict]:
+def _durham_source_manifest() -> list[dict]:
     return [
         {
             "source_name": "Duke University Hospital standard charges",
@@ -208,24 +221,135 @@ def default_source_manifest() -> list[dict]:
     ]
 
 
-def write_default_manifest(path: str | Path) -> Path:
+def _fairfax_source_manifest() -> list[dict]:
+    return [
+        {
+            "source_name": "Inova Fairfax Hospital standard charges",
+            "source_type": "standard_charges_csv",
+            "source_url_or_path": "https://www.inova.org/sites/default/files/patient_visitor/price_transparency/2026/540620889_inova-fairfax-hospital_standardcharges.csv",
+            "accessed_or_ingested_date": "",
+            "geography": "Fairfax, VA",
+            "notes": "Public Inova Fairfax Hospital machine-readable standard charges for Fairfax-area outpatient imaging review.",
+            "confidence": 0.93,
+        },
+        {
+            "source_name": "Inova Fair Oaks Hospital standard charges",
+            "source_type": "standard_charges_csv",
+            "source_url_or_path": "https://www.inova.org/sites/default/files/patient_visitor/price_transparency/2026/540620889_inova-fair-oaks-hospital_standardcharges.csv",
+            "accessed_or_ingested_date": "",
+            "geography": "Fairfax, VA",
+            "notes": "Public Inova Fair Oaks Hospital machine-readable standard charges for Fairfax-area outpatient imaging review.",
+            "confidence": 0.92,
+        },
+        {
+            "source_name": "Inova Alexandria Hospital standard charges",
+            "source_type": "standard_charges_csv",
+            "source_url_or_path": "https://www.inova.org/sites/default/files/patient_visitor/price_transparency/2026/540620889_inova-alexandria-hospital_standardcharges.csv",
+            "accessed_or_ingested_date": "",
+            "geography": "Northern Virginia, VA",
+            "notes": "Public Inova Alexandria Hospital machine-readable standard charges to widen NoVA outpatient imaging coverage.",
+            "confidence": 0.91,
+        },
+        {
+            "source_name": "Inova Loudoun Hospital standard charges",
+            "source_type": "standard_charges_csv",
+            "source_url_or_path": "https://www.inova.org/sites/default/files/patient_visitor/price_transparency/2026/540620889_inova-loudoun-hospital_standardcharges.csv",
+            "accessed_or_ingested_date": "",
+            "geography": "Northern Virginia, VA",
+            "notes": "Public Inova Loudoun Hospital machine-readable standard charges to widen NoVA outpatient imaging coverage.",
+            "confidence": 0.91,
+        },
+        {
+            "source_name": "Inova Mount Vernon Hospital standard charges",
+            "source_type": "standard_charges_csv",
+            "source_url_or_path": "https://www.inova.org/sites/default/files/patient_visitor/price_transparency/2026/540620889_inova-mount-vernon-hospital_standardcharges.csv",
+            "accessed_or_ingested_date": "",
+            "geography": "Northern Virginia, VA",
+            "notes": "Public Inova Mount Vernon Hospital machine-readable standard charges to widen NoVA outpatient imaging coverage.",
+            "confidence": 0.9,
+        },
+        {
+            "source_name": "Inova hospital charges and price transparency page",
+            "source_type": "reference_page",
+            "source_url_or_path": "https://www.inova.org/patient-and-visitor-information/hospital-charges",
+            "accessed_or_ingested_date": "",
+            "geography": "Fairfax, VA",
+            "notes": "Landing page for Inova machine-readable hospital charges and price transparency references.",
+            "confidence": 0.95,
+        },
+        {
+            "source_name": "Inova health plans page",
+            "source_type": "insurance_reference_page",
+            "source_url_or_path": "https://www.inova.org/patient-and-visitor-information/health-plans",
+            "accessed_or_ingested_date": "",
+            "geography": "Fairfax, VA",
+            "notes": "Accepted insurance plans reference page for Inova facilities in Fairfax and Northern Virginia.",
+            "confidence": 0.86,
+        },
+        {
+            "source_name": "Aetna transparency in coverage page",
+            "source_type": "reference_page",
+            "source_url_or_path": "https://www.aetna.com/individuals-families/member-rights-resources/transparency-in-coverage.html",
+            "accessed_or_ingested_date": "",
+            "geography": "National",
+            "notes": "Payer transparency reference page for future TIC ingestion filtered to Fairfax, VA evidence when available.",
+            "confidence": 0.8,
+        },
+        {
+            "source_name": "UnitedHealthcare transparency in coverage page",
+            "source_type": "reference_page",
+            "source_url_or_path": "https://transparency-in-coverage.uhc.com/",
+            "accessed_or_ingested_date": "",
+            "geography": "National",
+            "notes": "Payer transparency reference page for future machine-readable ingestion filtered to Fairfax, VA evidence when available.",
+            "confidence": 0.8,
+        },
+        {
+            "source_name": "Cigna transparency in coverage page",
+            "source_type": "reference_page",
+            "source_url_or_path": "https://www.cigna.com/legal/compliance/machine-readable-files",
+            "accessed_or_ingested_date": "",
+            "geography": "National",
+            "notes": "Payer transparency reference page for future machine-readable ingestion filtered to Fairfax, VA evidence when available.",
+            "confidence": 0.8,
+        },
+    ]
+
+
+def default_source_manifest(geography: str | None = None) -> list[dict]:
+    low = str(geography or "").lower()
+    if "fairfax" in low or low.endswith(", va") or low == "va" or "virginia" in low:
+        return _fairfax_source_manifest()
+    return _durham_source_manifest()
+
+
+def write_default_manifest(path: str | Path, geography: str | None = None) -> Path:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(default_source_manifest(), indent=2), encoding="utf-8")
+    target.write_text(json.dumps(default_source_manifest(geography), indent=2), encoding="utf-8")
     return target
 
 
-def load_source_manifest(path: str | Path | None = None, offline: bool = False) -> list[dict]:
+def load_source_manifest(path: str | Path | None = None, offline: bool = False, geography: str | None = None) -> list[dict]:
     if offline:
         return sample_source_manifest()
     if path is None or str(path).strip() == "":
-        return default_source_manifest()
+        return default_source_manifest(geography)
     target = Path(path)
     return json.loads(target.read_text(encoding="utf-8"))
 
 
 def source_now() -> str:
     return datetime.now(timezone.utc).date().isoformat()
+
+
+def _decode_text_bytes(payload: bytes) -> str:
+    for encoding in ("utf-8-sig", "cp1252", "latin-1"):
+        try:
+            return payload.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return payload.decode("utf-8", errors="replace")
 
 
 def _remote_text_stream(url: str) -> io.TextIOBase:
@@ -239,11 +363,64 @@ def _remote_text_stream(url: str) -> io.TextIOBase:
         },
     )
     response = urllib.request.urlopen(request, timeout=120)
-    return io.TextIOWrapper(response, encoding="utf-8-sig", newline="")
+    payload = response.read()
+    return io.StringIO(_decode_text_bytes(payload))
 
 
 def _local_text_stream(path: str | Path) -> io.TextIOBase:
-    return open(path, "r", encoding="utf-8-sig", newline="")
+    return io.StringIO(_decode_text_bytes(Path(path).read_bytes()))
+
+
+def parse_insurance_reference_page_text(
+    payload: str,
+    *,
+    source_name: str,
+    source_url: str,
+    geography: str,
+    default_confidence: float = 0.8,
+) -> dict[str, list[dict] | list[str]]:
+    text = re.sub(r"<[^>]+>", " ", payload or "")
+    text = re.sub(r"\s+", " ", text)
+    lowered = text.lower()
+    payers: list[dict] = []
+    plans: list[dict] = []
+    issues: list[str] = []
+    network_name = source_name.replace(" page", "").strip()
+    found_any = False
+    for marker in KNOWN_PAYER_MARKERS:
+        if marker.lower() not in lowered:
+            continue
+        found_any = True
+        payer_name = "UnitedHealthcare" if marker == "United" and "unitedhealthcare" in lowered else marker
+        payer_id = make_id("payer", payer_name)
+        plan_id = make_id("plan", payer_name, geography, network_name)
+        payers.append(
+            {
+                "payer_id": payer_id,
+                "payer_name": payer_name,
+                "source_url": source_url,
+                "source_type": source_name,
+                "confidence": default_confidence,
+                "notes": f"Observed on {source_name} as an accepted or referenced insurance plan.",
+            }
+        )
+        plans.append(
+            {
+                "plan_id": plan_id,
+                "payer_id": payer_id,
+                "plan_name": f"{payer_name} accepted plans",
+                "plan_type": "accepted_plans_reference",
+                "market_segment": "provider_network_reference",
+                "geography": geography,
+                "network_name": network_name,
+                "source_url": source_url,
+                "confidence": default_confidence,
+                "notes": f"Accepted plan reference from {source_name}.",
+            }
+        )
+    if not found_any:
+        issues.append(f"No payer markers were detected on {source_name}.")
+    return {"payers": unique_rows(payers, "payer_id"), "plans": unique_rows(plans, "plan_id"), "services": [], "rates": [], "issues": issues}
 
 
 def service_matches(description: str, keywords: Iterable[str] | None) -> bool:
@@ -548,12 +725,33 @@ def ingest_sources(
         manifest_row = dict(source)
         manifest_row["accessed_or_ingested_date"] = manifest_row.get("accessed_or_ingested_date") or source_now()
         merged["manifest"].append(manifest_row)
-        if source["source_type"] not in {"standard_charges_csv", "duke_standard_charges_csv", "synthetic_fixture", "shoppable_services_filters_json"}:
+        if source["source_type"] not in {"standard_charges_csv", "duke_standard_charges_csv", "synthetic_fixture", "shoppable_services_filters_json", "insurance_reference_page"}:
             continue
         try:
             if source["source_type"] == "synthetic_fixture":
+                fixture_variant = str(source.get("fixture_variant", "") or "").strip().lower()
+                if not fixture_variant:
+                    source_name_low = str(source.get("source_name", "") or "").lower()
+                    source_geo_low = str(source.get("geography", "") or "").lower()
+                    source_url = str(source.get("source_url_or_path", "") or "").lower()
+                    if "duke" in source_name_low or "duke" in source_url or "durham" in source_geo_low:
+                        fixture_variant = "duke_sample"
+                    else:
+                        fixture_variant = "imaging_demo"
+                synthetic_text = SAMPLE_DUKE_STANDARD_CHARGES
+                if fixture_variant == "imaging_demo":
+                    geography = str(source.get("geography", "Fairfax, VA") or "Fairfax, VA")
+                    parts = [item.strip() for item in geography.split(",", 1)]
+                    city = parts[0] if parts else "Fairfax"
+                    state = parts[1] if len(parts) > 1 else "VA"
+                    facility_name = str(source.get("facility_name", "") or f"{city} Imaging Center").strip()
+                    synthetic_text = build_synthetic_imaging_standard_charges(
+                        facility_name=facility_name,
+                        city=city,
+                        state=state,
+                    )
                 bundle = parse_duke_standard_charges_text(
-                    SAMPLE_DUKE_STANDARD_CHARGES,
+                    synthetic_text,
                     source_name=source["source_name"],
                     source_url=source["source_url_or_path"],
                     geography=source.get("geography", "Durham, NC"),
@@ -578,6 +776,24 @@ def ingest_sources(
                         source_url=str(source["source_url_or_path"]),
                         geography=source.get("geography", "Durham, NC"),
                         default_confidence=source.get("confidence", 0.85),
+                    )
+            elif source["source_type"] == "insurance_reference_page":
+                if str(source["source_url_or_path"]).startswith(("http://", "https://")):
+                    with closing(_remote_text_stream(source["source_url_or_path"])) as handle:
+                        bundle = parse_insurance_reference_page_text(
+                            handle.read(),
+                            source_name=source["source_name"],
+                            source_url=source["source_url_or_path"],
+                            geography=source.get("geography", "Fairfax, VA"),
+                            default_confidence=source.get("confidence", 0.8),
+                        )
+                else:
+                    bundle = parse_insurance_reference_page_text(
+                        Path(source["source_url_or_path"]).read_text(encoding="utf-8"),
+                        source_name=source["source_name"],
+                        source_url=str(source["source_url_or_path"]),
+                        geography=source.get("geography", "Fairfax, VA"),
+                        default_confidence=source.get("confidence", 0.8),
                     )
             elif str(source["source_url_or_path"]).startswith(("http://", "https://")):
                 with closing(_remote_text_stream(source["source_url_or_path"])) as handle:

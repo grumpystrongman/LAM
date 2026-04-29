@@ -98,6 +98,44 @@ def write_validation_checklist(workspace: str | Path, rows: list[dict], *, geogr
     return target
 
 
+def write_real_data_acquisition_checklist(
+    workspace: str | Path,
+    *,
+    geography_label: str = "Fairfax, VA",
+    service_focus: str = "outpatient imaging",
+    synthetic_label: bool = False,
+) -> Path:
+    target = Path(workspace) / "artifacts" / "real_data_acquisition_checklist.md"
+    parts = [item.strip() for item in str(geography_label or "").split(",", 1)]
+    region_name = parts[0] if parts else geography_label
+    state_name = parts[1] if len(parts) > 1 else ""
+    synthetic_note = (
+        "A synthetic/demo package was generated because validated local public evidence was unavailable in this run.\n\n"
+        if synthetic_label
+        else ""
+    )
+    target.write_text(
+        "# Real Data Acquisition Checklist\n\n"
+        f"- Requested geography: {geography_label}\n"
+        f"- Requested service scope: {service_focus}\n\n"
+        f"{synthetic_note}"
+        "## Collect real evidence\n\n"
+        f"- Identify {geography_label} or broader {state_name} outpatient imaging provider transparency files.\n"
+        "- Add locally relevant standard-charge or shoppable-service sources to the source manifest.\n"
+        "- Prefer provider or payer files that explicitly identify MRI, CT, ultrasound, mammography, x-ray, or diagnostic imaging services.\n"
+        "- Exclude stale or out-of-market artifacts from final evidence.\n"
+        f"- Verify any national payer transparency source is filtered to {region_name} before using it as evidence.\n\n"
+        "## Validate before outreach\n\n"
+        "- Confirm service mapping for each imaging row with contracting or revenue-cycle stakeholders.\n"
+        "- Pull sample claims or remittance examples for the top flagged outpatient imaging services.\n"
+        "- Validate payer and plan naming against current contract metadata.\n"
+        "- Confirm whether billed, negotiated, and allowed amounts are comparable for the flagged service.\n"
+        "- Keep synthetic/demo results separate from validated public local evidence.\n",
+        encoding="utf-8",
+    )
+    return target
+
+
 def _format_sheet(ws) -> None:
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
@@ -115,6 +153,7 @@ def export_workbook(
     payer_summary: list[dict],
     source_manifest: list[dict],
     methodology_lines: list[str],
+    synthetic_label: bool = False,
 ) -> Path:
     root = Path(workspace)
     target = root / "artifacts" / "durham_nc_payer_outreach_candidates.xlsx"
@@ -164,6 +203,8 @@ def export_workbook(
 
     methodology_ws = wb.create_sheet("Methodology")
     methodology_ws.append(["section", "details"])
+    if synthetic_label:
+        methodology_ws.append(["synthetic_label", "This workbook uses synthetic/demo data and is not public Fairfax evidence."])
     for line in methodology_lines:
         if ":" in line:
             section, details = line.split(":", 1)
@@ -192,6 +233,7 @@ def write_summary_report(
     source_manifest: list[dict],
     limitations: list[str],
     geography_label: str = "Durham, NC",
+    synthetic_label: bool = False,
 ) -> Path:
     root = Path(workspace)
     top_candidates = "\n".join(
@@ -211,6 +253,8 @@ def write_summary_report(
     target = root / "artifacts" / "summary_report.md"
     target.write_text(
         f"# {geography_label} Payer Pricing Review\n\n"
+        + ("**Synthetic/demo build:** This package does not represent validated public local pricing evidence.\n\n" if synthetic_label else "")
+        +
         "## Summary\n\n"
         f"This review uses public {geography_label} provider transparency data, payer reference sources, and a local retriever over normalized payer, plan, "
         "service, and pricing records. Flagged items are potential pricing outliers that warrant validation before outreach.\n\n"
@@ -230,7 +274,7 @@ def write_summary_report(
     return target
 
 
-def write_dashboard_html(workspace: str | Path, *, geography_label: str = "Durham, NC") -> Path:
+def write_dashboard_html(workspace: str | Path, *, geography_label: str = "Durham, NC", synthetic_label: bool = False) -> Path:
     root = Path(workspace)
     candidates = read_csv_rows(root / "artifacts" / "outreach_candidates.csv")
     payer_summary = read_csv_rows(root / "artifacts" / "payer_summary.csv")
@@ -265,6 +309,7 @@ def write_dashboard_html(workspace: str | Path, *, geography_label: str = "Durha
     )
     target = root / "artifacts" / "shopping_dashboard_placeholder.html"
     target = root / "artifacts" / "payer_dashboard.html"
+    synthetic_badge = "<span class='pill' style='background:#fee2e2;color:#991b1b;margin-left:8px;'>Synthetic / demo only</span>" if synthetic_label else ""
     target.write_text(
         f"<!doctype html><html><head><meta charset='utf-8'><title>{html.escape(geography_label)} Payer Review</title>"
         "<style>body{font-family:Georgia,serif;background:#f5f7fb;color:#182230;padding:32px} "
@@ -272,8 +317,8 @@ def write_dashboard_html(workspace: str | Path, *, geography_label: str = "Durha
         "border-radius:18px;padding:20px;box-shadow:0 10px 30px rgba(18,35,56,.06)} table{width:100%;border-collapse:collapse}"
         "th,td{padding:10px;border-bottom:1px solid #eef2f7;text-align:left} h1,h2{margin-top:0} .pill{display:inline-block;"
         "padding:6px 10px;border-radius:999px;background:#d8ebff;color:#15406b;font-size:12px;font-weight:700}</style></head><body>"
-        f"<span class='pill'>Potential pricing outliers only</span><h1>{html.escape(geography_label)} Payer Pricing Review</h1>"
-        f"<p>This dashboard summarizes public {html.escape(geography_label)} pricing data and highlights payer-plan combinations that appear higher than local peers for comparable services. All items require contract validation before outreach.</p>"
+        f"<span class='pill'>Potential pricing outliers only</span>{synthetic_badge}<h1>{html.escape(geography_label)} Payer Pricing Review</h1>"
+        f"<p>{'This is a synthetic/demo fallback and is not stakeholder-ready public local evidence. ' if synthetic_label else ''}This dashboard summarizes public {html.escape(geography_label)} pricing data and highlights payer-plan combinations that appear higher than local peers for comparable services. All items require contract validation before outreach.</p>"
         "<div class='grid'><div class='card'><h2>Top Outreach Candidates</h2><table><thead><tr><th>Rank</th><th>Payer</th><th>Plan</th><th>Service</th><th>Payer Rate</th><th>Peer Median</th><th>Variance</th></tr></thead><tbody>"
         f"{top_rows}</tbody></table></div><div class='card'><h2>Payer Summary</h2><table><thead><tr><th>Payer</th><th>Flags</th><th>Avg Variance</th><th>Top Concern</th></tr></thead><tbody>{payer_rows}</tbody></table><h2 style='margin-top:24px'>Sources</h2><ul>{source_rows}</ul></div></div></body></html>",
         encoding="utf-8",

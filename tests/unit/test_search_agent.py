@@ -1,7 +1,10 @@
-import unittest
-import tempfile
+import base64
 import json
 import shutil
+import sys
+import tempfile
+import types
+import unittest
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -937,6 +940,97 @@ class TestSearchAgent(unittest.TestCase):
         self.assertFalse(result.get("ok"))
         self.assertEqual(result.get("error_code"), "geography_consistency_failed")
 
+    @patch("lam.interface.search_agent.ensure_workspace")
+    def test_run_payer_pricing_review_blocks_final_output_gate_failure(self, mock_ensure) -> None:
+        mock_ensure.return_value = {
+            "workspace": "C:\\temp\\fairfax_va_20260427_120000",
+            "artifact_paths": {
+                "geography_validation_report_md": "C:\\temp\\fairfax_va_geography_validation.md",
+                "primary_open_file": "C:\\temp\\fairfax_va_geography_validation.md",
+            },
+            "counts": {"outreach_candidates": 0},
+            "reused_existing_outputs": False,
+            "current_task_contract": {"geography": "Fairfax, VA", "service_focus": "outpatient imaging"},
+            "invalidated_artifacts": ["durham_nc_20260425_100000: geography mismatch (Durham, NC != Fairfax, VA)"],
+            "generation_timestamp": "2026-04-27T12:00:00",
+            "geography_validation": {"passed": True, "errors": []},
+            "validation_results": {
+                "geography": {"passed": True, "issue_count": 0},
+                "service_scope": {"passed": False, "issue_count": 3},
+                "source_relevance": {"passed": False, "issue_count": 4},
+                "artifact_contamination": {"passed": False, "issue_count": 2},
+            },
+            "final_output_gate": {
+                "passed": False,
+                "severity": "blocking",
+                "blocking_failures": ["ServiceScopeValidator", "SourceRelevanceValidator", "ArtifactContaminationValidator"],
+                "required_repairs": ["Filter to outpatient imaging and rebuild with Fairfax evidence."],
+                "issue_count": 9,
+            },
+            "quarantined_artifacts": {"summary_report_md": "C:\\temp\\fairfax_va_summary_report.md"},
+            "repair_state": {"service_scope_repair": {"attempted": True}},
+            "top_candidates": [],
+            "issues": [],
+            "synthetic_only": False,
+        }
+        result = search_agent_mod._run_payer_pricing_review(
+            "Build a Fairfax, VA outpatient imaging payer/pricing review with a RAG index and stakeholder workbook."
+        )
+        self.assertFalse(result.get("ok"))
+        self.assertEqual(result.get("error_code"), "final_output_gate_failed")
+        self.assertIn("validation_results", result)
+        self.assertEqual(result.get("canvas", {}).get("title"), "Validation Failed")
+
+    @patch("lam.interface.search_agent.ensure_workspace")
+    def test_run_payer_pricing_review_returns_completed_demo_package(self, mock_ensure) -> None:
+        mock_ensure.return_value = {
+            "workspace": "C:\\temp\\fairfax_va_demo_20260427_120000",
+            "artifact_paths": {
+                "dashboard_html": "C:\\temp\\fairfax_va_payer_dashboard.html",
+                "primary_open_file": "C:\\temp\\fairfax_va_payer_dashboard.html",
+                "workbook_xlsx": "C:\\temp\\fairfax_va_payer_outreach_candidates.xlsx",
+                "summary_report_md": "C:\\temp\\fairfax_va_summary_report.md",
+                "source_manifest_csv": "C:\\temp\\fairfax_va_source_manifest.csv",
+                "validation_queue_csv": "C:\\temp\\fairfax_va_contract_validation_queue.csv",
+                "real_data_acquisition_checklist_md": "C:\\temp\\fairfax_va_real_data_acquisition_checklist.md",
+                "rag_index_db": "C:\\temp\\payer_rag.db",
+            },
+            "counts": {"outreach_candidates": 4},
+            "reused_existing_outputs": False,
+            "current_task_contract": {"geography": "Fairfax, VA", "service_focus": "outpatient imaging"},
+            "invalidated_artifacts": ["durham_nc_20260425_100000: geography mismatch (Durham, NC != Fairfax, VA)"],
+            "generation_timestamp": "2026-04-27T12:00:00",
+            "geography_validation": {"passed": True, "errors": []},
+            "validation_results": {
+                "geography": {"passed": True, "issue_count": 0},
+                "service_scope": {"passed": True, "issue_count": 0},
+                "source_relevance": {"passed": True, "issue_count": 0},
+                "artifact_contamination": {"passed": True, "issue_count": 0},
+            },
+            "final_output_gate": {
+                "passed": True,
+                "severity": "blocking",
+                "blocking_failures": [],
+                "required_repairs": [],
+                "issue_count": 0,
+            },
+            "quarantined_artifacts": {},
+            "repair_state": {"source_repair_attempted": True},
+            "top_candidates": [
+                {"payer_name": "United Healthcare", "plan_name": "Commercial PPO", "service": "MRI brain without contrast", "variance_percent": 0.14, "source_evidence": "sample://fairfax_demo | row_1"}
+            ],
+            "issues": [],
+            "synthetic_only": True,
+            "completion_status": "completed_demo_package",
+        }
+        result = search_agent_mod._run_payer_pricing_review(
+            "Build a Fairfax, VA outpatient imaging payer/pricing review with synthetic fallback if needed."
+        )
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(result.get("completion_status"), "completed_demo_package")
+        self.assertEqual(result.get("source_basis"), "synthetic_demo")
+        self.assertIn("Demo Package Ready", result.get("canvas", {}).get("title", ""))
+
     @patch("lam.operator_platform.research_primitives.search_web")
     @patch("lam.interface.search_agent._write_generic_research_artifacts")
     @patch("lam.interface.search_agent.webbrowser.open")
@@ -1432,6 +1526,7 @@ class TestSearchAgent(unittest.TestCase):
             next_step_index = 1
             paused_for_credentials = True
             pause_reason = "Login checkpoint"
+            artifacts = {}
             error = ""
 
         mock_exec.return_value = R()
@@ -1460,6 +1555,7 @@ class TestSearchAgent(unittest.TestCase):
             next_step_index = 1
             paused_for_credentials = False
             pause_reason = ""
+            artifacts = {}
             error = ""
 
         mock_exec.return_value = R()
@@ -1481,6 +1577,7 @@ class TestSearchAgent(unittest.TestCase):
             next_step_index = 2
             paused_for_credentials = False
             pause_reason = ""
+            artifacts = {}
             error = ""
 
         mock_exec.return_value = R()
@@ -1915,6 +2012,7 @@ class TestSearchAgent(unittest.TestCase):
             next_step_index = 1
             paused_for_credentials = False
             pause_reason = ""
+            artifacts = {}
             error = ""
 
         mock_build_plan.return_value = {
@@ -1975,6 +2073,94 @@ class TestSearchAgent(unittest.TestCase):
         self.assertEqual(result["mode"], "native_plan_invalid")
         self.assertIn("powerpoint", result.get("missing_outputs", []))
         mock_exec_native.assert_not_called()
+
+    def test_image_base64_roundtrip_helpers(self) -> None:
+        base = self._case_dir("image_base64_roundtrip")
+        src = base / "sample.png"
+        src.write_bytes(base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+Xj1wAAAAASUVORK5CYII="))
+        encoded = search_agent_mod.image_to_base64(src)
+        self.assertTrue(encoded)
+        restored = search_agent_mod.base64_to_image(encoded, base / "restored.png")
+        self.assertTrue(restored.exists())
+        self.assertEqual(src.read_bytes(), restored.read_bytes())
+
+    def test_study_image_url_prefers_base64_when_file_missing(self) -> None:
+        value = search_agent_mod._study_image_url(img_path="", image_base64="YWJj")
+        self.assertEqual(value, "data:image/png;base64,YWJj")
+
+    @patch("lam.interface.search_agent.LOGGER")
+    def test_render_pdf_page_image_logs_failures(self, mock_logger) -> None:
+        class BrokenDoc:
+            def load_page(self, _page_index: int) -> Any:
+                raise RuntimeError("boom")
+
+        with patch("lam.interface.search_agent._get_fitz_module", return_value=type("Fitz", (), {"Matrix": lambda self, x, y: (x, y)})()):
+            path = search_agent_mod._render_pdf_page_image(BrokenDoc(), 0, "https://example.com/file.pdf")
+        self.assertEqual(path, "")
+        mock_logger.warning.assert_called()
+
+    def test_capture_clipboard_image_saves_image(self) -> None:
+        base = self._case_dir("clipboard_image_capture")
+
+        class FakeImage:
+            def save(self, target: str, format: str = "PNG") -> None:
+                Path(target).write_bytes(b"fake-image")
+
+        fake_imagegrab = types.SimpleNamespace(grabclipboard=lambda: FakeImage())
+        fake_pil = types.SimpleNamespace(ImageGrab=fake_imagegrab)
+        with patch.dict(sys.modules, {"PIL": fake_pil, "PIL.ImageGrab": fake_imagegrab}):
+            out = search_agent_mod.capture_clipboard_image(base / "clip.png")
+        self.assertTrue(out)
+        self.assertTrue(Path(out).exists())
+
+    @patch("lam.interface.search_agent.capture_clipboard_image")
+    def test_execute_instruction_clipboard_capture_route(self, mock_capture_clipboard_image) -> None:
+        base = self._case_dir("execute_instruction_clipboard_capture")
+        image_path = base / "clipboard.png"
+        image_path.write_bytes(base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+Xj1wAAAAASUVORK5CYII="))
+        mock_capture_clipboard_image.return_value = str(image_path.resolve())
+        result = execute_instruction(
+            "Capture the current clipboard image and save it as an artifact package with base64 output.",
+            control_granted=True,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["mode"], "clipboard_capture")
+        self.assertEqual(result.get("source_status", {}).get("clipboard"), "ok")
+        self.assertIn("clipboard_image_png", result.get("artifacts", {}))
+        self.assertIn("clipboard_image_base64_txt", result.get("artifacts", {}))
+        self.assertTrue(str(result.get("opened_url", "")).startswith("file:///"))
+
+    @patch("lam.interface.search_agent.get_guidance")
+    @patch("lam.interface.search_agent.execute_plan")
+    @patch("lam.interface.search_agent.assess_risk")
+    @patch("lam.interface.search_agent.build_plan")
+    @patch("lam.interface.search_agent._is_clipboard_capture_intent", return_value=False)
+    def test_desktop_sequence_clipboard_artifacts_surface_in_response(self, _mock_clipboard_intent, mock_build_plan, mock_risk, mock_exec, mock_guidance) -> None:
+        class R:
+            ok = True
+            trace = [{"step": 1, "action": "capture_clipboard_image", "ok": True, "artifact": "C:\\temp\\clip.png"}]
+            done = True
+            next_step_index = 2
+            paused_for_credentials = False
+            pause_reason = ""
+            artifacts = {"clipboard_image_png": "C:\\temp\\clip.png", "primary_open_file": "C:\\temp\\clip.png"}
+            error = ""
+
+        mock_build_plan.return_value = {
+            "app_name": "paint",
+            "steps": [
+                {"action": "open_app", "app": "paint"},
+                {"action": "capture_clipboard_image", "output_path": "", "source": "system_clipboard"},
+            ],
+        }
+        mock_risk.return_value = {"requires_confirmation": False, "risky_steps": []}
+        mock_exec.return_value = R()
+        mock_guidance.return_value = {"app_name": "paint", "guidance": []}
+        result = execute_instruction("open paint then capture clipboard image", control_granted=True)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["mode"], "desktop_sequence")
+        self.assertIn("clipboard_image_png", result.get("artifacts", {}))
+        self.assertTrue(str(result.get("opened_url", "")).startswith("file:///"))
 
 
 if __name__ == "__main__":

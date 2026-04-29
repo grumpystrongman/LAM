@@ -60,6 +60,11 @@ class TestWebUiHumanSuite(unittest.TestCase):
         self.assertIn("validation_history", web_ui.HTML_PAGE)
         self.assertIn("renderInlineArtifactChips", web_ui.HTML_PAGE)
         self.assertIn('class="artifact-open"', web_ui.HTML_PAGE)
+        self.assertIn("Validation", web_ui.HTML_PAGE)
+        self.assertIn("final_output_gate", web_ui.HTML_PAGE)
+        self.assertIn("Capture Clipboard Image", web_ui.HTML_PAGE)
+        self.assertIn("function captureClipboardImageUi", web_ui.HTML_PAGE)
+        self.assertIn("/api/clipboard/capture", web_ui.HTML_PAGE)
 
     def test_start_killer_suite_task_stores_result(self) -> None:
         state = web_ui.UiState()
