@@ -192,6 +192,77 @@ class UIAAdapter:
             time.sleep(0.25)
         return {"ok": False, "error": "Visual target not found in time."}
 
+    def capture_live_state(self, app_hint: str = "", max_candidates: int = 12) -> Dict[str, Any]:
+        self._trace.append({"action": "capture_live_state", "app_hint": app_hint, "max_candidates": max_candidates})
+        if self.dry_run:
+            return {"ok": True, "app_name": str(app_hint or "").strip().lower(), "visible_labels": [], "selector_values": [], "window_title": ""}
+        if self._desktop is None:
+            return {"ok": False, "error": "UIA backend unavailable. Install pywinauto."}
+        hint = str(app_hint or "").strip().lower()
+        labels: List[str] = []
+        selector_values: List[str] = []
+        roles: List[str] = []
+        window_title = ""
+        try:
+            windows = list(self._desktop.windows())
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        target_window = None
+        for window in windows:
+            try:
+                title = str(window.window_text() or "").strip()
+            except Exception:
+                title = ""
+            if hint and hint in title.lower():
+                target_window = window
+                window_title = title
+                break
+        if target_window is None and windows:
+            target_window = windows[0]
+            try:
+                window_title = str(target_window.window_text() or "").strip()
+            except Exception:
+                window_title = ""
+        if target_window is None:
+            return {"ok": False, "error": "no_window_found"}
+        try:
+            descendants = list(target_window.descendants())[: max(1, int(max_candidates))]
+        except Exception:
+            descendants = []
+        for element in descendants:
+            try:
+                text = str(element.window_text() or "").strip()
+            except Exception:
+                text = ""
+            if text:
+                labels.append(text)
+                selector_values.append(text)
+            try:
+                class_name = str(getattr(element, "friendly_class_name", lambda: "")() or "").strip()
+            except Exception:
+                class_name = ""
+            if class_name:
+                roles.append(class_name)
+            try:
+                auto_id = str(getattr(element, "element_info", None).automation_id or "").strip()
+            except Exception:
+                auto_id = ""
+            if auto_id:
+                selector_values.append(auto_id)
+        dedup_labels = list(dict.fromkeys(labels))
+        dedup_selectors = list(dict.fromkeys(selector_values))
+        dedup_roles = list(dict.fromkeys(roles))
+        tree_signature = "|".join(dedup_roles[:6] + dedup_labels[:6])
+        return {
+            "ok": True,
+            "app_name": hint or window_title.lower(),
+            "window_title": window_title,
+            "visible_labels": dedup_labels[:max_candidates],
+            "selector_values": dedup_selectors[: max_candidates * 2],
+            "visible_roles": dedup_roles[:max_candidates],
+            "tree_signature": tree_signature,
+        }
+
     def _find_window(self, selector_bundle: Dict[str, Any]):
         if self._desktop is None:
             raise RuntimeError("UIA backend unavailable. Install pywinauto.")

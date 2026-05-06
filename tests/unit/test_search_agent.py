@@ -2134,8 +2134,7 @@ class TestSearchAgent(unittest.TestCase):
     @patch("lam.interface.search_agent.execute_plan")
     @patch("lam.interface.search_agent.assess_risk")
     @patch("lam.interface.search_agent.build_plan")
-    @patch("lam.interface.search_agent._is_clipboard_capture_intent", return_value=False)
-    def test_desktop_sequence_clipboard_artifacts_surface_in_response(self, _mock_clipboard_intent, mock_build_plan, mock_risk, mock_exec, mock_guidance) -> None:
+    def test_desktop_sequence_clipboard_artifacts_surface_in_response(self, mock_build_plan, mock_risk, mock_exec, mock_guidance) -> None:
         class R:
             ok = True
             trace = [{"step": 1, "action": "capture_clipboard_image", "ok": True, "artifact": "C:\\temp\\clip.png"}]

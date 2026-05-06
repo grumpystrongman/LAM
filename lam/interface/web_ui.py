@@ -19,7 +19,9 @@ import yaml
 from lam.adapters.uia_adapter import UIAAdapter
 from lam.interface.ai_backend import AI_BACKENDS, normalize_backend
 from lam.interface.app_launcher import list_installed_apps, open_installed_app
+from lam.interface.desktop_sequence import build_plan_from_recipe, execute_plan
 from lam.interface.global_teach_hooks import GlobalTeachHooks
+from lam.interface.learned_recipe import RecipeMemory
 from lam.interface.scheduler import ScheduleEngine, ScheduleJob
 from lam.interface.search_agent import (
     execute_instruction,
@@ -29,6 +31,7 @@ from lam.interface.search_agent import (
 )
 from lam.interface.selector_picker import capture_selector_at_cursor
 from lam.interface.teach_recorder import TeachRecorder
+from lam.interface.teach_runtime import TeachReplayRuntime
 from lam.interface.user_defaults import current_user, load_defaults, save_defaults
 from lam.interface.password_vault import LocalPasswordVault
 from lam.interface.browser_worker import normalize_browser_worker_mode
@@ -39,6 +42,10 @@ from lam.interface.human_operator_scenario_runner import (
 )
 from lam.interface.reliability_suite import run_reliability_suite
 from lam.interface.world_model import build_ui_world_model
+from lam.operator_platform.research_primitives import collect_generic_research
+from lam.learn.skill_library import SkillLibrary
+from lam.learn.skill_runtime import SkillPracticeRuntime
+from lam.learn.topic_mastery_runtime import TopicMasteryRuntime
 
 
 @dataclass(slots=True)
@@ -62,7 +69,7 @@ class UiState:
     artifact_reuse_max_age_hours: int = 72
     use_domain_freshness_defaults: bool = True
     user_id: str = field(default_factory=current_user)
-    saved_automations: Dict[str, str] = field(default_factory=dict)
+    saved_automations: Dict[str, Any] = field(default_factory=dict)
     history: List[Dict[str, Any]] = field(default_factory=list)
     recorder: TeachRecorder = field(default_factory=TeachRecorder)
     global_hooks: GlobalTeachHooks | None = None
@@ -160,8 +167,8 @@ HTML_PAGE = """<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>LAM Windows Interface</title>
   <style>
-    :root { --bg:#f6f7fb; --panel:#fff; --ink:#14212b; --accent:#0f766e; --muted:#6b7280; --warn:#b45309; }
-    body { margin:0; background:var(--bg); color:var(--ink); font-family:"Segoe UI",Tahoma,sans-serif; }
+    :root { --bg:#edf3f9; --panel:#fff; --panel-soft:#f8fbff; --ink:#0f172a; --ink-soft:#334155; --accent:#0b6bcb; --accent-2:#0f766e; --muted:#64748b; --warn:#b45309; --border:#dbe4ef; --shadow:0 16px 36px rgba(15,23,42,0.08); }
+    body { margin:0; background:radial-gradient(circle at top left,#f8fbff 0,#edf3f9 38%,#e8eef6 100%); color:var(--ink); font-family:"Segoe UI Variable","Segoe UI",Tahoma,sans-serif; }
     .wrap { display:grid; grid-template-columns:360px 1fr; height:100vh; }
     .side { background:#0f172a; color:#d1d5db; padding:14px; overflow:auto; }
     .brand-wrap { display:flex; align-items:center; gap:8px; }
@@ -181,12 +188,12 @@ HTML_PAGE = """<!doctype html>
     .history-item { border:1px solid #1f2937; border-radius:10px; margin-bottom:8px; padding:8px; cursor:pointer; }
     .history-item:hover { background:#1f2937; }
     .main { padding:18px; display:flex; flex-direction:column; gap:12px; overflow:auto; }
-    .panel { background:var(--panel); border:1px solid #e5e7eb; border-radius:12px; padding:12px; }
+    .panel { background:linear-gradient(180deg,#ffffff,#fbfdff); border:1px solid var(--border); border-radius:18px; padding:14px; box-shadow:var(--shadow); }
     .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:6px; }
     input[type=text], input[type=number], select { min-width:180px; font-size:14px; padding:9px; border:1px solid #d1d5db; border-radius:10px; }
     input.wide { flex:1; min-width:280px; }
-    button { border:0; border-radius:10px; padding:9px 12px; cursor:pointer; font-weight:600; }
-    .primary { background:var(--accent); color:white; }
+    button { border:1px solid var(--border); border-radius:12px; padding:10px 14px; cursor:pointer; font-weight:600; background:#fff; color:var(--ink); }
+    .primary { background:linear-gradient(135deg,var(--accent),#2563eb); color:white; border-color:#1d4ed8; }
     .warn { background:#fef3c7; color:#92400e; border:1px solid #fcd34d; }
     .summary-head { font-weight:700; font-size:18px; color:#0f172a; }
     .summary-sub { color:#475569; font-size:14px; margin-top:2px; }
@@ -205,6 +212,18 @@ HTML_PAGE = """<!doctype html>
     .artifact-chip-title { font-size:12px; font-weight:600; color:#0f172a; word-break:break-word; }
     .artifact-chip-actions { display:flex; align-items:center; gap:8px; margin-top:6px; }
     .artifact-open { font-size:12px; color:#0f766e; text-decoration:none; font-weight:600; }
+    .teach-stage-list { display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }
+    .teach-stage { border:1px solid #dbe4f0; border-radius:12px; padding:8px 10px; background:#fff; min-width:120px; }
+    .teach-stage.active { border-color:#93c5fd; background:#eff6ff; }
+    .teach-stage.ready { border-color:#86efac; background:#f0fdf4; }
+    .teach-stage.warn { border-color:#fdba74; background:#fff7ed; }
+    .teach-pill { display:inline-block; border-radius:999px; padding:2px 8px; font-size:11px; font-weight:600; border:1px solid #cbd5e1; background:#f8fafc; color:#334155; }
+    .teach-card-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; margin-top:10px; }
+    .teach-card { border:1px solid #e2e8f0; border-radius:10px; background:#fff; padding:10px; }
+    .teach-list { margin-top:8px; display:flex; flex-direction:column; gap:6px; }
+    .teach-item { border:1px solid #e2e8f0; border-radius:10px; background:#fff; padding:8px; }
+    .teach-item strong { color:#0f172a; }
+    .teach-json { width:100%; min-height:72px; font-family:Consolas,Menlo,monospace; font-size:12px; border:1px solid #d1d5db; border-radius:10px; padding:8px; }
     .timeline-filter-btn.active { background:#dbeafe; color:#1d4ed8; border:1px solid #93c5fd; }
     .artifact-list a { color:#0f766e; text-decoration:none; }
     .json-box { white-space:pre-wrap; max-height:260px; overflow:auto; font-size:12px; color:#0f172a; background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; padding:10px; }
@@ -232,21 +251,56 @@ HTML_PAGE = """<!doctype html>
     body { background:#f4f6fb; }
     .wrap { grid-template-columns:260px 1fr; transition:grid-template-columns .18s ease; }
     body.sidebar-compact .wrap { grid-template-columns:72px 1fr; }
-    .side { background:#f8fafc; color:#0f172a; border-right:1px solid #e2e8f0; }
+    .side { background:linear-gradient(180deg,#f8fbff,#f4f8fd); color:#0f172a; border-right:1px solid var(--border); }
     body.sidebar-compact .side .brand-label,
     body.sidebar-compact .side #history,
     body.sidebar-compact .side .small { display:none; }
-    .status { background:#fff; border:1px solid #e2e8f0; color:#334155; }
+    .status { background:#fff; border:1px solid var(--border); color:#334155; box-shadow:0 8px 20px rgba(15,23,42,0.04); }
     .history-item { border:1px solid #e2e8f0; background:#fff; }
     .history-item:hover { background:#eff6ff; }
-    .main { padding:14px; display:grid; grid-template-rows:auto auto 1fr; gap:10px; min-height:100vh; }
+    .main { padding:18px; display:grid; grid-template-rows:auto auto auto 1fr; gap:12px; min-height:100vh; }
     #chatControlPanel .advanced-control { display:none; }
-    #chatControlPanel { padding:10px; }
+    #chatControlPanel { padding:14px; }
     #chatControlPanel .chat-topbar { margin-top:0; justify-content:space-between; }
     #chatControlPanel .chat-composer-row input.wide { min-width:0; width:100%; }
     #chatControlPanel .chat-progress-log { display:none; }
     #chatPanel { display:flex; flex-direction:column; min-height:0; }
-    #chatPanel .assistant-feed { flex:1; max-height:none; background:#fff; border:1px solid #e2e8f0; }
+    #chatPanel .assistant-feed { flex:1; max-height:none; background:linear-gradient(180deg,#fff,#f9fbfe); border:1px solid var(--border); min-height:360px; }
+    .workspace-hero { display:grid; grid-template-columns:1.7fr 1fr; gap:12px; }
+    .workspace-hero-main { padding:18px; border-radius:18px; background:linear-gradient(135deg,#0f172a,#1d4ed8); color:#eff6ff; box-shadow:0 18px 40px rgba(15,23,42,0.18); }
+    .workspace-hero-main h1 { margin:0; font-size:28px; line-height:1.08; letter-spacing:-0.02em; }
+    .workspace-hero-main p { margin:10px 0 0 0; color:#dbeafe; max-width:64ch; }
+    .workspace-hero-actions { display:flex; gap:10px; flex-wrap:wrap; margin-top:16px; }
+    .workspace-hero-actions button { background:rgba(255,255,255,0.12); color:#fff; border-color:rgba(255,255,255,0.16); backdrop-filter:blur(8px); }
+    .workspace-hero-side { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
+    .hero-stat { padding:14px; border-radius:18px; background:linear-gradient(180deg,#ffffff,#f8fbff); border:1px solid var(--border); box-shadow:var(--shadow); }
+    .hero-stat .k { font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:#64748b; }
+    .hero-stat .v { font-size:22px; font-weight:700; margin-top:8px; color:#0f172a; }
+    .hero-stat .m { font-size:12px; color:#64748b; margin-top:6px; }
+    .side-section { margin-top:14px; }
+    .side-section-title { font-size:11px; letter-spacing:.1em; text-transform:uppercase; color:#64748b; margin-bottom:8px; }
+    .side-nav { display:flex; flex-direction:column; gap:8px; }
+    .side-nav button { text-align:left; justify-content:flex-start; background:#fff; }
+    .panel-head { display:flex; justify-content:space-between; gap:12px; align-items:center; margin-bottom:10px; }
+    .panel-title { font-size:16px; font-weight:700; letter-spacing:-0.01em; }
+    .panel-subtitle { font-size:12px; color:#64748b; }
+    .composer-box { border:1px solid var(--border); background:linear-gradient(180deg,#fff,#f8fbff); border-radius:16px; padding:12px; }
+    .chat-composer-row { align-items:stretch; }
+    .chat-composer-row input.wide { min-height:48px; padding:12px 14px; border-radius:14px; border:1px solid var(--border); background:#fff; box-shadow:inset 0 1px 2px rgba(15,23,42,0.03); }
+    .quick-chip-row { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+    .quick-chip { border-radius:999px; padding:8px 12px; background:#eff6ff; border:1px solid #bfdbfe; color:#1d4ed8; font-size:12px; cursor:pointer; }
+    .studio-grid { display:grid; grid-template-columns:1.1fr .9fr; gap:12px; }
+    .studio-column { display:flex; flex-direction:column; gap:12px; min-width:0; }
+    .studio-toolbar { display:flex; flex-direction:column; gap:10px; }
+    .studio-toolbar-group { display:flex; flex-wrap:wrap; gap:10px; }
+    .studio-toolbar-group button,
+    .studio-toolbar-group select { min-height:42px; }
+    .studio-toolbar-group select { min-width:180px; }
+    #learnedSkillPanel { display:flex; flex-direction:column; gap:12px; }
+    #learnedSkillPanel .teach-card-grid,
+    #learnedSkillPanel .teach-list,
+    #learnedSkillPanel .teach-json { margin-top:0; }
+    .lift { box-shadow:var(--shadow); }
     .main > #worldPanel, .main > #opsPanel, .main > #vaultPanel, .main > #runSummaryPanel, .main > #teachSchedulePanel { display:none; }
     .canvas-toggle { background:#2563eb; color:#fff; border:1px solid #1d4ed8; }
     #canvasPanel {
@@ -279,35 +333,112 @@ HTML_PAGE = """<!doctype html>
     @media (max-width: 1180px) {
       .wrap { grid-template-columns:1fr; }
       .side { max-height:30vh; }
+      .workspace-hero { grid-template-columns:1fr; }
+      .workspace-hero-side { grid-template-columns:repeat(2,minmax(0,1fr)); }
+      .studio-grid { grid-template-columns:1fr; }
       #canvasPanel { width:100%; right:-100%; }
+    }
+    @media (max-width: 720px) {
+      .main { padding:12px; gap:10px; }
+      .side { max-height:none; padding:12px; border-right:none; border-bottom:1px solid var(--border); }
+      .side-nav { display:grid; grid-template-columns:1fr 1fr; }
+      .workspace-hero-main { padding:16px; border-radius:16px; }
+      .workspace-hero-main h1 { font-size:22px; }
+      .workspace-hero-main p { font-size:15px; }
+      .workspace-hero-actions { display:grid; grid-template-columns:1fr 1fr; }
+      .workspace-hero-actions button { width:100%; }
+      .workspace-hero-side { grid-template-columns:1fr; }
+      #chatControlPanel .panel-head { flex-direction:column; align-items:flex-start; }
+      #chatControlPanel .chat-topbar .row { width:100%; flex-wrap:wrap; }
+      #chatControlPanel .chat-topbar .row button { flex:1 1 calc(50% - 6px); }
+      .chat-composer-row { flex-direction:column; }
+      .chat-composer-row button { width:100%; }
+      .quick-chip-row { display:grid; grid-template-columns:1fr 1fr; }
+      .quick-chip-row .quick-chip { width:100%; text-align:center; }
+      .studio-toolbar-group { display:grid; grid-template-columns:1fr 1fr; }
+      .studio-toolbar-group button,
+      .studio-toolbar-group select { width:100%; min-width:0; }
+      #canvasPanel { width:100%; right:-100%; border-left:none; }
+      body.canvas-open #canvasPanel { right:0; }
+    }
+    @media (max-width: 520px) {
+      .side-nav,
+      .workspace-hero-actions,
+      .quick-chip-row,
+      .studio-toolbar-group { grid-template-columns:1fr; }
+      #chatControlPanel .chat-topbar .row button { flex:1 1 100%; }
     }
   </style>
 </head>
 <body>
 <div class="wrap">
   <aside class="side">
-    <div class="row" style="margin-top:0;justify-content:space-between;">
-      <div class="brand-wrap">
-        <img class="brand-logo" src="/assets/openlamb-logo.png" alt="OpenLAMb logo"/>
-        <div class="brand brand-label">OpenLAMb</div>
+      <div class="row" style="margin-top:0;justify-content:space-between;">
+        <div class="brand-wrap">
+          <img class="brand-logo" src="/assets/openlamb-logo.png" alt="OpenLAMb logo"/>
+          <div class="brand brand-label">OpenLAMb</div>
+        </div>
+        <button onclick="toggleSidebarCompact()">Menu</button>
       </div>
-      <button onclick="toggleSidebarCompact()">Menu</button>
-    </div>
-    <div class="status" id="statusBox">Control: not granted</div>
-    <div class="auth-alert" id="authAlert"></div>
-    <div class="small">History</div>
-    <div id="history"></div>
-  </aside>
-  <main class="main">
+      <div class="status" id="statusBox">Control: not granted</div>
+      <div class="auth-alert" id="authAlert"></div>
+      <div class="side-section">
+        <div class="side-section-title">Navigate</div>
+        <div class="side-nav">
+          <button onclick="scrollToPanel('chatControlPanel')">Command Center</button>
+          <button onclick="scrollToPanel('chatPanel')">Conversation</button>
+          <button onclick="scrollToPanel('teachSchedulePanel')">Teach Mode</button>
+          <button onclick="scrollToPanel('learnedSkillPanel')">Skill Studio</button>
+          <button onclick="toggleCanvas(true)">Canvas</button>
+        </div>
+      </div>
+      <div class="side-section-title">History</div>
+      <div id="history"></div>
+    </aside>
+    <main class="main">
+      <div class="workspace-hero">
+        <div class="workspace-hero-main">
+          <h1>One workspace for execution, research, teach mode, and reusable skills.</h1>
+          <p>Delegate in chat, inspect evidence in Canvas, teach repeatable workflows, and manage learned topic skills without leaving the operator surface.</p>
+          <div class="workspace-hero-actions">
+            <button onclick="newTaskFromUI()">New mission</button>
+            <button onclick="toggleCanvas(true)">Open canvas</button>
+            <button onclick="scrollToPanel('teachSchedulePanel')">Teach workflow</button>
+            <button onclick="scrollToPanel('learnedSkillPanel')">Open skill studio</button>
+          </div>
+        </div>
+        <div class="workspace-hero-side">
+          <div class="hero-stat">
+            <div class="k">Current Mode</div>
+            <div class="v" id="workspaceModeStat">Idle</div>
+            <div class="m" id="workspaceModeMeta">Waiting for operator instruction.</div>
+          </div>
+          <div class="hero-stat">
+            <div class="k">Artifacts</div>
+            <div class="v" id="workspaceArtifactStat">0</div>
+            <div class="m" id="workspaceArtifactMeta">No package generated yet.</div>
+          </div>
+          <div class="hero-stat">
+            <div class="k">Learned Skills</div>
+            <div class="v" id="workspaceSkillStat">0</div>
+            <div class="m" id="workspaceSkillMeta">Skill library ready.</div>
+          </div>
+          <div class="hero-stat">
+            <div class="k">Scheduler</div>
+            <div class="v" id="workspaceScheduleStat">0</div>
+            <div class="m" id="workspaceScheduleMeta">No active automation jobs.</div>
+          </div>
+        </div>
+      </div>
     <div class="panel" id="chatControlPanel">
-      <div class="row chat-topbar">
+      <div class="panel-head chat-topbar">
         <div class="row" style="margin-top:0;">
           <button class="primary" onclick="grantControl()">Accept Control</button>
           <button class="warn" onclick="revokeControl()">Revoke</button>
           <button class="canvas-toggle" onclick="toggleCanvas(true)">Open Canvas</button>
           <button onclick="newTaskFromUI()">New Task</button>
         </div>
-        <div class="small">Delegate work in chat. Advanced controls are in Developer Details.</div>
+        <div class="panel-subtitle">Delegate work in chat. Advanced controls live under Developer Details.</div>
       </div>
       <div class="row advanced-control">
         <button class="primary" onclick="grantControl()">Accept Control</button>
@@ -368,11 +499,19 @@ HTML_PAGE = """<!doctype html>
         <button onclick="saveDomainFreshnessPolicy()">Save Domain Policy</button>
         <button onclick="loadDomainFreshnessPolicy()">Reload Domain Policy</button>
       </div>
-      <div class="row chat-composer-row">
-        <input id="instruction" class="wide" type="text" placeholder="Example: Review Durham payer pricing, build a RAG index, create the stakeholder workbook, and show me which plans need outreach."/>
-        <button class="primary" onclick="runInstruction()">Run</button>
-        <button onclick="previewInstruction()">Preview</button>
-        <button onclick="captureClipboardImageUi()">Capture Clipboard Image</button>
+      <div class="composer-box lift">
+        <div class="row chat-composer-row">
+          <input id="instruction" class="wide" type="text" placeholder="Describe the business outcome you want, not just the first step you would click."/>
+          <button class="primary" onclick="runInstruction()">Run</button>
+          <button onclick="previewInstruction()">Preview</button>
+          <button onclick="captureClipboardImageUi()">Capture Clipboard Image</button>
+        </div>
+        <div class="quick-chip-row">
+          <button class="quick-chip" onclick="useTemplate('Research the market for AI desktop agents and build an executive briefing with recommendations.')">Executive brief</button>
+          <button class="quick-chip" onclick="useTemplate('Learn how to build a Power BI KPI dashboard from this YouTube tutorial and create a reusable skill.')">Topic mastery</button>
+          <button class="quick-chip" onclick="useTemplate('Capture the current clipboard image and save it as an artifact package with base64 output.')">Clipboard capture</button>
+          <button class="quick-chip" onclick="useTemplate('Open Gmail, triage my latest messages, and draft replies.')">Inbox triage</button>
+        </div>
       </div>
       <div class="small advanced-control" id="freshnessPreview">Freshness preview: waiting for instruction.</div>
       <div class="row advanced-control">
@@ -414,9 +553,12 @@ HTML_PAGE = """<!doctype html>
     </div>
 
     <div class="panel" id="chatPanel">
-      <div class="row" style="justify-content:space-between;">
-        <div><strong>Assistant Feed</strong></div>
-        <div class="small">Live narration + final status</div>
+      <div class="panel-head">
+        <div>
+          <div class="panel-title">Operator Conversation</div>
+          <div class="panel-subtitle">Live narration, progress, and package status.</div>
+        </div>
+        <div class="small">Chat-first workspace</div>
       </div>
       <div class="assistant-feed" id="assistantFeed">
         <div class="assistant-msg meta">Waiting for a task.</div>
@@ -473,6 +615,7 @@ HTML_PAGE = """<!doctype html>
     <div class="grid2" id="teachSchedulePanel">
       <div class="panel">
         <div><strong>Teach Recorder</strong></div>
+        <div class="small" style="margin-top:4px;">Record a real workflow, inspect what the system learned, then preview or run the replay only when confidence is high enough.</div>
         <div class="row">
           <input id="teachApp" type="text" placeholder="App name (e.g. chatgpt)"/>
           <button onclick="teachStart()">Start Teach</button>
@@ -493,6 +636,40 @@ HTML_PAGE = """<!doctype html>
           <button onclick="teachAddWait()">Add Wait</button>
         </div>
         <div class="small" id="teachState">Teach idle.</div>
+        <div class="teach-stage-list" id="teachStageList"></div>
+        <div class="teach-card-grid">
+          <div class="teach-card">
+            <div><strong>Learning Summary</strong></div>
+            <div class="small" id="teachRecipeSummary">No learned recipe yet.</div>
+            <div class="teach-list" id="teachSegmentList"></div>
+          </div>
+          <div class="teach-card">
+            <div><strong>Replay Studio</strong></div>
+            <div class="row">
+              <button onclick="loadTeachRecipes()">Refresh Recipes</button>
+              <select id="teachRecipeSelect"></select>
+              <button onclick="previewTeachRecipe()">Preview Replay</button>
+              <button onclick="runTeachRecipe()">Run Replay</button>
+            </div>
+            <div class="small" id="teachReplayState">Pick a learned recipe to inspect replay readiness.</div>
+            <div class="row">
+              <textarea id="teachInputBindings" class="teach-json" placeholder='{"email_input":"leader@example.com"}'></textarea>
+            </div>
+            <div class="teach-list" id="teachBranchTimeline">
+              <div class="teach-item"><strong>Branch Timeline</strong><div class="small">No branch history yet.</div></div>
+            </div>
+            <div class="teach-list" id="teachCheckpointTimeline">
+              <div class="teach-item"><strong>Checkpoint Timeline</strong><div class="small">No checkpoint heat yet.</div></div>
+            </div>
+            <div class="teach-list" id="teachCheckpointDiff">
+              <div class="teach-item"><strong>Variant Diff View</strong><div class="small">No checkpoint comparison selected.</div></div>
+            </div>
+            <div class="teach-list" id="teachReteachPlan">
+              <div class="teach-item"><strong>Guided Re-teach Plan</strong><div class="small">No re-teach guidance yet.</div></div>
+            </div>
+            <div class="teach-list" id="teachRecipeList"></div>
+          </div>
+        </div>
       </div>
 
       <div class="panel">
@@ -512,6 +689,84 @@ HTML_PAGE = """<!doctype html>
           <button onclick="triggerEvent()">Trigger Event</button>
         </div>
         <div class="small" id="scheduleState">No schedules yet.</div>
+      </div>
+    </div>
+
+    <div class="panel" id="learnedSkillPanel">
+      <div class="panel-head">
+        <div>
+          <div class="panel-title">Learned Skill Studio</div>
+          <div class="panel-subtitle">Edit, diff, practice, schedule, and refresh reusable skills with checkpoint-aware policy.</div>
+        </div>
+      </div>
+      <div class="studio-toolbar">
+        <div class="studio-toolbar-group">
+          <button onclick="loadLearnedSkills()">Refresh Skills</button>
+          <select id="learnedSkillSelect"></select>
+          <select id="learnedSkillVersionSelect"></select>
+          <button onclick="openLearnedSkill()">Load Skill</button>
+          <button onclick="diffLearnedSkillVersions()">Show Diff</button>
+        </div>
+        <div class="studio-toolbar-group">
+          <button onclick="saveLearnedSkillEdit()">Save New Version</button>
+          <button onclick="showLearnedSkillSelectors()">Selector Suggestions</button>
+          <button onclick="previewLearnedSkillPractice()">Practice Preview</button>
+          <button class="primary" onclick="runLearnedSkillPractice()">Run Safe Practice</button>
+          <button onclick="submitLearnedSkillFeedback()">Send Feedback</button>
+          <button onclick="scheduleLearnedSkillPractice()">Schedule Practice</button>
+          <button onclick="refreshLearnedSkill()">Refresh Topic</button>
+        </div>
+      </div>
+      <div class="small" id="learnedSkillState">No learned skill loaded.</div>
+      <div class="studio-grid">
+        <div class="studio-column">
+          <div class="teach-card-grid" id="learnedSkillForm">
+            <div class="teach-card">
+              <div class="small">Skill Name</div>
+              <input id="learnedSkillNameField" type="text" class="wide" placeholder="Skill name"/>
+            </div>
+            <div class="teach-card">
+              <div class="small">Topic</div>
+              <input id="learnedSkillTopicField" type="text" class="wide" placeholder="Topic"/>
+            </div>
+            <div class="teach-card">
+              <div class="small">Purpose</div>
+              <input id="learnedSkillPurposeField" type="text" class="wide" placeholder="Purpose"/>
+            </div>
+            <div class="teach-card">
+              <div class="small">Domain</div>
+              <input id="learnedSkillDomainField" type="text" class="wide" placeholder="Domain"/>
+            </div>
+            <div class="teach-card">
+              <div class="small">Confidence</div>
+              <input id="learnedSkillConfidenceField" type="number" step="0.01" class="wide" placeholder="0.0"/>
+            </div>
+            <div class="teach-card">
+              <div class="small">Required Tools</div>
+              <input id="learnedSkillToolsField" type="text" class="wide" placeholder="comma-separated tools"/>
+            </div>
+            <div class="teach-card">
+              <div class="small">Prerequisites</div>
+              <input id="learnedSkillPrereqsField" type="text" class="wide" placeholder="comma-separated prerequisites"/>
+            </div>
+            <div class="teach-card">
+              <div class="small">Practice Policy</div>
+              <input id="learnedSkillPracticePolicyField" type="text" class="wide" placeholder="checkpoint guided"/>
+            </div>
+          </div>
+          <div class="teach-list" id="learnedSkillWorkflowPreview">
+            <div class="teach-item"><strong>Workflow Preview</strong><div class="small">Load a learned skill to inspect editable checkpoints and steps.</div></div>
+          </div>
+          <textarea id="learnedSkillEditor" class="teach-json" style="min-height:260px;" placeholder="Load a learned skill to edit its JSON."></textarea>
+        </div>
+        <div class="studio-column">
+          <div class="teach-list" id="learnedSkillTimeline">
+            <div class="teach-item"><strong>Version Timeline</strong><div class="small">No version history yet.</div></div>
+          </div>
+          <div class="teach-list" id="learnedSkillDiff">
+            <div class="teach-item"><strong>Diff History</strong><div class="small">Load a skill and compare versions.</div></div>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -582,13 +837,43 @@ let lastRaw = {};
 let lastCanvasUrl = "";
 let lastTaskFeedKey = "";
 let timelineFilter = localStorage.getItem("lam_timeline_filter") || "all";
+function isCompactViewport(){ return window.innerWidth <= 720; }
+function syncViewportMode(){
+  if(isCompactViewport()){
+    document.body.classList.add("sidebar-compact");
+    document.body.classList.remove("canvas-open");
+  }
+}
 function persistHistory(){ localStorage.setItem("lam_ui_history", JSON.stringify(ui.history.slice(-300))); }
 function toggleCanvas(forceOpen){
   const shouldOpen = (forceOpen === undefined) ? !document.body.classList.contains("canvas-open") : !!forceOpen;
+  if(shouldOpen && isCompactViewport()){
+    document.body.classList.remove("canvas-open");
+    return;
+  }
   document.body.classList.toggle("canvas-open", shouldOpen);
 }
 function toggleSidebarCompact(){
   document.body.classList.toggle("sidebar-compact");
+}
+function scrollToPanel(id){
+  const el=document.getElementById(id);
+  if(el){ el.scrollIntoView({behavior:"smooth", block:"start"}); }
+}
+function renderWorkspaceSummary(state){
+  const latestHistory = Array.isArray(state?.history) ? state.history : [];
+  const schedules = Array.isArray(state?.schedules) ? state.schedules : [];
+  const skills = Array.isArray(document.getElementById("learnedSkillSelect")?.options) ? document.getElementById("learnedSkillSelect").options : [];
+  const task = state?.task || {};
+  const set=(id,val)=>{ const el=document.getElementById(id); if(el){ el.innerText=String(val); } };
+  set("workspaceModeStat", task?.status || (state?.paused_for_credentials ? "Paused" : (state?.control_granted ? "Ready" : "Idle")));
+  set("workspaceModeMeta", task?.message || (state?.pause_reason || "Waiting for operator instruction."));
+  set("workspaceArtifactStat", Object.keys((task?.result?.artifacts)||{}).length || 0);
+  set("workspaceArtifactMeta", task?.result?.mode ? `Latest: ${task.result.mode}` : "No package generated yet.");
+  set("workspaceSkillStat", skills.length && skills[0]?.value ? skills.length : 0);
+  set("workspaceSkillMeta", skills.length && skills[0]?.value ? "Versioned learned skills available." : "Skill library ready.");
+  set("workspaceScheduleStat", schedules.length || 0);
+  set("workspaceScheduleMeta", schedules.length ? "Automation jobs queued." : "No active automation jobs.");
 }
 function setTimelineFilter(mode){
   timelineFilter = String(mode || "all");
@@ -809,7 +1094,7 @@ function renderSummary(r){
   document.getElementById("activityLog").innerText = activity.join("\\n");
   renderAssistantFeedFromResult(r||{});
   updateWorkCanvas(String(r?.opened_url||""), r?.opened_url ? "Live page from latest result." : "No active page.");
-  if(r?.opened_url || entries.length || r?.paused_for_credentials){
+  if((r?.opened_url || entries.length || r?.paused_for_credentials) && !isCompactViewport()){
     toggleCanvas(true);
   }
   renderStrictRules(r||{});
@@ -867,6 +1152,48 @@ function renderPlatformCards(r){
     if(!body){ return; }
     sections.push(`<details class="summary-card"><summary class="t">${escapeHtml(title)}</summary><div class="m" style="margin-top:8px;">${body}</div></details>`);
   };
+  const mission = cards?.mission_contract || {};
+  if(mission?.goal || mission?.mission_type){
+    pushSection("Mission",
+      [
+        mission.mission_type ? `<div><strong>Mission:</strong> ${escapeHtml(mission.mission_type)}</div>` : "",
+        mission.goal ? `<div><strong>Goal:</strong> ${escapeHtml(mission.goal)}</div>` : "",
+        mission.audience ? `<div><strong>Audience:</strong> ${escapeHtml(mission.audience)}</div>` : "",
+        mission.deliverable_mode ? `<div><strong>Deliverable mode:</strong> ${escapeHtml(mission.deliverable_mode)}</div>` : "",
+        Array.isArray(mission.requested_outputs) && mission.requested_outputs.length ? `<div><strong>Outputs:</strong> ${escapeHtml(mission.requested_outputs.join(", "))}</div>` : "",
+        mission.quality_bar ? `<div><strong>Quality bar:</strong> ${escapeHtml(mission.quality_bar)}</div>` : "",
+      ].filter(Boolean).join("")
+    );
+  }
+  const strategy = cards?.research_strategy || {};
+  if(Array.isArray(strategy?.research_questions) && strategy.research_questions.length){
+    pushSection("Research Strategy",
+      [
+        `<div><strong>Questions:</strong> ${escapeHtml(strategy.research_questions.join(" | "))}</div>`,
+        Array.isArray(strategy.source_categories) && strategy.source_categories.length ? `<div><strong>Sources:</strong> ${escapeHtml(strategy.source_categories.join(", "))}</div>` : "",
+        Array.isArray(strategy.search_paths) && strategy.search_paths.length ? `<div><strong>Paths:</strong> ${escapeHtml(strategy.search_paths.join(" | "))}</div>` : "",
+        strategy.minimum_evidence_threshold && Object.keys(strategy.minimum_evidence_threshold).length ? `<div><strong>Threshold:</strong> ${escapeHtml(JSON.stringify(strategy.minimum_evidence_threshold))}</div>` : "",
+      ].filter(Boolean).join("")
+    );
+  }
+  const evidence = cards?.evidence_map || {};
+  if(evidence?.summary && Object.keys(evidence.summary).length){
+    const accepted = Array.isArray(evidence.accepted_sources) ? evidence.accepted_sources.slice(0,4).map(item=>`${item.source || item.title || "source"} (${item.confidence || ""})`).join(" | ") : "";
+    const rejected = Array.isArray(evidence.rejected_sources) ? evidence.rejected_sources.slice(0,3).map(item=>item.source || item.title || "source").join(" | ") : "";
+    pushSection("Evidence Map",
+      [
+        `<div><strong>Summary:</strong> ${escapeHtml(JSON.stringify(evidence.summary))}</div>`,
+        accepted ? `<div><strong>Accepted:</strong> ${escapeHtml(accepted)}</div>` : "",
+        rejected ? `<div><strong>Rejected:</strong> ${escapeHtml(rejected)}</div>` : "",
+      ].filter(Boolean).join("")
+    );
+  }
+  const artifactPlan = cards?.artifact_plan || {};
+  if(Array.isArray(artifactPlan?.items) && artifactPlan.items.length){
+    pushSection("Artifact Plan",
+      artifactPlan.items.slice(0,8).map(item=>`<div>${escapeHtml(item.name || "artifact")} <span class="small">(${escapeHtml(item.artifact_type || "")}${item.evidence_required ? ", evidence required" : ""})</span></div>`).join("")
+    );
+  }
   const contract = cards?.task_contract || {};
   if(contract?.goal || contract?.domain){
     pushSection("Task Contract",
@@ -965,6 +1292,41 @@ function renderPlatformCards(r){
       + ((Array.isArray(validation?.required_repairs) && validation.required_repairs.length) ? `<div class="small" style="margin-top:8px;">Repairs: ${escapeHtml(validation.required_repairs.slice(0,4).join(" | "))}</div>` : "")
     );
   }
+  const outputTruth = cards?.output_truth || {};
+  if(outputTruth?.status || outputTruth?.summary){
+    pushSection("Output Truth",
+      [
+        outputTruth.status ? `<div><strong>Status:</strong> ${escapeHtml(outputTruth.status)}</div>` : "",
+        Number(outputTruth.real_evidence_sources||0) ? `<div><strong>Real evidence sources:</strong> ${escapeHtml(String(outputTruth.real_evidence_sources))}</div>` : "",
+        outputTruth.attempted_collection ? `<div><strong>Collection attempted:</strong> yes</div>` : "",
+        outputTruth.summary ? `<div>${escapeHtml(outputTruth.summary)}</div>` : "",
+        outputTruth.reason ? `<div class="small">${escapeHtml(outputTruth.reason)}</div>` : "",
+      ].filter(Boolean).join("")
+    );
+  }
+  const recovery = cards?.recovery || {};
+  if((Array.isArray(recovery.revisions) && recovery.revisions.length) || (Array.isArray(recovery.next_steps) && recovery.next_steps.length)){
+    pushSection("Recovery",
+      [
+        recovery.status ? `<div><strong>Status:</strong> ${escapeHtml(recovery.status)}</div>` : "",
+        recovery.reason ? `<div><strong>Reason:</strong> ${escapeHtml(recovery.reason)}</div>` : "",
+        recovery.strategy ? `<div><strong>Strategy:</strong> ${escapeHtml(recovery.strategy)}</div>` : "",
+        recovery.fallback_used ? `<div><strong>Fallback:</strong> ${escapeHtml(recovery.fallback_used)}</div>` : "",
+        Array.isArray(recovery.revisions) && recovery.revisions.length ? `<div><strong>Revisions:</strong> ${escapeHtml(String(recovery.revisions.length))}</div>` : "",
+        Array.isArray(recovery.next_steps) && recovery.next_steps.length ? `<div><strong>Next:</strong> ${escapeHtml(recovery.next_steps.join(" | "))}</div>` : "",
+      ].filter(Boolean).join("")
+    );
+  }
+  const finalPackage = cards?.final_package || {};
+  if(finalPackage?.status || finalPackage?.summary){
+    pushSection("Final Package",
+      [
+        finalPackage.status ? `<div><strong>Status:</strong> ${escapeHtml(finalPackage.status)}</div>` : "",
+        finalPackage.summary ? `<div>${escapeHtml(finalPackage.summary)}</div>` : "",
+        Array.isArray(finalPackage.next_steps) && finalPackage.next_steps.length ? `<div><strong>Use:</strong> ${escapeHtml(finalPackage.next_steps.join(" | "))}</div>` : "",
+      ].filter(Boolean).join("")
+    );
+  }
   const html = sections.join("");
   const mount = document.getElementById("platformCards");
   if(mount){ mount.innerHTML = html; }
@@ -1045,6 +1407,7 @@ function renderWorldModel(model){
   document.getElementById("worldModelBox").innerText = JSON.stringify(compact, null, 2);
 }
 function escapeHtml(s){ return String(s||"").replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function escapeHtmlAttr(s){ return String(s||"").replace(/[&<>\"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c])); }
 function stateClassName(state){
   return escapeHtml(String(state||"").replace(/[^a-z_]/gi,'_').toLowerCase());
 }
@@ -1157,6 +1520,7 @@ async function refreshState(){
   if(s.has_pending_plan) t+=" | Pending sequence";
   if(s.pause_reason) t+=" | "+s.pause_reason;
   document.getElementById("statusBox").innerText=t;
+  renderWorkspaceSummary(s);
   const auth=document.getElementById("authAlert");
   if(s.paused_for_credentials){
     const link = s.pending_auth_url ? `<div style="margin-top:6px;"><button onclick="focusAuthTarget()" style="background:#111827;color:#fee2e2;border:1px solid #ef4444;padding:6px 10px;border-radius:8px;cursor:pointer;">Focus auth tab</button></div>` : "";
@@ -1181,6 +1545,7 @@ async function refreshState(){
   document.getElementById("useDomainFreshnessDefaults").checked=!!s.use_domain_freshness_defaults;
   const teach=s.teach||{};
   document.getElementById("teachState").innerText=`${teach.active?'Recording':'Idle'} | events: ${teach.event_count||0}${s.global_teach_active?' | global hooks active':''}`;
+  renderTeachStudio(s);
   const jobs=(s.schedules||[]).length, recent=(s.schedule_history||[]).length;
   document.getElementById("scheduleState").innerText=`${jobs} schedule(s) configured | ${recent} recent run(s)`;
   const vs=s.vault_status||{};
@@ -1195,6 +1560,229 @@ async function refreshState(){
     : (canvasUrl ? "Live page from latest result." : "No active page.");
   updateWorkCanvas(canvasUrl, note);
   renderAuthRecoveryWizard(s);
+}
+function renderTeachStudio(state){
+  const teach=state?.teach||{};
+  const lastRecipe=teach?.last_recipe||{};
+  const stages=[
+    {label:"1. Record", active:!!teach.active, ready:!!teach.event_count},
+    {label:"2. Learn", active:false, ready:!!lastRecipe.recipe_id},
+    {label:"3. Replay", active:false, ready:!!lastRecipe.recipe_id && !!lastRecipe.autorun_ready},
+  ];
+  const stageMount=document.getElementById("teachStageList");
+  if(stageMount){
+    stageMount.innerHTML=stages.map(stage=>{
+      const cls=stage.ready ? "teach-stage ready" : (stage.active ? "teach-stage active" : "teach-stage");
+      return `<div class="${cls}"><div><strong>${escapeHtml(stage.label)}</strong></div><div class="small">${stage.active?"in progress":(stage.ready?"ready":"waiting")}</div></div>`;
+    }).join("");
+  }
+  const summary=document.getElementById("teachRecipeSummary");
+  if(summary){
+    if(lastRecipe.recipe_id){
+      const inputs=Array.isArray(lastRecipe.required_inputs)?lastRecipe.required_inputs.map(item=>item.name).join(", "):"";
+      const success=Array.isArray(lastRecipe.success_signals)?lastRecipe.success_signals.join(" | "):"";
+      const snapshotCount=Array.isArray(lastRecipe.state_snapshots)?lastRecipe.state_snapshots.length:0;
+      summary.innerHTML=
+        `<div><strong>${escapeHtml(lastRecipe.learned_goal||"Learned workflow")}</strong></div>`
+        + `<div class="small" style="margin-top:4px;">Confidence: ${escapeHtml(String(lastRecipe.confidence||0))} | Critic: ${lastRecipe.critic_passed?"pass":"needs review"} (${escapeHtml(String(lastRecipe.critic_score||0))})</div>`
+        + `<div class="small" style="margin-top:4px;">Autorun: ${lastRecipe.autorun_ready?"ready":"review first"}</div>`
+        + `<div class="small" style="margin-top:4px;">State snapshots: ${escapeHtml(String(snapshotCount))}</div>`
+        + (inputs ? `<div class="small" style="margin-top:4px;">Inputs: ${escapeHtml(inputs)}</div>` : "")
+        + (success ? `<div class="small" style="margin-top:4px;">Success: ${escapeHtml(success)}</div>` : "");
+    } else {
+      summary.innerText="No learned recipe yet.";
+    }
+  }
+  const segmentMount=document.getElementById("teachSegmentList");
+  if(segmentMount){
+    const segments=Array.isArray(teach.last_segments)?teach.last_segments:[];
+    segmentMount.innerHTML=segments.length
+      ? segments.slice(0,8).map(seg=>`<div class="teach-item"><strong>${escapeHtml(seg.segment_type||"segment")}</strong><div class="small">${escapeHtml(seg.purpose||"")}</div><div class="small">${escapeHtml(String(seg.start_index??""))} -> ${escapeHtml(String(seg.end_index??""))}</div></div>`).join("")
+      : `<div class="small">No observation segments yet.</div>`;
+  }
+  const branchMount=document.getElementById("teachBranchTimeline");
+  if(branchMount && !branchMount.innerHTML.trim()){
+    renderTeachBranchTimeline([]);
+  }
+  const checkpointMount=document.getElementById("teachCheckpointTimeline");
+  if(checkpointMount && !checkpointMount.innerHTML.trim()){
+    renderTeachCheckpointTimeline([]);
+  }
+  const diffMount=document.getElementById("teachCheckpointDiff");
+  if(diffMount && !diffMount.innerHTML.trim()){
+    renderTeachCheckpointDiff({});
+  }
+  const reteachMount=document.getElementById("teachReteachPlan");
+  if(reteachMount && !reteachMount.innerHTML.trim()){
+    renderTeachReteachPlan({});
+  }
+}
+async function loadTeachRecipes(){
+  const app_name=(document.getElementById("teachApp").value||"").trim();
+  const r=await fetch("/api/teach/recipes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({app_name})}).then(r=>r.json());
+  const select=document.getElementById("teachRecipeSelect");
+  const mount=document.getElementById("teachRecipeList");
+  if(!select || !mount){ return; }
+  const recipes=Array.isArray(r?.recipes)?r.recipes:[];
+  const families=Array.isArray(r?.families)?r.families:[];
+  const options=[];
+  families.forEach((item,idx)=>options.push(`<option value="family:${escapeHtmlAttr(item.family_id||"")}">${escapeHtml(item.learned_goal||item.family_id||("family "+(idx+1)))} [family]</option>`));
+  recipes.forEach((item,idx)=>options.push(`<option value="recipe:${escapeHtmlAttr(item.path||"")}">${escapeHtml(item.learned_goal||item.recipe_id||("recipe "+(idx+1)))}</option>`));
+  select.innerHTML=options.length ? options.join("") : `<option value="">No recipes</option>`;
+  mount.innerHTML=(families.length || recipes.length)
+    ? [
+        ...families.slice(0,4).map(item=>{
+          const variants=Array.isArray(item.variants)?item.variants:[];
+          const timeline=variants.slice(0,3).map(v=>{
+            const health=v.branch_health||{};
+            return `${v.recipe_id||"variant"}:${health.status||""}:${health.success_rate ?? ""}`;
+          }).join(" | ");
+          return `<div class="teach-item"><strong>${escapeHtml(item.learned_goal||item.family_id||"family")}</strong><div class="small">family | variants ${escapeHtml(String(item.variant_count||0))} | active ${escapeHtml(String(item.active_variant_count||0))} | app ${escapeHtml(item.app_name||"")}</div>${timeline?`<div class="small" style="margin-top:4px;">History: ${escapeHtml(timeline)}</div>`:""}</div>`;
+        }),
+        ...recipes.slice(0,4).map(item=>`<div class="teach-item"><strong>${escapeHtml(item.learned_goal||item.recipe_id||"recipe")}</strong><div class="small">confidence ${escapeHtml(String(item.confidence||0))} | inputs ${(item.required_inputs||[]).length} | app ${escapeHtml(item.app_name||"")}</div></div>`)
+      ].join("")
+    : `<div class="small">No saved recipes for this app yet.</div>`;
+  renderTeachBranchTimeline(families);
+  renderTeachCheckpointTimeline(families);
+  renderTeachCheckpointDiff({});
+}
+async function previewTeachRecipe(){
+  const selected=(document.getElementById("teachRecipeSelect").value||"").trim();
+  if(!selected){ document.getElementById("teachReplayState").innerText="Select a recipe first."; return; }
+  let input_bindings={};
+  try{ input_bindings=JSON.parse((document.getElementById("teachInputBindings").value||"{}").trim()||"{}"); } catch { document.getElementById("teachReplayState").innerText="Input bindings must be valid JSON."; return; }
+  const payload={input_bindings,current_state:{app_name:(document.getElementById("teachApp").value||"").trim(),visible_labels:[],selector_values:[]}};
+  if(selected.startsWith("family:")){ payload.family_id=selected.slice(7); } else if(selected.startsWith("recipe:")){ payload.recipe_path=selected.slice(7); } else { payload.recipe_path=selected; }
+  const r=await fetch("/api/teach/replay_preview",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)}).then(r=>r.json());
+  const preview=r?.preview||{};
+  const checks=Array.isArray(preview.state_checks)?preview.state_checks:[];
+  const snapshots=Array.isArray(preview.state_snapshots)?preview.state_snapshots:[];
+  const reteach=preview.reteach_guidance||{};
+  const checkpointNames=snapshots.map(s=>s.checkpoint_name).filter(Boolean);
+  document.getElementById("teachReplayState").innerHTML=
+    `<strong>${escapeHtml(preview.learned_goal||"Replay preview")}</strong>`
+    + `<div class="small" style="margin-top:4px;">Autorun: ${preview.can_autorun?"ready":"blocked"} | Confidence: ${escapeHtml(String(preview.confidence||0))}</div>`
+    + (preview.selected_variant && preview.selected_variant.recipe_id ? `<div class="small" style="margin-top:4px;">Selected variant: ${escapeHtml(preview.selected_variant.recipe_id)} | Match: ${escapeHtml(String(preview.selected_variant.match_score||0))} | Success rate: ${escapeHtml(String(preview.selected_variant.branch_health?.success_rate ?? ""))} | Stale age hrs: ${escapeHtml(String(preview.selected_variant.branch_health?.stale_age_hours ?? ""))} | Status: ${escapeHtml(String(preview.selected_variant.branch_health?.status ?? ""))}</div>` : "")
+    + (Array.isArray(preview.missing_inputs) && preview.missing_inputs.length ? `<div class="small" style="margin-top:4px;">Missing inputs: ${escapeHtml(preview.missing_inputs.join(", "))}</div>` : "")
+    + (checks.length ? `<div class="small" style="margin-top:4px;">State checks: ${escapeHtml(checks.map(c=>c.expected_state).slice(0,3).join(" | "))}</div>` : "")
+    + (snapshots.length ? `<div class="small" style="margin-top:4px;">Checkpoints: ${escapeHtml(checkpointNames.slice(0,4).join(" | "))}</div>` : "")
+    + (reteach.suggested ? `<div class="small" style="margin-top:4px;color:#9a3412;">Re-teach suggested: ${escapeHtml(reteach.reason||"All surviving branches are failing at the same segment.")}</div>` : "")
+    + (preview.pause_reason ? `<div class="small" style="margin-top:4px;">Pause reason: ${escapeHtml(preview.pause_reason)}</div>` : "");
+  renderTeachReteachPlan(reteach);
+  if(r?.family){
+    renderTeachCheckpointTimeline([r.family]);
+    renderTeachCheckpointDiff(reteach);
+  }
+}
+async function runTeachRecipe(){
+  const selected=(document.getElementById("teachRecipeSelect").value||"").trim();
+  if(!selected){ document.getElementById("teachReplayState").innerText="Select a recipe first."; return; }
+  let input_bindings={};
+  try{ input_bindings=JSON.parse((document.getElementById("teachInputBindings").value||"{}").trim()||"{}"); } catch { document.getElementById("teachReplayState").innerText="Input bindings must be valid JSON."; return; }
+  const human_like_interaction=!!document.getElementById("humanLikeInteraction").checked;
+  const step_mode=!!document.getElementById("stepMode").checked;
+  const payload={input_bindings,human_like_interaction,step_mode,current_state:{app_name:(document.getElementById("teachApp").value||"").trim(),visible_labels:[],selector_values:[]}};
+  if(selected.startsWith("family:")){ payload.family_id=selected.slice(7); } else if(selected.startsWith("recipe:")){ payload.recipe_path=selected.slice(7); } else { payload.recipe_path=selected; }
+  const r=await fetch("/api/teach/replay_run",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)}).then(r=>r.json());
+  handleResult(r);
+  if(r?.preview){
+    const preview=r.preview||{};
+    document.getElementById("teachReplayState").innerHTML=
+      `<strong>${escapeHtml(preview.learned_goal||"Replay run")}</strong>`
+      + `<div class="small" style="margin-top:4px;">Mode: ${escapeHtml(r.mode||"teach_replay_run")} | Done: ${r.done?"yes":"no"} | Next step: ${escapeHtml(String(r.next_step_index??""))}</div>`
+      + (r.reteach_guidance?.suggested ? `<div class="small" style="margin-top:4px;color:#9a3412;">Re-teach suggested: ${escapeHtml(r.reteach_guidance.reason||"Branches are failing at the same segment.")}</div>` : "")
+      + (r.pause_reason ? `<div class="small" style="margin-top:4px;">Pause reason: ${escapeHtml(r.pause_reason)}</div>` : "");
+  }
+  renderTeachReteachPlan(r?.reteach_guidance||{});
+  renderTeachCheckpointDiff(r?.reteach_guidance||{});
+  if(r?.family && Array.isArray(r.family.variants)){ renderTeachBranchTimeline([r.family]); renderTeachCheckpointTimeline([r.family]); }
+  await refreshState();
+}
+function renderTeachBranchTimeline(families){
+  const mount=document.getElementById("teachBranchTimeline");
+  if(!mount){ return; }
+  const items=Array.isArray(families)?families:[];
+  if(!items.length){
+    mount.innerHTML=`<div class="teach-item"><strong>Branch Timeline</strong><div class="small">No branch history yet.</div></div>`;
+    return;
+  }
+  const rows=[];
+  items.slice(0,3).forEach(family=>{
+    const variants=Array.isArray(family.variants)?family.variants:[];
+    variants.slice(0,4).forEach(variant=>{
+      const health=variant.branch_health||{};
+      const runs=Array.isArray(variant.replay_history?.recent_runs)?variant.replay_history.recent_runs:[];
+      const timeline=runs.length
+        ? runs.slice(-5).map(run=>`${run.ok?"pass":"fail"}@${new Date((run.timestamp||0)*1000).toLocaleDateString()}`).join(" | ")
+        : "no replay history";
+      rows.push(`<div class="teach-item"><strong>${escapeHtml(variant.variant_label||variant.recipe_id||"variant")}</strong><div class="small">${escapeHtml(String(health.status||"active"))} | success ${escapeHtml(String(health.success_rate ?? ""))} | stale ${escapeHtml(String(health.stale_age_hours ?? ""))}h</div><div class="small" style="margin-top:4px;">${escapeHtml(timeline)}</div></div>`);
+    });
+  });
+  mount.innerHTML=`<div class="teach-item"><strong>Branch Timeline</strong><div class="small">Recent branch outcomes and health.</div></div>${rows.join("")}`;
+}
+function renderTeachCheckpointTimeline(families){
+  const mount=document.getElementById("teachCheckpointTimeline");
+  if(!mount){ return; }
+  const items=Array.isArray(families)?families:[];
+  const checkpoints=[];
+  items.slice(0,3).forEach(family=>{
+    const mapped=Array.isArray(family.checkpoint_map)?family.checkpoint_map:[];
+    mapped.slice(0,6).forEach(cp=>checkpoints.push(cp));
+  });
+  if(!checkpoints.length){
+    mount.innerHTML=`<div class="teach-item"><strong>Checkpoint Timeline</strong><div class="small">No checkpoint heat yet.</div></div>`;
+    return;
+  }
+  const rows=checkpoints.map(cp=>{
+    const heat=Number(cp.failure_heat||0);
+    const bg=heat>=0.6?"#fee2e2":(heat>=0.3?"#fff7ed":"#ecfdf5");
+    const color=heat>=0.6?"#991b1b":(heat>=0.3?"#9a3412":"#166534");
+    const width=Math.max(6, Math.min(100, Math.round(heat*100)));
+    const trend=Array.isArray(cp.trend_points)?cp.trend_points:[];
+    const trendText=trend.length ? trend.map(p=>`${p.date}:${p.failure}/${p.success}`).join(" | ") : "no trend yet";
+    return `<div class="teach-item"><strong>${escapeHtml(cp.checkpoint_name||cp.semantic_id||"checkpoint")}</strong><div class="small">${escapeHtml(cp.segment_type||"")} | variants ${escapeHtml(String(cp.variant_count||0))} | failures ${escapeHtml(String(cp.failure_count||0))}</div><div style="margin-top:6px;background:#e2e8f0;border-radius:999px;height:10px;overflow:hidden;"><div style="width:${width}%;height:100%;background:${bg};border-right:1px solid rgba(15,23,42,0.1);"></div></div><div class="small" style="margin-top:4px;color:${color};">Heat ${escapeHtml(String(cp.failure_heat||0))}</div><div class="small" style="margin-top:4px;">Trend ${escapeHtml(trendText)}</div></div>`;
+  }).join("");
+  mount.innerHTML=`<div class="teach-item"><strong>Checkpoint Timeline</strong><div class="small">Shared checkpoint heat across family variants.</div></div>${rows}`;
+}
+function renderTeachCheckpointDiff(guidance){
+  const mount=document.getElementById("teachCheckpointDiff");
+  if(!mount){ return; }
+  const cp=guidance?.checkpoint_detail||{};
+  if(!cp || !cp.semantic_id){
+    mount.innerHTML=`<div class="teach-item"><strong>Variant Diff View</strong><div class="small">No checkpoint comparison selected.</div></div>`;
+    return;
+  }
+  const base=cp.suggested_base_variant||{};
+  const diffs=Array.isArray(cp.variant_diffs)?cp.variant_diffs:[];
+  const diffRows=diffs.length
+    ? diffs.map(item=>`<div class="small" style="margin-top:4px;">${escapeHtml(item.variant_label||item.recipe_id||"variant")} | status ${escapeHtml(item.status||"")} | failure delta ${escapeHtml(String(item.failure_delta||0))} | success delta ${escapeHtml(String(item.success_delta||0))} | rate delta ${escapeHtml(String(item.success_rate_delta||0))}</div>`).join("")
+    : `<div class="small" style="margin-top:4px;">No alternate variant differences yet.</div>`;
+  mount.innerHTML=`<div class="teach-item"><strong>Variant Diff View</strong><div class="small">${escapeHtml(cp.checkpoint_name||cp.semantic_id||"checkpoint")}</div>${base.recipe_id?`<div class="small" style="margin-top:4px;">Suggested base: ${escapeHtml(base.variant_label||base.recipe_id)} | status ${escapeHtml(base.status||"")} | success ${escapeHtml(String(base.success_rate ?? ""))}</div>`:""}${diffRows}</div>`;
+}
+function renderTeachReteachPlan(guidance){
+  const mount=document.getElementById("teachReteachPlan");
+  if(!mount){ return; }
+  const plan=guidance||{};
+  if(!plan.suggested){
+    mount.innerHTML=`<div class="teach-item"><strong>Guided Re-teach Plan</strong><div class="small">No re-teach guidance yet.</div></div>`;
+    return;
+  }
+  const steps=Array.isArray(plan.steps)?plan.steps:[];
+  mount.innerHTML=
+    `<div class="teach-item"><strong>Guided Re-teach Plan</strong><div class="small">${escapeHtml(plan.reason||"Replay is converging on the same failure point.")}</div>${plan.checkpoint_name?`<div class="small" style="margin-top:4px;">Checkpoint: ${escapeHtml(plan.checkpoint_name)}</div>`:""}${plan.base_variant_label?`<div class="small" style="margin-top:4px;">Suggested base context: ${escapeHtml(plan.base_variant_label)}</div>`:""}<div class="row" style="margin-top:8px;"><button onclick="startCheckpointReteach('${escapeHtmlAttr(plan.checkpoint_id||"")}','${escapeHtmlAttr(plan.checkpoint_name||"")}')">Re-teach this checkpoint</button></div>${steps.length?`<div class="small" style="margin-top:6px;">${steps.map((s,i)=>`${i+1}. ${s}`).join(" ")}</div>`:""}</div>`;
+}
+async function startCheckpointReteach(checkpointId, checkpointName){
+  const appInput=document.getElementById("teachApp");
+  if(appInput && !String(appInput.value||"").trim()){
+    const selected=(document.getElementById("teachRecipeSelect").value||"").trim();
+    if(selected.startsWith("family:")){
+      const familyName=selected.slice(7);
+      if(familyName){ appInput.value=String(appInput.value||"").trim(); }
+    }
+  }
+  await teachStart();
+  document.getElementById("teachReplayState").innerHTML=
+    `<strong>Recording replacement checkpoint</strong><div class="small" style="margin-top:4px;">Checkpoint: ${escapeHtml(checkpointName||checkpointId||"target checkpoint")}</div><div class="small" style="margin-top:4px;">Navigate to the UI state immediately before this checkpoint, then demonstrate a successful path and stop teach mode.</div>`;
 }
 function renderHistory(){
   const el=document.getElementById("history"); el.innerHTML="";
@@ -1423,6 +2011,10 @@ async function vaultSave(){
 async function vaultList(){
   const q=document.getElementById("vaultQuery").value.trim();
   const r=await fetch("/api/vault/list",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({query:q})}).then(r=>r.json());
+  if(!r.ok){
+    document.getElementById("vaultList").innerText = r.error || "Vault unavailable in this session.";
+    return;
+  }
   const entries=(r.entries||[]);
   if(!entries.length){ document.getElementById("vaultList").innerText="No matching entries."; return; }
   document.getElementById("vaultList").innerText = entries.slice(0,8).map(e=>`${e.service} | ${e.username_masked}${e.favorite?' | favorite':''}`).join("\\n");
@@ -1453,14 +2045,172 @@ async function vaultImport(){
 }
 function useTemplate(text){ document.getElementById("instruction").value=text; }
 async function captureSelector(){ const r=await fetch("/api/selector/capture",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(r=>r.json()); showResponse(r); await refreshState(); }
-async function teachStart(){ const app_name=document.getElementById("teachApp").value.trim(); const r=await fetch("/api/teach/start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({app_name})}).then(r=>r.json()); showResponse(r); await refreshState(); }
+async function teachStart(){ const app_name=document.getElementById("teachApp").value.trim(); const r=await fetch("/api/teach/start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({app_name})}).then(r=>r.json()); showResponse(r); await refreshState(); await loadTeachRecipes(); }
 async function teachGlobalStart(){ const r=await fetch("/api/teach/global_start",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(r=>r.json()); showResponse(r); await refreshState(); }
 async function teachGlobalStop(){ const r=await fetch("/api/teach/global_stop",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(r=>r.json()); showResponse(r); await refreshState(); }
 async function teachAddClick(){ const r=await fetch("/api/teach/add_click",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(r=>r.json()); showResponse(r); await refreshState(); }
 async function teachAddType(){ const text=document.getElementById("teachTypeText").value; const r=await fetch("/api/teach/add_type",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text})}).then(r=>r.json()); showResponse(r); await refreshState(); }
 async function teachAddHotkey(){ const keys=document.getElementById("teachHotkey").value; const r=await fetch("/api/teach/add_hotkey",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({keys})}).then(r=>r.json()); showResponse(r); await refreshState(); }
 async function teachAddWait(){ const seconds=parseInt(document.getElementById("teachWait").value||"1",10); const r=await fetch("/api/teach/add_wait",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({seconds})}).then(r=>r.json()); showResponse(r); await refreshState(); }
-async function teachStop(){ const r=await fetch("/api/teach/stop",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(r=>r.json()); handleResult(r); if(r.ok && r.instruction){ document.getElementById("instruction").value=r.instruction; } await refreshState(); }
+async function teachStop(){ const r=await fetch("/api/teach/stop",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(r=>r.json()); handleResult(r); if(r.ok && (r.adaptive_instruction || r.instruction)){ document.getElementById("instruction").value=r.adaptive_instruction||r.instruction; } await refreshState(); await loadTeachRecipes(); if(r?.replay_plan){ document.getElementById("teachReplayState").innerHTML=`<strong>${escapeHtml(r.replay_plan.learned_goal||"Replay preview")}</strong><div class="small" style="margin-top:4px;">Autorun: ${r.replay_plan.can_autorun?"ready":"review first"} | Confidence: ${escapeHtml(String(r.replay_plan.confidence||0))}</div>`; } }
+async function loadLearnedSkills(){
+  const r=await fetch("/api/learn/skills",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(r=>r.json());
+  const select=document.getElementById("learnedSkillSelect");
+  const versionSelect=document.getElementById("learnedSkillVersionSelect");
+  const timeline=document.getElementById("learnedSkillTimeline");
+  if(!select || !versionSelect || !timeline){ return; }
+  const skills=Array.isArray(r?.skills)?r.skills:[];
+  select.innerHTML=skills.length ? skills.map(item=>`<option value="${escapeHtmlAttr(item.skill_id||"")}">${escapeHtml(item.skill_name||item.skill_id||"skill")} (${escapeHtml(item.latest_version||"")})</option>`).join("") : `<option value="">No learned skills</option>`;
+  versionSelect.innerHTML=`<option value="">latest</option>`;
+  timeline.innerHTML=skills.length
+      ? `<div class="teach-item"><strong>Version Timeline</strong><div class="small">${skills.slice(0,6).map(item=>`${item.skill_name||item.skill_id}: v${item.latest_version||""}`).join(" | ")}</div></div>`
+        : `<div class="teach-item"><strong>Version Timeline</strong><div class="small">No version history yet.</div></div>`;
+    if(ui.latestState){ renderWorkspaceSummary(ui.latestState); }
+  }
+  function renderLearnedSkillForm(skill){
+    const payload=skill||{};
+    const set=(id,value)=>{ const el=document.getElementById(id); if(el){ el.value=value ?? ""; } };
+    set("learnedSkillNameField", payload.skill_name||"");
+    set("learnedSkillTopicField", payload.topic||"");
+    set("learnedSkillPurposeField", payload.purpose||"");
+    set("learnedSkillDomainField", payload.domain||"");
+    set("learnedSkillConfidenceField", payload.confidence_score ?? "");
+    set("learnedSkillToolsField", Array.isArray(payload.required_tools)?payload.required_tools.join(", "):"");
+    set("learnedSkillPrereqsField", Array.isArray(payload.prerequisites)?payload.prerequisites.join(", "):"");
+    set("learnedSkillPracticePolicyField", payload.practice_policy?.mode||"");
+    const workflowMount=document.getElementById("learnedSkillWorkflowPreview");
+    if(workflowMount){
+      const rows=Array.isArray(payload.workflow)?payload.workflow.slice(0,12).map(item=>`<div class="teach-item"><strong>Step ${escapeHtml(String(item.step||""))}</strong><div class="small">${escapeHtml(item.checkpoint_name||item.description||"")}</div><div class="small" style="margin-top:4px;">${escapeHtml(item.action_type||"")} | confidence ${escapeHtml(String(item.confidence ?? ""))}</div></div>`).join(""):"";
+      workflowMount.innerHTML=rows || `<div class="teach-item"><strong>Workflow Preview</strong><div class="small">No workflow steps found.</div></div>`;
+    }
+  }
+  function syncLearnedSkillFormToEditor(){
+    const editor=document.getElementById("learnedSkillEditor");
+    if(!editor){ return; }
+    let skill={};
+    try{ skill=JSON.parse(editor.value||"{}"); } catch { skill={}; }
+    skill.skill_name=document.getElementById("learnedSkillNameField")?.value?.trim()||skill.skill_name||"";
+    skill.topic=document.getElementById("learnedSkillTopicField")?.value?.trim()||skill.topic||"";
+    skill.purpose=document.getElementById("learnedSkillPurposeField")?.value?.trim()||skill.purpose||"";
+    skill.domain=document.getElementById("learnedSkillDomainField")?.value?.trim()||skill.domain||"";
+    const confidenceRaw=document.getElementById("learnedSkillConfidenceField")?.value?.trim()||"";
+    if(confidenceRaw){ skill.confidence_score=parseFloat(confidenceRaw); }
+    skill.required_tools=(document.getElementById("learnedSkillToolsField")?.value||"").split(",").map(s=>s.trim()).filter(Boolean);
+    skill.prerequisites=(document.getElementById("learnedSkillPrereqsField")?.value||"").split(",").map(s=>s.trim()).filter(Boolean);
+    skill.practice_policy=skill.practice_policy||{};
+    const practiceMode=document.getElementById("learnedSkillPracticePolicyField")?.value?.trim()||"";
+    if(practiceMode){ skill.practice_policy.mode=practiceMode; }
+    editor.value=JSON.stringify(skill, null, 2);
+  }
+  async function openLearnedSkill(){
+  const skill_id=(document.getElementById("learnedSkillSelect").value||"").trim();
+  const version=(document.getElementById("learnedSkillVersionSelect").value||"").trim();
+  if(!skill_id){ document.getElementById("learnedSkillState").innerText="Select a learned skill first."; return; }
+  const r=await fetch("/api/learn/skill/load",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({skill_id,version})}).then(r=>r.json());
+  if(!r.ok){ showResponse(r); return; }
+  document.getElementById("learnedSkillEditor").value=JSON.stringify(r.skill||{}, null, 2);
+  document.getElementById("learnedSkillState").innerText=`Loaded ${r.skill?.skill_name||skill_id} v${r.skill?.version||r.version||"latest"}`;
+  renderLearnedSkillForm(r.skill||{});
+  const versionSelect=document.getElementById("learnedSkillVersionSelect");
+  if(versionSelect){
+    const versions=Array.isArray(r.versions)?r.versions:[];
+    versionSelect.innerHTML=`<option value="">latest</option>` + versions.map(v=>`<option value="${escapeHtmlAttr(v.version||"")}">${escapeHtml(v.version||"")}</option>`).join("");
+    if(r.skill?.version){ versionSelect.value=String(r.skill.version); }
+  }
+  const timeline=document.getElementById("learnedSkillTimeline");
+  if(timeline){
+    const versions=Array.isArray(r.versions)?r.versions:[];
+    timeline.innerHTML=`<div class="teach-item"><strong>Version Timeline</strong>${versions.length ? versions.slice().reverse().map(v=>`<div class="small" style="margin-top:4px;">v${escapeHtml(v.version||"")} | confidence ${escapeHtml(String(v.confidence_score||""))} | note ${escapeHtml(v.editor_note||"")}</div>`).join("") : `<div class="small">No version history yet.</div>`}</div>`;
+  }
+}
+  async function saveLearnedSkillEdit(){
+    const skill_id=(document.getElementById("learnedSkillSelect").value||"").trim();
+    syncLearnedSkillFormToEditor();
+    let skill={};
+    try{ skill=JSON.parse(document.getElementById("learnedSkillEditor").value||"{}"); } catch { document.getElementById("learnedSkillState").innerText="Editor JSON is invalid."; return; }
+  if(skill_id && !skill.skill_id){ skill.skill_id=skill_id; }
+  const note=prompt("Editor note for this new version","manual edit") || "manual edit";
+  const r=await fetch("/api/learn/skill/save",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({skill,editor_note:note})}).then(r=>r.json());
+  handleResult(r);
+  await loadLearnedSkills();
+  if(r.ok){ document.getElementById("learnedSkillState").innerText=`Saved ${r.skill_id||skill.skill_id} v${r.version||""}`; }
+}
+async function diffLearnedSkillVersions(){
+  const skill_id=(document.getElementById("learnedSkillSelect").value||"").trim();
+  const right=(document.getElementById("learnedSkillVersionSelect").value||"").trim();
+  if(!skill_id){ return; }
+  const left=prompt("Compare against version (leave blank for previous version)","") || "";
+  const r=await fetch("/api/learn/skill/diff",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({skill_id,left_version:left,right_version:right})}).then(r=>r.json());
+  const mount=document.getElementById("learnedSkillDiff");
+  if(mount){
+    mount.innerHTML=`<div class="teach-item"><strong>Diff History</strong><div class="small">${escapeHtml(r.summary||"No diff available.")}</div><pre class="json-box" style="margin-top:8px;max-height:240px;">${escapeHtml(r.unified_diff||"")}</pre></div>`;
+  }
+}
+async function submitLearnedSkillFeedback(){
+  const skill_id=(document.getElementById("learnedSkillSelect").value||"").trim();
+  const version=(document.getElementById("learnedSkillVersionSelect").value||"").trim();
+  if(!skill_id){ return; }
+  const rating=parseInt(prompt("Rating 1-5","4")||"4",10);
+  const signal=prompt("Signal / outcome tag","useful") || "useful";
+  const comment=prompt("Optional feedback comment","") || "";
+  const r=await fetch("/api/learn/skill/feedback",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({skill_id,version,rating,signal,comment})}).then(r=>r.json());
+  handleResult(r);
+  if(r.ok){ document.getElementById("learnedSkillState").innerText=`Feedback saved. Avg rating ${r.feedback_summary?.average_rating||0}`; }
+}
+async function scheduleLearnedSkillPractice(){
+  const skill_id=(document.getElementById("learnedSkillSelect").value||"").trim();
+  const version=(document.getElementById("learnedSkillVersionSelect").value||"").trim();
+  if(!skill_id){ return; }
+  const kind=prompt("Schedule kind: interval | daily | event","daily") || "daily";
+  const value=prompt("Schedule value: seconds | HH:MM | event_name", kind==="daily" ? "09:00" : "604800") || "";
+  const r=await fetch("/api/learn/skill/schedule_practice",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({skill_id,version,kind,value})}).then(r=>r.json());
+  handleResult(r); await refreshState();
+}
+async function refreshLearnedSkill(){
+  const skill_id=(document.getElementById("learnedSkillSelect").value||"").trim();
+  const version=(document.getElementById("learnedSkillVersionSelect").value||"").trim();
+  if(!skill_id){ return; }
+  const source_url=prompt("Optional new source URL for refresh","") || "";
+  const reason=prompt("Refresh reason","version_sensitive_topic_refresh") || "version_sensitive_topic_refresh";
+  const r=await fetch("/api/learn/skill/refresh",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({skill_id,version,source_url,reason})}).then(r=>r.json());
+  handleResult(r); await loadLearnedSkills();
+}
+  async function showLearnedSkillSelectors(){
+  const skill_id=(document.getElementById("learnedSkillSelect").value||"").trim();
+  const version=(document.getElementById("learnedSkillVersionSelect").value||"").trim();
+  if(!skill_id){ return; }
+  const r=await fetch("/api/learn/skill/selectors",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({skill_id,version})}).then(r=>r.json());
+  const mount=document.getElementById("learnedSkillDiff");
+  if(mount){
+    const rows=Array.isArray(r.workflow)?r.workflow.map(item=>`<div class="small" style="margin-top:4px;"><strong>Step ${escapeHtml(String(item.step||""))}</strong>: ${escapeHtml((item.selector_suggestions||[]).map(s=>`${s.kind}=${s.value}`).join(" | "))}</div>`).join("") : "";
+      mount.innerHTML=`<div class="teach-item"><strong>Selector Suggestions</strong>${rows || `<div class="small">No selector suggestions found.</div>`}</div>`;
+    }
+  }
+  async function previewLearnedSkillPractice(){
+    const skill_id=(document.getElementById("learnedSkillSelect").value||"").trim();
+    const version=(document.getElementById("learnedSkillVersionSelect").value||"").trim();
+    if(!skill_id){ return; }
+    const r=await fetch("/api/learn/skill/practice_preview",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({skill_id,version})}).then(r=>r.json());
+    const mount=document.getElementById("learnedSkillDiff");
+    if(mount){
+      const cps=Array.isArray(r.preview?.checkpoints)?r.preview.checkpoints:[];
+      mount.innerHTML=`<div class="teach-item"><strong>Practice Preview</strong><div class="small">Policy ${escapeHtml(r.preview?.checkpoint_policy?.policy||"")} | checkpoints ${escapeHtml(String(r.preview?.checkpoint_policy?.checkpoint_count||0))} | autorun ${r.preview?.can_autorun?"ready":"review"}</div>${cps.slice(0,10).map(cp=>`<div class="small" style="margin-top:4px;">${escapeHtml(cp.checkpoint_name||cp.checkpoint_id||"checkpoint")}</div>`).join("")}</div>`;
+    }
+    if(r.ok){ document.getElementById("learnedSkillState").innerText=`Practice preview ready for ${skill_id}`; }
+  }
+  async function runLearnedSkillPractice(){
+    const skill_id=(document.getElementById("learnedSkillSelect").value||"").trim();
+    const version=(document.getElementById("learnedSkillVersionSelect").value||"").trim();
+    if(!skill_id){ return; }
+    const r=await fetch("/api/learn/skill/practice_run",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({skill_id,version})}).then(r=>r.json());
+    handleResult(r);
+    const mount=document.getElementById("learnedSkillDiff");
+    if(mount){
+      const runs=Array.isArray(r.checkpoint_runs)?r.checkpoint_runs:[];
+      mount.innerHTML=`<div class="teach-item"><strong>Practice Run</strong><div class="small">Status: ${r.ok?"passed":"needs review"}</div>${runs.map(cp=>`<div class="small" style="margin-top:4px;">${escapeHtml(cp.checkpoint_name||cp.checkpoint_id||"checkpoint")} | ${cp.ok?"ok":"failed"}${cp.error?` | ${escapeHtml(cp.error)}`:""}</div>`).join("")}</div>`;
+    }
+    await loadLearnedSkills();
+  }
 async function addSchedule(){
   const name=document.getElementById("scheduleName").value.trim(), automation_name=document.getElementById("scheduleAutomation").value.trim();
   const kind=document.getElementById("scheduleKind").value, value=document.getElementById("scheduleValue").value.trim();
@@ -1473,7 +2223,17 @@ async function triggerEvent(){
   showResponse(r); await refreshState();
 }
 function showResponse(r){ renderSummary(r||{}); setRaw(r||{}); }
-function handleResult(r){ showResponse(r); if(r.ok){ ui.history.push(r); persistHistory(); renderHistory(); } }
+function handleResult(r){
+  showResponse(r);
+  if(r.ok){
+    ui.history.push(r);
+    persistHistory();
+    renderHistory();
+    if(String(r.mode||"")==="topic_mastery_learn_mode" || r.learned_skill || r.result?.learned_skill){
+      void loadLearnedSkills();
+    }
+  }
+}
 function renderTask(task){
   const pct = Math.max(0, Math.min(100, parseInt(task.progress||0,10)||0));
   document.getElementById("progressBar").style.width=`${pct}%`;
@@ -1539,6 +2299,8 @@ window.onload=async()=>{
   };
   if(devDetails){ devDetails.addEventListener("toggle", syncDeveloperPanels); }
   syncDeveloperPanels();
+  syncViewportMode();
+  window.addEventListener("resize", syncViewportMode);
   detailsVisible = localStorage.getItem("lam_details_visible")==="1";
   strictRulesVisible = localStorage.getItem("lam_strict_rules_visible")==="1";
   const showDetailsBox = document.getElementById("showDetails");
@@ -1562,6 +2324,8 @@ window.onload=async()=>{
   }
   await refreshFreshnessPreview();
   await loadDomainFreshnessPolicy();
+  await loadTeachRecipes();
+  await loadLearnedSkills();
   await vaultList();
 };
 </script>
@@ -1774,7 +2538,12 @@ class _Handler(BaseHTTPRequestHandler):
             query = str(payload.get("query", "")).strip()
             tag = str(payload.get("tag", "")).strip().lower()
             favorite_only = bool(payload.get("favorite_only", False))
-            self._send_json(200, {"ok": True, "entries": self.state.vault.list_entries(query=query, tag=tag, favorite_only=favorite_only)})
+            try:
+                entries = self.state.vault.list_entries(query=query, tag=tag, favorite_only=favorite_only)
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                self._send_json(200, {"ok": False, "error": str(exc), "entries": []})
+                return
+            self._send_json(200, {"ok": True, "entries": entries})
             return
 
         if self.path == "/api/vault/save":
@@ -2079,6 +2848,338 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(200, result)
             return
 
+        if self.path == "/api/teach/recipes":
+            app_name = str(payload.get("app_name", "")).strip()
+            memory = RecipeMemory()
+            self._send_json(200, {"ok": True, "recipes": memory.list_for_app(app_name), "families": memory.list_families_for_app(app_name)})
+            return
+
+        if self.path == "/api/learn/skills":
+            library = SkillLibrary()
+            self._send_json(200, {"ok": True, "skills": library.list_skills()})
+            return
+
+        if self.path == "/api/learn/skill/load":
+            skill_id = str(payload.get("skill_id", "")).strip()
+            version = str(payload.get("version", "")).strip()
+            if not skill_id:
+                self._send_json(400, {"ok": False, "error": "skill_id is required"})
+                return
+            library = SkillLibrary()
+            skill = library.load_skill(skill_id, version)
+            versions = library.list_versions(skill_id)
+            if not skill:
+                self._send_json(404, {"ok": False, "error": "skill not found"})
+                return
+            self._send_json(200, {"ok": True, "skill": skill, "versions": versions, "version": str(skill.get("version", "")), "editor_schema": library.editor_schema(skill)})
+            return
+
+        if self.path == "/api/learn/skill/save":
+            skill = dict(payload.get("skill", {}) or {})
+            if not skill or not str(skill.get("skill_id", "")).strip():
+                self._send_json(400, {"ok": False, "error": "skill payload with skill_id is required"})
+                return
+            library = SkillLibrary()
+            saved = library.save_skill(skill, editor_note=str(payload.get("editor_note", "manual edit")))
+            self._send_json(200, {"ok": True, **saved})
+            return
+
+        if self.path == "/api/learn/skill/diff":
+            skill_id = str(payload.get("skill_id", "")).strip()
+            if not skill_id:
+                self._send_json(400, {"ok": False, "error": "skill_id is required"})
+                return
+            library = SkillLibrary()
+            versions = library.list_versions(skill_id)
+            right_version = str(payload.get("right_version", "")).strip() or (str(versions[-1].get("version", "")) if versions else "")
+            left_version = str(payload.get("left_version", "")).strip()
+            if not left_version and len(versions) >= 2:
+                left_version = str(versions[-2].get("version", ""))
+            diff = library.diff_versions(skill_id, left_version, right_version)
+            self._send_json(200, {"ok": True, **diff})
+            return
+
+        if self.path == "/api/learn/skill/feedback":
+            skill_id = str(payload.get("skill_id", "")).strip()
+            version = str(payload.get("version", "")).strip()
+            if not skill_id:
+                self._send_json(400, {"ok": False, "error": "skill_id is required"})
+                return
+            library = SkillLibrary()
+            summary = library.record_feedback(
+                skill_id,
+                version,
+                rating=int(payload.get("rating", 0) or 0),
+                comment=str(payload.get("comment", "")),
+                signal=str(payload.get("signal", "")),
+            )
+            self._send_json(200, {"ok": True, "feedback_summary": summary})
+            return
+
+        if self.path == "/api/learn/skill/selectors":
+            skill_id = str(payload.get("skill_id", "")).strip()
+            version = str(payload.get("version", "")).strip()
+            if not skill_id:
+                self._send_json(400, {"ok": False, "error": "skill_id is required"})
+                return
+            library = SkillLibrary()
+            skill = library.load_skill(skill_id, version)
+            self._send_json(200, {"ok": True, "workflow": list(skill.get("workflow", []) or [])})
+            return
+
+        if self.path == "/api/learn/skill/practice_preview":
+            skill_id = str(payload.get("skill_id", "")).strip()
+            version = str(payload.get("version", "")).strip()
+            if not skill_id:
+                self._send_json(400, {"ok": False, "error": "skill_id is required"})
+                return
+            library = SkillLibrary()
+            skill = library.load_skill(skill_id, version)
+            if not skill:
+                self._send_json(404, {"ok": False, "error": "skill not found"})
+                return
+            preview = SkillPracticeRuntime().build_preview(skill, mode="safe_practice")
+            self._send_json(200, {"ok": True, "preview": preview})
+            return
+
+        if self.path == "/api/learn/skill/practice_run":
+            skill_id = str(payload.get("skill_id", "")).strip()
+            version = str(payload.get("version", "")).strip()
+            if not skill_id:
+                self._send_json(400, {"ok": False, "error": "skill_id is required"})
+                return
+            library = SkillLibrary()
+            skill = library.load_skill(skill_id, version)
+            if not skill:
+                self._send_json(404, {"ok": False, "error": "skill not found"})
+                return
+            run = SkillPracticeRuntime().execute_practice(skill, mode="safe_practice")
+            library.record_practice_run(
+                skill_id,
+                version or str(skill.get("version", "")),
+                {
+                    "ok": bool(run.get("ok", False)),
+                    "checkpoint_count": len(list((run.get("preview", {}) or {}).get("checkpoints", []) or [])),
+                    "failed_checkpoint_id": str(run.get("failed_checkpoint_id", "") or ""),
+                    "failed_checkpoint_name": str(run.get("failed_checkpoint_name", "") or ""),
+                },
+            )
+            self._send_json(200, {"ok": bool(run.get("ok", False)), **run})
+            return
+
+        if self.path == "/api/learn/skill/schedule_practice":
+            skill_id = str(payload.get("skill_id", "")).strip()
+            version = str(payload.get("version", "")).strip()
+            kind = str(payload.get("kind", "daily")).strip().lower()
+            value = str(payload.get("value", "09:00")).strip()
+            if not skill_id:
+                self._send_json(400, {"ok": False, "error": "skill_id is required"})
+                return
+            if not self.state.scheduler:
+                self._send_json(500, {"ok": False, "error": "Scheduler unavailable"})
+                return
+            library = SkillLibrary()
+            plan = library.practice_schedule_payload(skill_id, version)
+            with self.state.lock:
+                self.state.saved_automations[plan["automation_name"]] = json.dumps(plan)
+                _save_automations(self.state.saved_automations)
+            job = self.state.scheduler.add_job(name=plan["name"], automation_name=plan["automation_name"], kind=kind, value=value)
+            self._send_json(200, {"ok": True, "job": job.to_dict(), "automation_name": plan["automation_name"], "instruction": plan["instruction"], "checkpoint_policy": plan.get("checkpoint_policy", {})})
+            return
+
+        if self.path == "/api/learn/skill/refresh":
+            skill_id = str(payload.get("skill_id", "")).strip()
+            version = str(payload.get("version", "")).strip()
+            source_url = str(payload.get("source_url", "")).strip()
+            reason = str(payload.get("reason", "version_sensitive_topic_refresh")).strip()
+            if not skill_id:
+                self._send_json(400, {"ok": False, "error": "skill_id is required"})
+                return
+            library = SkillLibrary()
+            plan = library.build_refresh_plan(skill_id, version, reason=reason, source_url=source_url)
+            runtime = TopicMasteryRuntime()
+            browser_worker_mode = self.state.browser_worker_mode
+            human_like_interaction = self.state.human_like_interaction
+
+            def _topic_source_collector(**kwargs: Any) -> Dict[str, Any]:
+                query = str(kwargs.get("query", "") or plan.get("recommended_instruction", "")).strip()
+                return collect_generic_research(
+                    instruction=query,
+                    browser_worker_mode=browser_worker_mode,
+                    human_like_interaction=human_like_interaction,
+                )
+
+            workspace_dir = Path("data/learn_refresh_runs") / f"{skill_id}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+            result = runtime.run(
+                plan["recommended_instruction"],
+                context={
+                    "workspace_dir": str(workspace_dir),
+                    "topic": plan.get("topic", ""),
+                    "seed_url": plan.get("seed_url", ""),
+                    "existing_skill_version": version,
+                    "source_collector": _topic_source_collector,
+                },
+            )
+            library.record_refresh_run(
+                skill_id,
+                version,
+                {
+                    "status": str(result.get("status", "") or ""),
+                    "selected_sources": int((result.get("source_discovery", {}) or {}).get("selected", 0) or 0),
+                    "runtime_quality": str(((result.get("source_discovery", {}) or {}).get("adapter_summary", {}) or {}).get("runtime_quality", "") or ""),
+                },
+            )
+            with self.state.lock:
+                self.state.history.append(dict(result))
+                self.state.history = self.state.history[-300:]
+                _save_history(self.state.history)
+            self._send_json(200, {"ok": True, "refresh_plan": plan, "result": result})
+            return
+
+        if self.path == "/api/teach/replay_preview":
+            recipe_path = str(payload.get("recipe_path", "")).strip()
+            family_id = str(payload.get("family_id", "")).strip()
+            input_bindings = dict(payload.get("input_bindings", {}) or {})
+            current_state = dict(payload.get("current_state", {}) or {})
+            if not recipe_path and not family_id:
+                self._send_json(400, {"ok": False, "error": "recipe_path or family_id is required"})
+                return
+            if _needs_live_replay_state(current_state):
+                app_hint = str(payload.get("app_name", "")).strip()
+                current_state = _capture_live_replay_state(app_hint=app_hint)
+            runtime = TeachReplayRuntime()
+            memory = RecipeMemory()
+            if family_id:
+                family = memory.load_family(family_id)
+                preview = runtime.build_plan(family=family, input_bindings=input_bindings, current_state=current_state)
+                self._send_json(200, {"ok": True, "family": family, "current_state": current_state, "preview": preview})
+                return
+            recipe = runtime.load_recipe(recipe_path)
+            preview = runtime.build_plan(recipe=recipe, input_bindings=input_bindings, current_state=current_state)
+            self._send_json(200, {"ok": True, "recipe": recipe, "current_state": current_state, "preview": preview})
+            return
+
+        if self.path == "/api/teach/replay_run":
+            recipe_path = str(payload.get("recipe_path", "")).strip()
+            family_id = str(payload.get("family_id", "")).strip()
+            input_bindings = dict(payload.get("input_bindings", {}) or {})
+            current_state = dict(payload.get("current_state", {}) or {})
+            human_like_interaction = bool(payload.get("human_like_interaction", self.state.human_like_interaction))
+            step_mode = bool(payload.get("step_mode", self.state.step_mode))
+            if not recipe_path and not family_id:
+                self._send_json(400, {"ok": False, "error": "recipe_path or family_id is required"})
+                return
+            if _needs_live_replay_state(current_state):
+                app_hint = str(payload.get("app_name", "")).strip()
+                current_state = _capture_live_replay_state(app_hint=app_hint)
+            runtime = TeachReplayRuntime()
+            memory = RecipeMemory()
+            family = memory.load_family(family_id) if family_id else {}
+            recipe = runtime.load_recipe(recipe_path) if recipe_path else {}
+            built = build_plan_from_recipe(recipe or family, input_bindings=input_bindings, current_state=current_state, is_family=bool(family))
+            plan = dict(built.get("plan", {}) or {})
+            preview = dict(built.get("preview", {}) or {})
+            if not bool(preview.get("can_autorun", False)):
+                self._send_json(
+                    200,
+                    {
+                        "ok": False,
+                        "mode": "teach_replay_preview",
+                        "recipe": recipe,
+                        "preview": preview,
+                        "message": str(preview.get("pause_reason", "") or "Recipe requires review before execution."),
+                    },
+                )
+                return
+            execution_attempts: List[Dict[str, Any]] = []
+            ranked_variants = list(preview.get("ranked_variants", []) or [])
+            variant_payloads: List[Dict[str, Any]] = [dict(preview.get("selected_variant", {}) or {})]
+            variant_payloads.extend(item for item in ranked_variants if str(item.get("recipe_id", "")) != str(preview.get("selected_variant", {}).get("recipe_id", "")))
+            run = None
+            chosen_preview = preview
+            chosen_plan = plan
+            resume_from_source_index = None
+            resume_from_segment_index = None
+            resume_from_checkpoint_id = ""
+            for variant_info in variant_payloads if family else [dict(preview.get("selected_variant", {}) or {})]:
+                if family:
+                    variant_recipe = dict(variant_info.get("variant", {}) or {})
+                    if not variant_recipe:
+                        continue
+                    built_variant = build_plan_from_recipe(
+                        variant_recipe,
+                        input_bindings=input_bindings,
+                        current_state=current_state,
+                        is_family=False,
+                        resume_from_source_index=resume_from_source_index,
+                        resume_from_segment_index=resume_from_segment_index,
+                        resume_from_checkpoint_id=resume_from_checkpoint_id,
+                    )
+                    chosen_plan = dict(built_variant.get("plan", {}) or {})
+                    chosen_preview = dict(built_variant.get("preview", {}) or {})
+                    if not bool(chosen_preview.get("can_autorun", False)):
+                        execution_attempts.append({"recipe_id": variant_recipe.get("recipe_id", ""), "ok": False, "reason": chosen_preview.get("pause_reason", "variant not autorun-ready"), "segment_index": resume_from_segment_index, "checkpoint_id": str(resume_from_checkpoint_id or ""), "checkpoint_name": ""})
+                        continue
+                run = execute_plan(
+                    chosen_plan,
+                    start_index=0,
+                    step_mode=step_mode,
+                    allow_input_fallback=True,
+                    human_like_interaction=bool(human_like_interaction),
+                )
+                execution_attempts.append({"recipe_id": chosen_preview.get("recipe_id", ""), "ok": run.ok, "error": run.error, "segment_index": runtime.reassignment_segment(run.trace) if not run.ok else None, "checkpoint_id": runtime.reassignment_checkpoint_id(run.trace) if not run.ok else "", "checkpoint_name": _trace_checkpoint_name(run.trace) if not run.ok else ""})
+                if family and chosen_preview.get("family_id") and chosen_preview.get("recipe_id"):
+                    failed_checkpoint_id = runtime.reassignment_checkpoint_id(run.trace) if not run.ok else ""
+                    failed_checkpoint_name = _trace_checkpoint_name(run.trace) if not run.ok else ""
+                    memory.record_variant_outcome(
+                        family_id=str(chosen_preview.get("family_id", "")),
+                        recipe_id=str(chosen_preview.get("recipe_id", "")),
+                        ok=bool(run.ok),
+                        reason=str(run.error or run.pause_reason or ""),
+                        current_state=current_state,
+                        checkpoint_id=failed_checkpoint_id,
+                        checkpoint_name=failed_checkpoint_name,
+                    )
+                if run.ok:
+                    break
+                if not runtime.should_reassign_branch(run.trace):
+                    break
+                resume_from_source_index = runtime.reassignment_checkpoint(run.trace)
+                resume_from_segment_index = runtime.reassignment_segment(run.trace)
+                resume_from_checkpoint_id = runtime.reassignment_checkpoint_id(run.trace)
+            reteach_guidance = _build_reteach_guidance(execution_attempts)
+            if family_id:
+                try:
+                    family = memory.load_family(family_id)
+                except Exception:
+                    pass
+            reteach_guidance = _augment_reteach_guidance_with_family(reteach_guidance, family)
+            if run is None:
+                self._send_json(200, {"ok": False, "mode": "teach_replay_run", "preview": preview, "attempts": execution_attempts, "reteach_guidance": reteach_guidance, "error": "no runnable variant"})
+                return
+            self._send_json(
+                200,
+                {
+                    "ok": run.ok,
+                    "mode": "teach_replay_run",
+                    "recipe": recipe,
+                    "family": family,
+                    "preview": chosen_preview,
+                    "plan": chosen_plan,
+                    "current_state": current_state,
+                    "attempts": execution_attempts,
+                    "reteach_guidance": reteach_guidance,
+                    "trace": run.trace,
+                    "done": run.done,
+                    "next_step_index": run.next_step_index,
+                    "paused_for_credentials": run.paused_for_credentials,
+                    "pause_reason": run.pause_reason,
+                    "artifacts": dict(run.artifacts or {}),
+                    "error": run.error,
+                },
+            )
+            return
+
         if self.path == "/api/automation/save":
             name = str(payload.get("name", "")).strip()
             instruction = str(payload.get("instruction", "")).strip()
@@ -2096,9 +3197,30 @@ class _Handler(BaseHTTPRequestHandler):
             instruction = str(payload.get("instruction", "")).strip()
             ai_backend = normalize_backend(str(payload.get("ai_backend", "")))
             min_live = int(payload.get("min_live_non_curated_citations", 3))
+            automation_payload: Dict[str, Any] = {"kind": "instruction", "instruction": instruction}
             if not instruction:
                 with self.state.lock:
-                    instruction = self.state.saved_automations.get(name, "")
+                    automation_payload = _decode_saved_automation(self.state.saved_automations.get(name, ""))
+                    instruction = str(automation_payload.get("instruction", "") or "")
+            if str(automation_payload.get("kind", "")) == "learn_skill_practice":
+                library = SkillLibrary()
+                skill = library.load_skill(str(automation_payload.get("skill_id", "")), str(automation_payload.get("version", "")))
+                if not skill:
+                    self._send_json(404, {"ok": False, "error": f"Skill '{automation_payload.get('skill_id', '')}' not found."})
+                    return
+                run = SkillPracticeRuntime().execute_practice(skill, mode="safe_practice")
+                library.record_practice_run(
+                    str(automation_payload.get("skill_id", "")),
+                    str(automation_payload.get("version", "") or skill.get("version", "")),
+                    {
+                        "ok": bool(run.get("ok", False)),
+                        "checkpoint_count": len(list((run.get("preview", {}) or {}).get("checkpoints", []) or [])),
+                        "failed_checkpoint_id": str(run.get("failed_checkpoint_id", "") or ""),
+                        "failed_checkpoint_name": str(run.get("failed_checkpoint_name", "") or ""),
+                    },
+                )
+                self._send_json(200, {"ok": bool(run.get("ok", False)), "mode": "learned_skill_practice", **run})
+                return
             payload = {
                 "instruction": instruction,
                 "confirm_risky": bool(payload.get("confirm_risky", False)),
@@ -2124,12 +3246,33 @@ class _Handler(BaseHTTPRequestHandler):
                 artifact_reuse_max_age_hours = max(1, min(720, int(payload.get("artifact_reuse_max_age_hours", self.state.artifact_reuse_max_age_hours))))
             except Exception:
                 artifact_reuse_max_age_hours = self.state.artifact_reuse_max_age_hours
+            automation_payload: Dict[str, Any] = {"kind": "instruction", "instruction": instruction}
             with self.state.lock:
                 if not instruction:
-                    instruction = self.state.saved_automations.get(name, "")
+                    automation_payload = _decode_saved_automation(self.state.saved_automations.get(name, ""))
+                    instruction = str(automation_payload.get("instruction", "") or "")
                 preflight_error = _preflight_gate_error_locked(self.state)
             if preflight_error:
                 self._send_json(412, _preflight_block_response(preflight_error))
+                return
+            if str(automation_payload.get("kind", "")) == "learn_skill_practice":
+                library = SkillLibrary()
+                skill = library.load_skill(str(automation_payload.get("skill_id", "")), str(automation_payload.get("version", "")))
+                if not skill:
+                    self._send_json(404, {"ok": False, "error": f"Skill '{automation_payload.get('skill_id', '')}' not found."})
+                    return
+                run = SkillPracticeRuntime().execute_practice(skill, mode="safe_practice")
+                library.record_practice_run(
+                    str(automation_payload.get("skill_id", "")),
+                    str(automation_payload.get("version", "") or skill.get("version", "")),
+                    {
+                        "ok": bool(run.get("ok", False)),
+                        "checkpoint_count": len(list((run.get("preview", {}) or {}).get("checkpoints", []) or [])),
+                        "failed_checkpoint_id": str(run.get("failed_checkpoint_id", "") or ""),
+                        "failed_checkpoint_name": str(run.get("failed_checkpoint_name", "") or ""),
+                    },
+                )
+                self._send_json(200, {"ok": bool(run.get("ok", False)), "mode": "learned_skill_practice", **run})
                 return
             if not instruction:
                 self._send_json(404, {"ok": False, "error": f"Automation '{name}' not found."})
@@ -2472,7 +3615,8 @@ def run_ui_server(host: str = "127.0.0.1", port: int = 8795, open_browser: bool 
 
     def scheduler_run(job: ScheduleJob) -> Dict[str, Any]:
         with state.lock:
-            instruction = state.saved_automations.get(job.automation_name, "")
+            automation_payload = _decode_saved_automation(state.saved_automations.get(job.automation_name, ""))
+            instruction = str(automation_payload.get("instruction", "") or "")
             granted = state.control_granted
             preflight_error = _preflight_gate_error_locked(state)
             step_mode = state.step_mode
@@ -2488,6 +3632,23 @@ def run_ui_server(host: str = "127.0.0.1", port: int = 8795, open_browser: bool 
             return {"ok": False, "error": "Control not granted; scheduled run skipped."}
         if preflight_error:
             return _preflight_block_response(preflight_error)
+        if str(automation_payload.get("kind", "")) == "learn_skill_practice":
+            library = SkillLibrary()
+            skill = library.load_skill(str(automation_payload.get("skill_id", "")), str(automation_payload.get("version", "")))
+            if not skill:
+                return {"ok": False, "error": f"Skill '{automation_payload.get('skill_id', '')}' not found."}
+            run = SkillPracticeRuntime().execute_practice(skill, mode="safe_practice")
+            library.record_practice_run(
+                str(automation_payload.get("skill_id", "")),
+                str(automation_payload.get("version", "") or skill.get("version", "")),
+                {
+                    "ok": bool(run.get("ok", False)),
+                    "checkpoint_count": len(list((run.get("preview", {}) or {}).get("checkpoints", []) or [])),
+                    "failed_checkpoint_id": str(run.get("failed_checkpoint_id", "") or ""),
+                    "failed_checkpoint_name": str(run.get("failed_checkpoint_name", "") or ""),
+                },
+            )
+            return {"ok": bool(run.get("ok", False)), "mode": "learned_skill_practice", **run}
         if not instruction:
             return {"ok": False, "error": f"Automation '{job.automation_name}' not found."}
         reuse_mode, reuse_hours, _domain, _source = _resolve_domain_freshness_defaults(
@@ -2563,7 +3724,7 @@ def _automations_path() -> Path:
     return path
 
 
-def _load_automations() -> Dict[str, str]:
+def _load_automations() -> Dict[str, Any]:
     path = _automations_path()
     if not path.exists():
         return {}
@@ -2573,8 +3734,24 @@ def _load_automations() -> Dict[str, str]:
         return {}
 
 
-def _save_automations(data: Dict[str, str]) -> None:
+def _save_automations(data: Dict[str, Any]) -> None:
     _automations_path().write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def _decode_saved_automation(raw: Any) -> Dict[str, Any]:
+    if isinstance(raw, dict):
+        return dict(raw)
+    text = str(raw or "").strip()
+    if not text:
+        return {"kind": "instruction", "instruction": ""}
+    if text.startswith("{"):
+        try:
+            payload = json.loads(text)
+            if isinstance(payload, dict):
+                return payload
+        except Exception:
+            pass
+    return {"kind": "instruction", "instruction": text}
 
 
 def _history_path() -> Path:
@@ -2598,6 +3775,119 @@ def _load_history() -> List[Dict[str, Any]]:
 
 def _save_history(history: List[Dict[str, Any]]) -> None:
     _history_path().write_text(json.dumps(history[-300:], indent=2), encoding="utf-8")
+
+
+def _capture_live_replay_state(app_hint: str = "") -> Dict[str, Any]:
+    adapter = UIAAdapter(allow_input_fallback=False, dry_run=False, human_like=False)
+    try:
+        state = adapter.capture_live_state(app_hint=app_hint, max_candidates=12)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        return {
+            "ok": False,
+            "app_name": str(app_hint or "").strip().lower(),
+            "visible_labels": [],
+            "selector_values": [],
+            "visible_roles": [],
+            "tree_signature": "",
+            "window_title": "",
+            "error": str(exc),
+        }
+    if not isinstance(state, dict):
+        return {
+            "ok": False,
+            "app_name": str(app_hint or "").strip().lower(),
+            "visible_labels": [],
+            "selector_values": [],
+            "visible_roles": [],
+            "tree_signature": "",
+            "window_title": "",
+            "error": "invalid_live_state",
+        }
+    return state
+
+
+def _build_reteach_guidance(execution_attempts: List[Dict[str, Any]]) -> Dict[str, Any]:
+    failed_segments: List[int] = []
+    failed_checkpoint_ids: List[str] = []
+    failed_checkpoint_names: List[str] = []
+    for attempt in execution_attempts:
+        if bool(attempt.get("ok", False)):
+            return {"suggested": False}
+        segment = attempt.get("segment_index", None)
+        if isinstance(segment, int) and segment >= 0:
+            failed_segments.append(segment)
+        checkpoint_id = str(attempt.get("checkpoint_id", "") or "").strip()
+        checkpoint_name = str(attempt.get("checkpoint_name", "") or "").strip()
+        if checkpoint_id:
+            failed_checkpoint_ids.append(checkpoint_id)
+        if checkpoint_name:
+            failed_checkpoint_names.append(checkpoint_name)
+    if failed_segments and len(set(failed_segments)) == 1:
+        segment = failed_segments[0]
+        checkpoint_name = failed_checkpoint_names[0] if failed_checkpoint_names and len(set(failed_checkpoint_names)) == 1 else ""
+        checkpoint_id = failed_checkpoint_ids[0] if failed_checkpoint_ids and len(set(failed_checkpoint_ids)) == 1 else ""
+        label = checkpoint_name or f"segment {segment}"
+        return {
+            "suggested": True,
+            "segment_index": segment,
+            "checkpoint_id": checkpoint_id,
+            "checkpoint_name": checkpoint_name,
+            "reason": f"All surviving branches failed at {label}. Re-teach that checkpoint or demonstrate an alternate successful path.",
+            "steps": [
+                f"Start teach mode in the same app and navigate to the state immediately before {label}.",
+                f"Demonstrate the segment through a successful completion of {label}.",
+                "Use distinct clicks or field entries so the recorder can learn stronger selectors and state signals.",
+                "Stop teach mode and save the new variant, then replay the family again.",
+            ],
+        }
+    return {"suggested": False}
+
+
+def _augment_reteach_guidance_with_family(guidance: Dict[str, Any], family: Dict[str, Any] | None) -> Dict[str, Any]:
+    payload = dict(guidance or {})
+    if not bool(payload.get("suggested", False)):
+        return payload
+    family_payload = dict(family or {})
+    checkpoint_map = list(family_payload.get("checkpoint_map", []) or [])
+    target_checkpoint_id = str(payload.get("checkpoint_id", "") or "").strip()
+    target_checkpoint_name = str(payload.get("checkpoint_name", "") or "").strip()
+    match = {}
+    for checkpoint in checkpoint_map:
+        checkpoint_id_candidates = list(checkpoint.get("checkpoint_ids", []) or [])
+        if target_checkpoint_id and target_checkpoint_id in checkpoint_id_candidates:
+            match = dict(checkpoint)
+            break
+        if target_checkpoint_name and str(checkpoint.get("checkpoint_name", "") or "").strip() == target_checkpoint_name:
+            match = dict(checkpoint)
+            break
+    if not match:
+        return payload
+    payload["checkpoint_detail"] = match
+    base = dict(match.get("suggested_base_variant", {}) or {})
+    if base:
+        payload["base_variant_recipe_id"] = str(base.get("recipe_id", "") or "")
+        payload["base_variant_label"] = str(base.get("variant_label", "") or base.get("recipe_id", "") or "")
+    return payload
+
+
+def _trace_checkpoint_name(trace: List[Dict[str, Any]]) -> str:
+    if not trace:
+        return ""
+    for item in reversed(trace):
+        name = str(item.get("checkpoint_name", "") or "").strip()
+        if name:
+            return name
+    return ""
+
+
+def _needs_live_replay_state(current_state: Dict[str, Any] | None) -> bool:
+    if not isinstance(current_state, dict) or not current_state:
+        return True
+    labels = list(current_state.get("visible_labels", []) or [])
+    selectors = list(current_state.get("selector_values", []) or [])
+    roles = list(current_state.get("visible_roles", []) or [])
+    tree_signature = str(current_state.get("tree_signature", "") or "").strip()
+    return not (labels or selectors or roles or tree_signature)
 
 
 def _feedback_path() -> Path:

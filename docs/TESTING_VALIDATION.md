@@ -1,24 +1,27 @@
-# Testing and Validation Plan
+# Testing and Validation
 
-## Unit Tests
+## Fast Product Smoke Slice
 
-- Policy evaluation matrix: role, ABAC, allowlist, deny rules, approval mapping.
-- Redaction correctness and confidence threshold behavior.
+```powershell
+python -m pytest -q tests\unit\test_main_cli.py tests\unit\test_password_vault.py tests\unit\test_web_ui_human_suite.py tests\unit\test_skill_library.py tests\unit\test_skill_runtime.py tests\unit\test_topic_mastery.py
+```
 
-## Integration Tests
+## Broader Operator Slice
 
-- End-to-end deterministic workflow run with synthetic claims rows.
-- Approval service interaction validation (pending/approved/denied paths).
-- Audit chain generation per step and per decision.
+```powershell
+python -m pytest -q tests\unit\test_search_agent.py tests\unit\test_operator_platform.py tests\unit\test_mission_runtime.py tests\unit\test_web_ui_human_suite.py
+```
 
-## Security Tests
+## What These Cover
 
-- Verify no raw PHI/PII persists in audit logs.
-- Verify blocked exfiltration actions are denied and logged.
-- Verify kill-switch abort path logs terminal event.
+- CLI parser and help surface
+- local UI product surface
+- password vault resilience
+- learned-skill storage and practice runtime
+- Topic Mastery Learn Mode
+- mission runtime and operator-platform integration
 
-## Drift and Resilience
+## Practical Rule
 
-- Selector drift simulations.
-- UI popup/timeouts/session expiry.
-- Network latency and approval timeout handling.
+When changing OpenLAMb, do not stop at code changes.
+Run at least one fast UI/CLI slice and one domain/runtime slice that matches the feature you touched.

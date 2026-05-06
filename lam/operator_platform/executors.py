@@ -17,10 +17,31 @@ from .data_science import (
     missing_value_report,
 )
 from .data_storytelling import build_story_package
+from .evidence_map import EvidenceMap
+from .mission_contract import MissionContractEngine
+from .mission_research import collect_mission_research
+from .artifact_specific_critics import (
+    CompletionCritic as MissionArtifactCompletionCritic,
+    CoverLetterCritic,
+    DataStoryCritic,
+    ExecutiveBriefCritic,
+    GrantProposalCritic,
+    JobFitCritic,
+    PresentationCritic as MissionPresentationCritic,
+    ResearchQualityCritic,
+    ResumeCritic,
+    SourceCredibilityCritic,
+    StatisticalAnalysisCritic,
+    UIUXCritic as MissionUIUXCritic,
+)
+from .research_strategist import ResearchStrategist
 from .presentation_build import build_presentation_outline
 from .research_backend import relevance_score
 from .research_primitives import collect_generic_research
+from .revision_runtime import RevisionRuntime
 from .ui_build import build_ui_delivery
+from .work_product_engine import WorkProductEngine
+from lam.learn.topic_mastery_runtime import TopicMasteryRuntime
 
 
 @dataclass(slots=True)
@@ -239,6 +260,315 @@ class ResearchCollectionExecutor(BaseCapabilityExecutor):
             },
             evidence=[str(x) for x in (collected.get("evidence") or [])],
             logs=[str(x) for x in (collected.get("logs") or [])],
+        )
+
+
+class MissionResearchExecutor(BaseCapabilityExecutor):
+    name = "mission_research"
+    description = "Collect mission-scoped evidence for professional work products such as jobs, grants, and executive briefs."
+    input_schema = ["task_contract"]
+    output_schema = ["mission_research", "sources", "research_notes", "source_status"]
+
+    def execute(self, context: Dict[str, Any], inputs: Dict[str, Any]) -> CapabilityExecutionResult:
+        contract = dict(inputs.get("task_contract", {}))
+        instruction = str(contract.get("user_goal", ""))
+        mission = MissionContractEngine().extract(instruction, context={"scope_dimensions": contract.get("scope_dimensions", {})})
+        strategy = ResearchStrategist().build(mission)
+        browser_worker_mode = str(context.get("browser_worker_mode", "local") or "local")
+        human_like_interaction = bool(context.get("human_like_interaction", False))
+        injected_collector = context.get("source_collector")
+
+        if callable(injected_collector):
+            collector = injected_collector
+        else:
+            def collector(**kwargs: Any) -> Dict[str, Any]:
+                query = str(kwargs.get("query", "") or "").strip()
+                effective_instruction = query or instruction
+                return collect_generic_research(
+                    instruction=effective_instruction,
+                    browser_worker_mode=browser_worker_mode,
+                    human_like_interaction=human_like_interaction,
+                )
+
+        collected = collect_mission_research(
+            mission=mission,
+            strategy=strategy,
+            context=context,
+            collector=collector,
+            strategist=ResearchStrategist(),
+        )
+        outputs = {
+            "mission_research": collected,
+            "sources": list(collected.get("sources", []) or []),
+            "research_notes": {
+                "objective": instruction,
+                "domain": contract.get("domain", ""),
+                "summary": f"Collected mission-scoped evidence for {mission.mission_type}.",
+                "queries": list(collected.get("queries", []) or []),
+                "errors": list(collected.get("errors", []) or []),
+            },
+            "source_status": {
+                "attempted": "yes" if bool(collected.get("attempted", False)) else "no",
+                "source_count": str(len(list(collected.get("sources", []) or []))),
+                "error_count": str(len(list(collected.get("errors", []) or []))),
+            },
+        }
+        return CapabilityExecutionResult(
+            outputs=outputs,
+            evidence=[f"mission_queries={len(list(collected.get('queries', []) or []))}", f"mission_sources={len(list(collected.get('sources', []) or []))}"],
+            logs=[f"mission_research:{note.get('query','')}" for note in list(collected.get("notes", []) or [])[:6]],
+        )
+
+
+class MissionWorkProductExecutor(BaseCapabilityExecutor):
+    name = "mission_work_product"
+    description = "Build mission-scoped artifacts, map evidence, run artifact critics, and return truthful mission status."
+    input_schema = ["task_contract"]
+    output_schema = ["mission_contract", "research_strategy", "evidence_map", "artifact_plan", "mission_status", "final_package", "output_truth", "recovery"]
+
+    def execute(self, context: Dict[str, Any], inputs: Dict[str, Any]) -> CapabilityExecutionResult:
+        task_contract = dict(inputs.get("task_contract", {}))
+        instruction = str(task_contract.get("user_goal", ""))
+        mission = MissionContractEngine().extract(instruction, context={"scope_dimensions": task_contract.get("scope_dimensions", {})})
+        if task_contract.get("mission_type"):
+            mission.mission_type = str(task_contract.get("mission_type", mission.mission_type))
+        if task_contract.get("deliverable_mode"):
+            mission.deliverable_mode = str(task_contract.get("deliverable_mode", mission.deliverable_mode))
+        if task_contract.get("requested_outputs"):
+            mission.requested_outputs = [str(x) for x in (task_contract.get("requested_outputs") or [])]
+            mission.artifact_plan = MissionContractEngine()._artifact_plan(mission.mission_type, mission.requested_outputs)
+        strategy = ResearchStrategist().build(mission)
+        memory_context = dict(inputs.get("memory_context", {}) or {})
+        evidence_map = EvidenceMap()
+        expected_claims = list(strategy.get("expected_evidence", [])[:4])
+        for row in list(inputs.get("sources", []) or []):
+            if isinstance(row, dict):
+                evidence_map.add_scored_source(contract=mission, source=row, supported_claims=expected_claims)
+        for item in list(memory_context.get("used", []) or [])[:4]:
+            evidence_map.add_scored_source(
+                contract=mission,
+                source={
+                    "source": f"memory:{item.get('type', 'context')}",
+                    "source_type": "user_context",
+                    "url_or_path": f"user://memory/{item.get('memory_id', '')}",
+                    "title": str(item.get("type", "")),
+                    "snippet": json.dumps(item.get("content", {}))[:220],
+                },
+                supported_claims=expected_claims[:2] or ["context_support"],
+            )
+        workspace = _workspace_dir(context)
+        engine = WorkProductEngine()
+        artifacts, artifact_metadata = engine.build(
+            contract=mission,
+            strategy=strategy,
+            evidence_map=evidence_map.to_dict(),
+            memory_context=memory_context,
+            workspace_dir=workspace,
+            source_records=list(inputs.get("sources", []) or []),
+            extra_context=context,
+        )
+        revision_runtime = RevisionRuntime(engine=engine)
+        critic_results: Dict[str, Dict[str, Any]] = {
+            "research_quality": ResearchQualityCritic().evaluate(strategy, evidence_map.to_dict()).to_dict(),
+            "source_credibility": SourceCredibilityCritic().evaluate(evidence_map.to_dict()).to_dict(),
+        }
+        revisions: List[Dict[str, Any]] = []
+        for key, path in artifacts.items():
+            evaluator = None
+            critic_name = ""
+            if key.startswith("resume"):
+                critic_name, evaluator = "resume", ResumeCritic().evaluate
+            elif key.startswith("cover_letter"):
+                critic_name, evaluator = "cover_letter", CoverLetterCritic().evaluate
+            elif key.startswith("proposal"):
+                critic_name, evaluator = "grant_proposal", GrantProposalCritic().evaluate
+            elif key.startswith("executive_brief"):
+                critic_name, evaluator = "executive_brief", ExecutiveBriefCritic().evaluate
+            elif key.startswith("data_story"):
+                critic_name, evaluator = "data_story", DataStoryCritic().evaluate
+            elif key.startswith("presentation"):
+                critic_name, evaluator = "presentation", MissionPresentationCritic().evaluate
+            elif key.startswith("ui_spec"):
+                critic_name, evaluator = "uiux", MissionUIUXCritic().evaluate
+            elif key.startswith("dashboard"):
+                critic_name, evaluator = "uiux", MissionUIUXCritic().evaluate
+            elif key.startswith("code"):
+                critic_name, evaluator = "statistical_analysis", StatisticalAnalysisCritic().evaluate
+            elif key.startswith("job_tracker") and key.endswith("_csv"):
+                rows = self._read_csv_rows(path)
+                critic_results["job_fit"] = JobFitCritic().evaluate(rows).to_dict()
+                continue
+            if evaluator is None:
+                continue
+            revision = revision_runtime.revise_until_pass(
+                artifact_key=key,
+                artifact_path=path,
+                critic_name=critic_name,
+                evaluate=lambda text, fn=evaluator: fn(text),
+            )
+            critic_results[critic_name] = dict(revision.get("final_result", {}))
+            revisions.append(revision)
+        completion = MissionArtifactCompletionCritic().evaluate(mission.artifact_plan, artifacts).to_dict()
+        critic_results["completion"] = completion
+        summary = evidence_map.summary()
+        accepted_external = int(summary.get("accepted_external_count", 0) or 0)
+        accepted_primary = int(summary.get("accepted_primary_count", 0) or 0)
+        claims_supported = int(summary.get("claims_supported", 0) or 0)
+        thresholds = dict(strategy.get("minimum_evidence_threshold", {}) or {})
+        min_sources = int(thresholds.get("min_sources", 2) or 2)
+        min_claims = int(thresholds.get("min_supported_claims", 2) or 2)
+        min_primary = int(thresholds.get("min_primary_sources", 0) or 0)
+        failed = [name for name, payload in critic_results.items() if isinstance(payload, dict) and not bool(payload.get("passed", True))]
+        hard_failures = [name for name in failed if name not in {"research_quality", "source_credibility"}]
+        mission_status = "real_complete"
+        if hard_failures:
+            mission_status = "failed_validation"
+        elif accepted_external <= 0:
+            mission_status = "no_result_found_with_sufficient_search"
+        elif claims_supported < min_claims or accepted_external < min_sources or accepted_primary < min_primary:
+            mission_status = "real_partial"
+        final_package = {
+            "status": mission_status,
+            "summary": f"Mission {mission.mission_type} finished with status {mission_status}.",
+            "next_steps": (
+                ["Open the package artifacts.", "Review critic notes before circulation."]
+                if mission_status == "real_complete"
+                else ["Broaden source collection within mission scope.", "Do not circulate without stronger evidence."]
+            ),
+        }
+        recovery = {
+            "status": mission_status,
+            "reason": "Artifact critics failed." if hard_failures else ("Insufficient accepted external evidence." if mission_status != "real_complete" else "Mission package met the current quality and evidence bar."),
+            "strategy": "revision_runtime" if hard_failures else ("broaden_within_scope" if mission_status != "real_complete" else "none"),
+            "fallback_used": "none",
+        }
+        output_truth = {
+            "status": mission_status,
+            "real_evidence_sources": accepted_external,
+            "attempted_collection": True,
+            "reason": recovery["reason"],
+        }
+        critic_results_path = workspace / "mission_artifacts" / "critic_results.json"
+        critic_results_path.write_text(json.dumps(critic_results, indent=2), encoding="utf-8")
+        artifacts["critic_results_json"] = str(critic_results_path.resolve())
+        artifact_metadata["critic_results_json"] = {
+            "key": "critic_results_json",
+            "path": str(critic_results_path.resolve()),
+            "type": "spec",
+            "title": "Critic Results",
+            "evidence_summary": "Artifact-specific critic results and revision outcomes.",
+            "validation_state": "ready",
+            "created_at": critic_results_path.stat().st_mtime if critic_results_path.exists() else 0,
+        }
+        validation_summary_path = workspace / "mission_artifacts" / "validation_summary.md"
+        validation_summary_path.write_text(
+            "\n".join(
+                [
+                    "# Validation Summary",
+                    "",
+                    f"- Mission status: {mission_status}",
+                    f"- Output truth: {output_truth['status']}",
+                    f"- Accepted external evidence sources: {accepted_external}",
+                    f"- Claims supported: {claims_supported}",
+                    f"- Hard critic failures: {', '.join(hard_failures) if hard_failures else 'none'}",
+                    f"- Recovery strategy: {recovery['strategy']}",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        artifacts["validation_summary_md"] = str(validation_summary_path.resolve())
+        artifact_metadata["validation_summary_md"] = {
+            "key": "validation_summary_md",
+            "path": str(validation_summary_path.resolve()),
+            "type": "document",
+            "title": "Validation Summary",
+            "evidence_summary": "Mission-level truth, evidence, and critic validation summary.",
+            "validation_state": "ready",
+            "created_at": validation_summary_path.stat().st_mtime if validation_summary_path.exists() else 0,
+        }
+        outputs = {
+            "mission_contract": mission.to_dict(),
+            "research_strategy": strategy,
+            "evidence_map": evidence_map.to_dict(),
+            "artifact_plan": list(mission.artifact_plan),
+            "mission_status": mission_status,
+            "final_package": final_package,
+            "output_truth": output_truth,
+            "recovery": recovery,
+            "mission_critics": critic_results,
+            "revisions_performed": revisions,
+        }
+        return CapabilityExecutionResult(
+            outputs=outputs,
+            artifacts=artifacts,
+            artifact_metadata=artifact_metadata,
+            evidence=[f"accepted_external_sources={accepted_external}", f"claims_supported={claims_supported}"],
+            logs=[f"mission_status={mission_status}", f"mission_type={mission.mission_type}"],
+        )
+
+    def _read_csv_rows(self, path: str | Path) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        with Path(path).open("r", newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                if row:
+                    rows.append(dict(row))
+        return rows
+
+
+class TopicMasteryLearnExecutor(BaseCapabilityExecutor):
+    name = "topic_mastery_learn"
+    description = "Analyze a seed video or topic across multiple sources and build a reusable learned skill package."
+    input_schema = ["task_contract"]
+    output_schema = ["learn_mission", "source_discovery", "topic_model", "consensus_workflow", "learned_skill", "critic_results", "skill_validation", "status"]
+
+    def execute(self, context: Dict[str, Any], inputs: Dict[str, Any]) -> CapabilityExecutionResult:
+        task_contract = dict(inputs.get("task_contract", {}))
+        runtime_context = dict(context)
+        runtime_context["task_contract"] = task_contract
+        if not callable(runtime_context.get("source_collector")):
+            browser_worker_mode = str(context.get("browser_worker_mode", "local") or "local")
+            human_like_interaction = bool(context.get("human_like_interaction", False))
+
+            def _topic_source_collector(**kwargs: Any) -> Dict[str, Any]:
+                query = str(kwargs.get("query", "") or task_contract.get("user_goal", "")).strip()
+                return collect_generic_research(
+                    instruction=query,
+                    browser_worker_mode=browser_worker_mode,
+                    human_like_interaction=human_like_interaction,
+                )
+
+            runtime_context["source_collector"] = _topic_source_collector
+        runtime = TopicMasteryRuntime()
+        result = runtime.run(str(task_contract.get("user_goal", "")), context=runtime_context)
+        outputs = {
+            "learn_mission": dict(result.get("learn_mission", {}) or {}),
+            "source_discovery": dict(result.get("source_discovery", {}) or {}),
+            "video_analysis": dict(result.get("video_analysis", {}) or {}),
+            "topic_model": dict(result.get("topic_model", {}) or {}),
+            "consensus_workflow": list(result.get("consensus_workflow", []) or []),
+            "contradictions": list(result.get("contradictions", []) or []),
+            "best_practices": list(result.get("best_practices", []) or []),
+            "learned_skill": dict(result.get("learned_skill", {}) or {}),
+            "mastery_guide": dict(result.get("mastery_guide", {}) or {}),
+            "practice_plan": dict(result.get("practice_plan", {}) or {}),
+            "practice_preview": dict(result.get("practice_preview", {}) or {}),
+            "critic_results": dict(result.get("critic_results", {}) or {}),
+            "skill_validation": dict(result.get("skill_validation", {}) or {}),
+            "memory": dict(result.get("memory", {}) or {}),
+            "final_package": dict(result.get("final_package", {}) or {}),
+            "refresh_plan": dict(result.get("refresh_plan", {}) or {}),
+            "status": str(result.get("status", "")),
+        }
+        return CapabilityExecutionResult(
+            outputs=outputs,
+            artifacts=dict(result.get("artifacts", {}) or {}),
+            evidence=[
+                f"selected_sources={int((result.get('source_discovery', {}) or {}).get('selected', 0) or 0)}",
+                f"consensus_steps={len(list(result.get('consensus_workflow', []) or []))}",
+            ],
+            logs=[f"topic_mastery:{str((result.get('learn_mission', {}) or {}).get('topic', ''))}"],
         )
 
 
@@ -1097,7 +1427,10 @@ class ApprovalGateExecutor(BaseCapabilityExecutor):
 def default_executors() -> Dict[str, BaseCapabilityExecutor]:
     rows: Iterable[BaseCapabilityExecutor] = [
         DeepResearchExecutor(),
+        TopicMasteryLearnExecutor(),
         ResearchCollectionExecutor(),
+        MissionResearchExecutor(),
+        MissionWorkProductExecutor(),
         CompetitorResearchExecutor(),
         SourceEvaluationExecutor(),
         FileInspectionExecutor(),

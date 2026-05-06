@@ -61,6 +61,8 @@ from lam.operator_platform import (
     ExecutionGraphRuntime,
     HumanStyleReporter,
     MemoryStore,
+    MissionContractEngine,
+    MissionRuntime,
     PresentationCritic as PlatformPresentationCritic,
     SourceCritic as PlatformSourceCritic,
     StoryCritic as PlatformStoryCritic,
@@ -71,6 +73,7 @@ from lam.operator_platform import (
     default_capability_registry,
     default_executors,
 )
+from lam.learn.topic_mastery_runtime import TopicMasteryRuntime
 from lam.operator_platform.research_backend import (
     apply_human_judgment_quality_gate as platform_apply_human_judgment_quality_gate,
     build_recommendation_focus_query as platform_build_recommendation_focus_query,
@@ -1430,7 +1433,32 @@ def _is_clipboard_capture_intent(instruction: str) -> bool:
     has_clipboard = "clipboard" in low
     has_capture = any(token in low for token in ["capture", "grab", "save", "import", "paste"])
     has_visual = any(token in low for token in ["image", "screenshot", "png", "photo", "picture"])
-    return has_clipboard and (has_capture or has_visual)
+    has_macro_sequence = any(token in low for token in [" then ", "open ", "click ", "type ", "press ", "focus ", "switch to ", "scroll "])
+    return has_clipboard and (has_capture or has_visual) and not has_macro_sequence
+
+
+def _is_mission_runtime_intent(instruction: str) -> bool:
+    low = str(instruction or "").lower()
+    job_package = any(token in low for token in ["tailor my resume", "tailor resume", "cover letter", "application checklist"])
+    grant_package = "grant" in low and any(token in low for token in ["proposal", "eligibility", "submission checklist", "funder priorities", "rank them", "draft the top proposal", "grant tracker"])
+    executive_brief = (
+        any(token in low for token in ["executive briefing", "executive brief", "brief my vp", "brief leadership"])
+        or (any(token in low for token in ["market", "research", "recommendations"]) and any(token in low for token in ["brief", "briefing"]))
+    )
+    data_story = (
+        any(token in low for token in ["find the story", "data story", "build charts", "executive summary", "brief my vp"])
+        and any(token in low for token in ["dataset", "analyze", "analysis", "data"])
+    )
+    if (
+        _is_clipboard_capture_intent(instruction)
+        or _is_email_triage_intent(instruction)
+        or _is_payer_pricing_review_intent(instruction)
+        or _is_competitor_analysis_intent(instruction)
+        or _is_code_workbench_intent(instruction)
+        or (_is_job_research_intent(instruction) and not job_package)
+    ):
+        return False
+    return job_package or grant_package or executive_brief or data_story
 
 
 def _requested_outputs(instruction: str) -> Set[str]:
@@ -1568,6 +1596,8 @@ def _should_use_execution_graph_runtime(*, task_contract: Any, explicit_route: s
     explicit_editor = any(token in low for token in ["vscode", "vs code", "visual studio code", "workspace", "new instance"])
     if explicit_route == "artifact_generation":
         return False
+    if domain == "topic_learning":
+        return True
     if domain == "ui_build" and any(token in low for token in ui_tokens):
         return True
     if domain == "deep_analysis" and not explicit_editor:
@@ -1579,7 +1609,10 @@ def _runtime_plan_steps_from_graph(graph: Dict[str, Any]) -> List[Dict[str, Any]
     mapping = {
         "deep_research": ("research", "Compile the working brief", {"query": "task_contract"}),
         "research_collection": ("research", "Collect source evidence and candidate options", {"query": "search_results"}),
+        "mission_research": ("research", "Collect mission-scoped evidence", {"query": "mission_queries"}),
+        "topic_mastery_learn": ("learn", "Build topic mastery package", {"path": "workspace/learn_artifacts"}),
         "source_evaluation": ("research", "Score source quality", {"id": "source_scores"}),
+        "mission_work_product": ("produce", "Build mission work-product package", {"path": "workspace/mission_artifacts"}),
         "file_inspection": ("inspect", "Inspect workspace inputs", {"path": "workspace"}),
         "data_cleaning": ("transform", "Normalize structured rows", {"id": "clean_rows"}),
         "statistical_analysis": ("analyze", "Run analysis", {"id": "analysis_results"}),
@@ -2416,6 +2449,207 @@ def _finalize_operator_result(result: Dict[str, Any], instruction: str, plan_ste
     return attached
 
 
+def _run_mission_runtime(
+    instruction: str,
+    *,
+    ai_meta: Dict[str, Any],
+    progress_cb: Optional[Callable[[int, str], None]] = None,
+    browser_worker_mode: str = "local",
+    human_like_interaction: bool = False,
+) -> Dict[str, Any]:
+    _emit_progress(progress_cb, 12, "Building mission contract")
+    mission_engine = MissionContractEngine()
+    mission_contract = mission_engine.extract(instruction)
+    task_contract = TaskContractEngine().extract(instruction)
+    task_contract.mission_type = mission_contract.mission_type
+    task_contract.deliverable_mode = mission_contract.deliverable_mode
+    task_contract.requested_outputs = list(mission_contract.requested_outputs)
+
+    def _mission_source_collector(**kwargs: Any) -> Dict[str, Any]:
+        query = str(kwargs.get("query", "") or "").strip()
+        mission_instruction = str(kwargs.get("instruction", instruction) or instruction)
+        effective_instruction = query if query else mission_instruction
+        collected = platform_collect_generic_research(
+            instruction=effective_instruction,
+            browser_worker_mode=browser_worker_mode,
+            human_like_interaction=bool(human_like_interaction),
+        )
+        normalized_sources: List[Dict[str, Any]] = []
+        for row in list(collected.get("sources", []) or []):
+            if not isinstance(row, dict):
+                continue
+            normalized = dict(row)
+            normalized["source"] = str(row.get("source") or row.get("source_name") or row.get("company") or row.get("name") or "source")
+            normalized["source_type"] = str(row.get("source_type") or row.get("type") or row.get("source") or "reference")
+            normalized["url"] = str(row.get("url") or row.get("job_url") or row.get("url_or_path") or "")
+            normalized["title"] = str(row.get("title") or row.get("role_title") or row.get("name") or "")
+            normalized["snippet"] = str(row.get("snippet") or row.get("summary") or "")
+            normalized_sources.append(normalized)
+        if not normalized_sources:
+            for row in list(collected.get("search_results", []) or [])[:12]:
+                if not isinstance(row, dict):
+                    continue
+                normalized_sources.append(
+                    {
+                        "source": str(row.get("source", "search_result")),
+                        "source_type": str(row.get("source", "search_result")),
+                        "url": str(row.get("url", "")),
+                        "title": str(row.get("title", "")),
+                        "snippet": str(row.get("snippet", "")),
+                    }
+                )
+        return {
+            "sources": normalized_sources,
+            "search_results": list(collected.get("search_results", []) or []),
+            "query": str(collected.get("query", query)),
+            "error": str(collected.get("error", "")),
+            "ok": bool(collected.get("ok", False)),
+        }
+
+    workspace_slug = re.sub(r"[^a-z0-9]+", "_", instruction.lower()).strip("_")[:48] or "mission"
+    workspace_dir = Path("data/mission_runs") / f"{workspace_slug}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+    runtime_graph = CapabilityPlanner(registry=default_capability_registry()).plan(task_contract)
+    runtime_result = _run_execution_graph_runtime_path(
+        instruction=instruction,
+        task_contract=task_contract,
+        graph=runtime_graph,
+        ai_meta=ai_meta,
+        progress_cb=progress_cb,
+        artifact_reuse_mode="always_regenerate",
+        artifact_reuse_max_age_hours=1,
+        mode_override="mission_runtime",
+        extra_context={
+            "workspace_dir": str(workspace_dir),
+            "browser_worker_mode": browser_worker_mode,
+            "human_like_interaction": bool(human_like_interaction),
+            "source_collector": _mission_source_collector,
+        },
+    )
+    _emit_progress(progress_cb, 55, "Generating work products")
+    graph_dict = runtime_result.get("capability_execution_graph", {}) if isinstance(runtime_result.get("capability_execution_graph"), dict) else {}
+    mission_node = next((node for node in (graph_dict.get("nodes", []) or []) if str(node.get("capability", "")) == "mission_work_product"), {})
+    mission_outputs = dict(mission_node.get("output_payload", {}) or {})
+    artifacts = dict(runtime_result.get("artifacts", {}) or {})
+    mission_status = str(mission_outputs.get("mission_status", "") or "failed_execution")
+    passed = mission_status not in {"failed_validation", "failed_execution"}
+    verification_checks = [
+        {"name": "mission_contract_built", "pass": bool(mission_outputs.get("mission_contract") or mission_contract.to_dict())},
+        {"name": "artifact_plan_realized", "pass": bool(mission_outputs.get("artifact_plan") or mission_contract.artifact_plan) and bool(artifacts)},
+        {"name": "critic_revision_cycle_completed", "pass": bool(mission_outputs.get("mission_critics"))},
+        {"name": "truthful_status_assigned", "pass": bool(mission_status)},
+    ]
+    result = dict(runtime_result)
+    result.update(
+        {
+            "mode": "mission_runtime",
+            "runtime_mode": "execution_graph_runtime",
+            "mission_contract": dict(mission_outputs.get("mission_contract", mission_contract.to_dict()) or mission_contract.to_dict()),
+            "task_contract": task_contract.to_dict(),
+            "deliverable_mode": str(mission_outputs.get("mission_contract", {}).get("deliverable_mode", mission_contract.deliverable_mode) if isinstance(mission_outputs.get("mission_contract", {}), dict) else mission_contract.deliverable_mode),
+            "research_strategy": dict(mission_outputs.get("research_strategy", {}) or {}),
+            "evidence_map": dict(mission_outputs.get("evidence_map", {}) or {}),
+            "artifact_plan": list(mission_outputs.get("artifact_plan", mission_contract.artifact_plan) or mission_contract.artifact_plan),
+            "memory_context": dict(runtime_result.get("memory_context", {}) or {}),
+            "mission_status": mission_status,
+            "output_truth": dict(mission_outputs.get("output_truth", {}) or {}),
+            "recovery": dict(mission_outputs.get("recovery", {}) or {}),
+            "final_package": dict(mission_outputs.get("final_package", {}) or {}),
+            "revisions_performed": list(mission_outputs.get("revisions_performed", runtime_result.get("revisions_performed", [])) or runtime_result.get("revisions_performed", [])),
+            "critics": {"mission": dict(mission_outputs.get("mission_critics", {}) or {}), "platform": dict((runtime_result.get("critics", {}) or {}).get("platform", {}) if isinstance(runtime_result.get("critics", {}), dict) else {})},
+            "summary": {
+                "mission_type": mission_contract.mission_type,
+                "deliverable_mode": mission_contract.deliverable_mode,
+                "accepted_sources": int(((mission_outputs.get("evidence_map", {}) or {}).get("summary", {}) or {}).get("accepted_count", 0) or 0),
+                "accepted_external_sources": int(((mission_outputs.get("evidence_map", {}) or {}).get("summary", {}) or {}).get("accepted_external_count", 0) or 0),
+                "artifacts_created": len(artifacts),
+            },
+            "verification": {
+                "passed": passed,
+                "checks": verification_checks,
+                "evidence": [f"mission_status={mission_status}", f"artifacts={sorted(artifacts.keys())}"],
+            },
+            "verification_report": {
+                "final_verification": "passed" if passed else "failed",
+                "verification_checks": verification_checks,
+                "failed_checks": [item["name"] for item in verification_checks if not bool(item["pass"])],
+            },
+            "final_report": {
+                "status": mission_status,
+                "summary": str((mission_outputs.get("final_package", {}) or {}).get("summary", "Mission package prepared.")),
+                "outputs_created": [{"type": "file", "location": value, "description": key} for key, value in artifacts.items() if isinstance(value, str)],
+                "next_safe_action": "Open the package and review the critic results before external use.",
+            },
+            "canvas": {
+                "title": "Mission Package Ready" if passed else "Mission Package Needs Review",
+                "subtitle": mission_contract.mission_type,
+                "cards": [
+                    {"title": str(item.get("title", item.get("key", ""))), "price": str(item.get("validation_state", "ready")), "source": "artifact", "url": str(item.get("path", ""))}
+                    for item in list((runtime_result.get("artifact_metadata", {}) or {}).values())[:6]
+                    if isinstance(item, dict)
+                ],
+            },
+        }
+    )
+    result["ui_cards"] = build_platform_cards(result)
+    _emit_progress(progress_cb, 100, "Completed")
+    return result
+
+
+def _run_topic_mastery_learn_mode(
+    instruction: str,
+    *,
+    ai_meta: Dict[str, Any],
+    progress_cb: Optional[Callable[[int, str], None]] = None,
+) -> Dict[str, Any]:
+    _emit_progress(progress_cb, 10, "Building learn mission")
+    task_contract = TaskContractEngine().extract(instruction)
+    task_contract.domain = "topic_learning"
+    runtime_graph = CapabilityPlanner(registry=default_capability_registry()).plan(task_contract)
+    workspace_slug = re.sub(r"[^a-z0-9]+", "_", instruction.lower()).strip("_")[:48] or "topic_mastery"
+    workspace_dir = Path("data/learn_runs") / f"{workspace_slug}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+    runtime_result = _run_execution_graph_runtime_path(
+        instruction=instruction,
+        task_contract=task_contract,
+        graph=runtime_graph,
+        ai_meta=ai_meta,
+        progress_cb=progress_cb,
+        artifact_reuse_mode="always_regenerate",
+        artifact_reuse_max_age_hours=1,
+        mode_override="topic_mastery_learn_mode",
+        extra_context={"workspace_dir": str(workspace_dir)},
+    )
+    graph_dict = runtime_result.get("capability_execution_graph", {}) if isinstance(runtime_result.get("capability_execution_graph"), dict) else {}
+    learn_node = next((node for node in (graph_dict.get("nodes", []) or []) if str(node.get("capability", "")) == "topic_mastery_learn"), {})
+    learn_outputs = dict(learn_node.get("output_payload", {}) or {})
+    result = dict(runtime_result)
+    result.update(
+        {
+            "mode": "topic_mastery_learn_mode",
+            "runtime_mode": "execution_graph_runtime",
+            "learn_mission": dict(learn_outputs.get("learn_mission", {}) or {}),
+            "source_discovery": dict(learn_outputs.get("source_discovery", {}) or {}),
+            "video_analysis": dict(learn_outputs.get("video_analysis", {}) or {}),
+            "topic_model": dict(learn_outputs.get("topic_model", {}) or {}),
+            "consensus_workflow": list(learn_outputs.get("consensus_workflow", []) or []),
+            "contradictions": list(learn_outputs.get("contradictions", []) or []),
+            "learned_skill": dict(learn_outputs.get("learned_skill", {}) or {}),
+            "learned_skill_library": dict(learn_outputs.get("learned_skill_library", {}) or {}),
+            "mastery_guide": dict(learn_outputs.get("mastery_guide", {}) or {}),
+            "practice_plan": dict(learn_outputs.get("practice_plan", {}) or {}),
+            "practice_preview": dict(learn_outputs.get("practice_preview", {}) or {}),
+            "refresh_plan": dict(learn_outputs.get("refresh_plan", {}) or {}),
+            "critic_results": dict(learn_outputs.get("critic_results", {}) or {}),
+            "skill_validation": dict(learn_outputs.get("skill_validation", {}) or {}),
+            "memory": dict(learn_outputs.get("memory", {}) or {}),
+            "status": str(learn_outputs.get("status", "real_partial") or "real_partial"),
+            "final_package": dict(learn_outputs.get("final_package", {}) or {}),
+        }
+    )
+    result["ui_cards"] = build_platform_cards(result)
+    _emit_progress(progress_cb, 100, "Completed")
+    return result
+
+
 def _build_run_narration(out: Dict[str, Any], playbook: Dict[str, Any]) -> List[str]:
     lines: List[str] = []
     pb_name = str(playbook.get("name", "General Operator Playbook")).strip()
@@ -2512,6 +2746,22 @@ def execute_instruction(
         result["ui_cards"] = build_platform_cards(result)
         _emit_progress(progress_cb, 100, "Completed")
         return result
+
+    if _is_topic_mastery_intent(normalized):
+        return _run_topic_mastery_learn_mode(
+            instruction=instruction,
+            ai_meta=ai_meta,
+            progress_cb=progress_cb,
+        )
+
+    if _is_mission_runtime_intent(normalized):
+        return _run_mission_runtime(
+            instruction=instruction,
+            ai_meta=ai_meta,
+            progress_cb=progress_cb,
+            browser_worker_mode=browser_worker_mode,
+            human_like_interaction=False,
+        )
 
     if _should_use_execution_graph_runtime(task_contract=task_contract, explicit_route=explicit_route, instruction=normalized):
         runtime_graph = CapabilityPlanner(registry=default_capability_registry()).plan(task_contract)
@@ -5323,6 +5573,21 @@ def _gmail_login_required(page: Any) -> bool:
     except Exception:
         return True
     return False
+
+
+def _is_topic_mastery_intent(instruction: str) -> bool:
+    low = str(instruction or "").lower()
+    learn_markers = [
+        "learn how to",
+        "get well versed",
+        "mastery guide",
+        "reusable playbook",
+        "learned skill",
+        "seed video",
+        "topic only",
+    ]
+    source_markers = ["youtube", "tutorial", "video url", "watch this video", "related videos", "supporting sources"]
+    return any(token in low for token in learn_markers) and any(token in low for token in source_markers)
 
 
 def _gmail_try_login_with_vault(page: Any, account: str) -> Dict[str, Any]:

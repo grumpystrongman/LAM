@@ -253,8 +253,12 @@ class MemoryStore:
         item_keys = item.get("invalidation_keys", {}) if isinstance(item.get("invalidation_keys"), dict) else {}
         task_keys = task_contract.get("invalidation_keys", {}) if isinstance(task_contract.get("invalidation_keys"), dict) else {}
         for key in ["geography", "domain", "audience"]:
-            item_value = str(item_keys.get(key, "")).strip().lower()
-            task_value = str(task_keys.get(key, "")).strip().lower()
+            if key == "geography":
+                item_value = str(item_keys.get("geography", item_keys.get("location", ""))).strip().lower()
+                task_value = str(task_keys.get("geography", task_keys.get("location", ""))).strip().lower()
+            else:
+                item_value = str(item_keys.get(key, "")).strip().lower()
+                task_value = str(task_keys.get(key, "")).strip().lower()
             if item_value and task_value and item_value != task_value:
                 return f"conflicts on {key}"
         return ""
@@ -264,7 +268,9 @@ class MemoryStore:
         task_keys = task_contract.get("invalidation_keys", {}) if isinstance(task_contract.get("invalidation_keys"), dict) else {}
         item_keys = item.get("invalidation_keys", {}) if isinstance(item.get("invalidation_keys"), dict) else {}
         for key in ["domain", "geography", "audience"]:
-            if str(item_keys.get(key, "")).strip().lower() == str(task_keys.get(key, "")).strip().lower() and str(task_keys.get(key, "")).strip():
+            item_value = item_keys.get("geography", item_keys.get("location", "")) if key == "geography" else item_keys.get(key, "")
+            task_value = task_keys.get("geography", task_keys.get("location", "")) if key == "geography" else task_keys.get(key, "")
+            if str(item_value).strip().lower() == str(task_value).strip().lower() and str(task_value).strip():
                 score += 0.3
         hay = json.dumps(item.get("content", {})).lower() + " " + " ".join(str(x).lower() for x in (item.get("tags", []) or []))
         for token in [t for t in str(query or "").lower().split() if len(t) > 3][:8]:

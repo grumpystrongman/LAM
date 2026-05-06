@@ -40,7 +40,10 @@ class CapabilityRegistry:
 def default_capability_registry() -> CapabilityRegistry:
     rows = [
         ("deep_research", "Collect and synthesize multi-source evidence.", ["task_contract"], ["research_notes"], ["browser", "search"], "medium"),
+        ("topic_mastery_learn", "Analyze a seed video or topic across multiple sources and build a reusable learned skill package.", ["task_contract"], ["learned_skill"], ["browser", "search", "filesystem"], "medium"),
         ("research_collection", "Collect search results, browser notes, and recommendation evidence for a research task.", ["task_contract"], ["research_notes"], ["browser", "search"], "medium"),
+        ("mission_research", "Collect mission-scoped evidence for professional work products such as jobs, grants, and executive briefs.", ["task_contract"], ["mission_research"], ["browser", "search"], "medium"),
+        ("mission_work_product", "Build mission-scoped professional artifacts with evidence mapping and revision.", ["task_contract"], ["mission_package"], ["filesystem", "language"], "medium"),
         ("competitor_research", "Research and rank competitor evidence for a target market.", ["task_contract"], ["research_notes"], ["browser", "search"], "medium"),
         ("source_evaluation", "Score source credibility and fit.", ["research_notes"], ["source_scores"], ["critic"], "low"),
         ("web_browse", "Interact with browser targets and collect observations.", ["url", "query"], ["browser_notes"], ["browser", "playwright"], "medium"),

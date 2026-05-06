@@ -60,8 +60,7 @@ def run_human_operator_suite(
     started_at = time.time()
     all_scenarios = _load_scenarios(Path(scenarios_path))
     scenarios = _select_suite_scenarios(all_scenarios, suite=suite)
-    root = Path(artifacts_root).resolve()
-    root.mkdir(parents=True, exist_ok=True)
+    root = _prepare_artifacts_root(Path(artifacts_root), suite=suite)
 
     runs: List[ScenarioRun] = []
     for s in scenarios:
@@ -140,6 +139,17 @@ def run_human_operator_suite(
     report_path.write_text(json.dumps(out, indent=2), encoding="utf-8")
     out["report_path"] = str(report_path)
     return out
+
+
+def _prepare_artifacts_root(path: Path, *, suite: str) -> Path:
+    root = path.resolve()
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+    except PermissionError:
+        fallback = (Path("data") / "test_artifacts" / f"{suite}_suite_fallback").resolve()
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
 
 
 def _select_suite_scenarios(scenarios: List[Dict[str, Any]], *, suite: str) -> List[Dict[str, Any]]:

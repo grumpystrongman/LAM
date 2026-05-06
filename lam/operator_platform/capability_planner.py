@@ -5,12 +5,14 @@ from typing import Dict, List
 
 from .capability_registry import CapabilityRegistry, default_capability_registry
 from .execution_graph import ExecutionGraph, ExecutionNode
+from .mission_contract import MissionContractEngine
 from .task_contract_engine import TaskContract
 
 
 class CapabilityPlanner:
     def __init__(self, registry: CapabilityRegistry | None = None) -> None:
         self.registry = registry or default_capability_registry()
+        self.mission_contract_engine = MissionContractEngine()
 
     def plan(self, contract: TaskContract) -> ExecutionGraph:
         sequence = self._sequence_for_contract(contract)
@@ -48,6 +50,12 @@ class CapabilityPlanner:
 
     def _sequence_for_contract(self, contract: TaskContract) -> List[str]:
         outputs = set(contract.requested_outputs)
+        mission_type = str(getattr(contract, "mission_type", "") or "")
+        if not mission_type:
+            try:
+                mission_type = str(self.mission_contract_engine.extract(contract.user_goal).mission_type)
+            except Exception:
+                mission_type = ""
         if contract.domain == "artifact_generation":
             sequence = ["deep_research", "report_build", "stakeholder_summary"]
             if "presentation" in outputs:
@@ -60,8 +68,14 @@ class CapabilityPlanner:
         if contract.domain == "generic_research":
             sequence = ["research_collection", "source_evaluation", "artifact_export"]
             return self._dedupe(sequence)
+        if contract.domain == "topic_learning":
+            sequence = ["topic_mastery_learn"]
+            return self._dedupe(sequence)
         if contract.domain == "competitor_analysis":
             sequence = ["competitor_research", "source_evaluation", "data_storytelling", "presentation_build", "report_build", "stakeholder_summary", "artifact_export"]
+            return self._dedupe(sequence)
+        if mission_type in {"job_search_package", "grant_application_package", "executive_research_brief", "data_storytelling"}:
+            sequence = ["mission_research", "mission_work_product"]
             return self._dedupe(sequence)
         sequence: List[str] = ["deep_research", "source_evaluation"]
         if contract.domain in {"payer_pricing_review", "deep_analysis"}:
@@ -94,8 +108,11 @@ class CapabilityPlanner:
 
     def _dependencies_for(self, capability: str, capability_nodes: Dict[str, str]) -> List[str]:
         dependency_order = {
-            "source_evaluation": ["deep_research", "research_collection", "competitor_research"],
+            "source_evaluation": ["deep_research", "research_collection", "mission_research", "competitor_research"],
+            "topic_mastery_learn": [],
             "research_collection": [],
+            "mission_research": [],
+            "mission_work_product": ["mission_research", "statistical_analysis", "data_visualization"],
             "competitor_research": [],
             "file_inspection": ["deep_research"],
             "data_cleaning": ["deep_research"],
@@ -107,12 +124,12 @@ class CapabilityPlanner:
             "code_test": ["code_write"],
             "code_fix": ["code_test"],
             "data_storytelling": ["statistical_analysis", "deep_research", "competitor_research"],
-            "report_build": ["data_storytelling", "statistical_analysis", "deep_research", "competitor_research", "code_fix"],
+            "report_build": ["data_storytelling", "statistical_analysis", "deep_research", "competitor_research", "mission_research", "code_fix"],
             "stakeholder_summary": ["report_build", "data_storytelling"],
             "presentation_build": ["data_storytelling"],
-            "spreadsheet_build": ["statistical_analysis"],
+            "spreadsheet_build": ["statistical_analysis", "mission_research"],
             "ui_build": ["data_visualization", "data_storytelling", "deep_research"],
-            "artifact_export": ["report_build", "stakeholder_summary", "presentation_build", "spreadsheet_build", "ui_build", "rag_build", "code_write", "research_collection", "competitor_research"],
+            "artifact_export": ["report_build", "stakeholder_summary", "presentation_build", "spreadsheet_build", "ui_build", "rag_build", "code_write", "research_collection", "mission_research", "competitor_research"],
             "approval_gate": ["artifact_export"],
         }
         wanted = dependency_order.get(capability, [])

@@ -4,6 +4,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
+from lam.interface.learned_recipe import RecipeCritic, RecipeMemory, build_learned_recipe, recipe_to_instruction
+from lam.interface.teach_runtime import DemonstrationSegmenter, ScreenObservationStream, TeachReplayRuntime
+
 
 @dataclass(slots=True)
 class TeachEvent:
@@ -19,28 +22,54 @@ class TeachRecorder:
     events: List[TeachEvent] = field(default_factory=list)
     compression_window_seconds: float = 1.0
     compression_mode: str = "normal"
+    recipe_memory: RecipeMemory = field(default_factory=RecipeMemory)
+    observation_stream: ScreenObservationStream = field(default_factory=ScreenObservationStream)
+    segmenter: DemonstrationSegmenter = field(default_factory=DemonstrationSegmenter)
+    replay_runtime: TeachReplayRuntime = field(default_factory=TeachReplayRuntime)
+    last_result: Dict[str, Any] = field(default_factory=dict)
 
     def start(self, app_name: str) -> Dict[str, Any]:
         self.recording = True
         self.app_name = (app_name or "").strip().lower()
         self.events = []
+        self.last_result = {}
         return {"ok": True, "recording": self.recording, "app_name": self.app_name}
 
     def stop(self) -> Dict[str, Any]:
         self.recording = False
         compressed = self._compress_events(self.events)
         instruction = self._to_instruction(compressed)
-        return {
+        observation_frames = self.observation_stream.build(app_name=self.app_name, compressed_events=compressed)
+        observation_segments = self.segmenter.segment(observation_frames)
+        recipe = build_learned_recipe(
+            self.app_name,
+            compressed,
+            observation_frames=observation_frames,
+            observation_segments=observation_segments,
+        )
+        recipe_critic = RecipeCritic().evaluate(recipe)
+        recipe_path = self.recipe_memory.save(recipe)
+        replay_plan = self.replay_runtime.build_plan(recipe=recipe)
+        result = {
             "ok": True,
             "recording": self.recording,
             "app_name": self.app_name,
             "instruction": instruction,
+            "adaptive_instruction": recipe_to_instruction(recipe),
             "events": [self._event_to_dict(e) for e in self.events],
             "compressed_events": compressed,
+            "observation_frames": observation_frames,
+            "observation_segments": observation_segments,
             "step_count": len(compressed),
             "raw_event_count": len(self.events),
             "compression_mode": self.compression_mode,
+            "learned_recipe": recipe.to_dict(),
+            "recipe_critic": recipe_critic.to_dict(),
+            "recipe_path": recipe_path,
+            "replay_plan": replay_plan,
         }
+        self.last_result = result
+        return result
 
     def set_compression_mode(self, mode: str) -> Dict[str, Any]:
         value = (mode or "normal").strip().lower()
@@ -62,10 +91,29 @@ class TeachRecorder:
         return self._push("wait", {"seconds": max(1, int(seconds))})
 
     def state(self) -> Dict[str, Any]:
+        recipe = dict(self.last_result.get("learned_recipe", {}) or {})
+        critic = dict(self.last_result.get("recipe_critic", {}) or {})
+        replay = dict(self.last_result.get("replay_plan", {}) or {})
         return {
+            "active": self.recording,
             "recording": self.recording,
             "app_name": self.app_name,
+            "event_count": len(self.events),
             "events": [self._event_to_dict(e) for e in self.events],
+            "last_recipe": {
+                "recipe_id": recipe.get("recipe_id", ""),
+                "learned_goal": recipe.get("learned_goal", ""),
+                "confidence": recipe.get("confidence", 0.0),
+                "required_inputs": list(recipe.get("required_inputs", []) or []),
+                "success_signals": list(recipe.get("success_signals", []) or []),
+                "state_snapshots": list(recipe.get("state_snapshots", []) or []),
+                "critic_passed": bool(critic.get("passed", False)),
+                "critic_score": critic.get("score", 0.0),
+                "autorun_ready": bool(replay.get("can_autorun", False)),
+                "missing_inputs": list(replay.get("missing_inputs", []) or []),
+                "recipe_path": self.last_result.get("recipe_path", ""),
+            },
+            "last_segments": list(self.last_result.get("observation_segments", []) or []),
         }
 
     def _push(self, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:

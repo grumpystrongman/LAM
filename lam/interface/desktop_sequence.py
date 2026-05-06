@@ -10,6 +10,7 @@ from lam.adapters.uia_adapter import UIAAdapter
 from lam.interface.app_launcher import normalize_app_name, open_installed_app
 from lam.interface.clipboard_capture import capture_clipboard_image
 from lam.interface.password_vault import LocalPasswordVault
+from lam.interface.teach_runtime import TeachReplayRuntime
 
 
 @dataclass(slots=True)
@@ -151,6 +152,7 @@ def execute_plan(
     artifacts: Dict[str, str] = {}
     index = start_index
     last_visual_point: Dict[str, int] | None = None
+    app_hint = str(plan.get("app_name", "") or "")
 
     while index < len(steps):
         step = steps[index]
@@ -175,18 +177,136 @@ def execute_plan(
             elif action == "focus_window":
                 adapter.focus_window(step.get("selector", {}))
                 trace.append({"step": index, "action": action, "ok": True})
+            elif action == "assert_visible":
+                try:
+                    adapter.assert_visible(step.get("selector", {}), timeout_ms=int(step.get("timeout_ms", 2500) or 2500))
+                    trace.append({"step": index, "action": action, "ok": True, "optional": bool(step.get("optional", False))})
+                except Exception as exc:
+                    if bool(step.get("optional", False)):
+                        trace.append({"step": index, "action": action, "ok": False, "optional": True, "warning": str(exc)})
+                    else:
+                        trace.append({"step": index, "action": action, "ok": False, "error": str(exc)})
+                        return SequenceResult(False, steps, trace, index, False, False, "", artifacts, str(exc))
+            elif action == "assert_state":
+                selectors = [dict(item or {}) for item in list(step.get("candidate_selectors", []) or []) if isinstance(item, dict)]
+                description = str(step.get("description", "") or "")
+                last_error = ""
+                matched_selector: Dict[str, Any] | None = None
+                live_state_before = _safe_capture_live_state(adapter, app_hint=app_hint)
+                if not selectors:
+                    trace.append({"step": index, "action": action, "ok": False, "optional": bool(step.get("optional", False)), "warning": "no candidate selectors", "live_state_before": live_state_before})
+                    if not bool(step.get("optional", False)):
+                        return SequenceResult(False, steps, trace, index, False, False, "", artifacts, str(step.get("recovery_hint", "") or "missing state selectors"))
+                else:
+                    for selector_index, selector in enumerate(selectors):
+                        try:
+                            adapter.assert_visible(selector, timeout_ms=int(step.get("timeout_ms", 2200) or 2200))
+                            matched_selector = selector
+                            live_state_after = _safe_capture_live_state(adapter, app_hint=app_hint)
+                            trace.append(
+                                {
+                                    "step": index,
+                                    "action": action,
+                                    "ok": True,
+                                    "phase": step.get("phase", ""),
+                                    "source_index": step.get("source_index", -1),
+                                    "segment_index": step.get("segment_index", -1),
+                                    "checkpoint_id": step.get("checkpoint_id", ""),
+                                    "checkpoint_name": step.get("checkpoint_name", ""),
+                                    "selector_index": selector_index,
+                                    "description": description,
+                                    "selector": selector,
+                                    "live_state_before": live_state_before,
+                                    "live_state_after": live_state_after,
+                                }
+                            )
+                            last_error = ""
+                            break
+                        except Exception as exc:
+                            last_error = str(exc)
+                    if last_error and matched_selector is None:
+                        if bool(step.get("optional", False)):
+                            trace.append(
+                                {
+                                    "step": index,
+                                    "action": action,
+                                    "ok": False,
+                                    "optional": True,
+                                    "phase": step.get("phase", ""),
+                                    "source_index": step.get("source_index", -1),
+                                    "segment_index": step.get("segment_index", -1),
+                                    "checkpoint_id": step.get("checkpoint_id", ""),
+                                    "checkpoint_name": step.get("checkpoint_name", ""),
+                                    "warning": last_error,
+                                    "description": description,
+                                    "live_state_before": live_state_before,
+                                }
+                            )
+                        else:
+                            trace.append({"step": index, "action": action, "ok": False, "error": last_error, "description": description, "phase": step.get("phase", ""), "source_index": step.get("source_index", -1), "segment_index": step.get("segment_index", -1), "checkpoint_id": step.get("checkpoint_id", ""), "checkpoint_name": step.get("checkpoint_name", ""), "live_state_before": live_state_before})
+                            return SequenceResult(
+                                False,
+                                steps,
+                                trace,
+                                index,
+                                False,
+                                False,
+                                "",
+                                artifacts,
+                                str(step.get("recovery_hint", "") or last_error),
+                            )
             elif action == "click":
-                adapter.click(step.get("selector", {}))
-                trace.append({"step": index, "action": action, "ok": True})
+                selectors = [dict(step.get("selector", {}) or {})]
+                selectors.extend(dict(item or {}) for item in list(step.get("fallback_selectors", []) or []))
+                last_error = ""
+                for selector_index, selector in enumerate(selectors):
+                    try:
+                        adapter.click(selector)
+                        trace.append(
+                            {
+                                "step": index,
+                                "action": action,
+                                "ok": True,
+                                "selector_index": selector_index,
+                                "selector": selector,
+                                "expected_state": step.get("expected_state", ""),
+                            }
+                        )
+                        last_error = ""
+                        break
+                    except Exception as exc:
+                        last_error = str(exc)
+                        trace.append(
+                            {
+                                "step": index,
+                                "action": action,
+                                "ok": False,
+                                "selector_index": selector_index,
+                                "selector": selector,
+                                "warning": str(exc),
+                            }
+                        )
+                if last_error:
+                    return SequenceResult(
+                        False,
+                        steps,
+                        trace,
+                        index,
+                        False,
+                        False,
+                        "",
+                        artifacts,
+                        str(step.get("recovery_hint", "") or last_error),
+                    )
             elif action == "type_text":
                 adapter.type({}, step.get("text", ""))
-                trace.append({"step": index, "action": action, "ok": True})
+                trace.append({"step": index, "action": action, "ok": True, "expected_state": step.get("expected_state", "")})
             elif action == "hotkey":
                 adapter.hotkey(step.get("keys", ""))
-                trace.append({"step": index, "action": action, "ok": True})
+                trace.append({"step": index, "action": action, "ok": True, "expected_state": step.get("expected_state", "")})
             elif action == "wait":
                 adapter.wait_for({"strategy": "noop", "value": ""}, timeout_ms=int(step.get("seconds", 1) * 1000))
-                trace.append({"step": index, "action": action, "ok": True})
+                trace.append({"step": index, "action": action, "ok": True, "expected_state": step.get("expected_state", "")})
             elif action == "scroll":
                 adapter.scroll(step.get("direction", "down"), int(step.get("amount", 1)))
                 trace.append({"step": index, "action": action, "ok": True})
@@ -254,3 +374,54 @@ def execute_plan(
             return SequenceResult(True, steps, trace, index, False, False, "Step mode checkpoint.", artifacts)
 
     return SequenceResult(True, steps, trace, index, True, False, "", artifacts)
+
+
+def build_plan_from_recipe(
+    recipe: Dict[str, Any],
+    *,
+    input_bindings: Dict[str, Any] | None = None,
+    current_state: Dict[str, Any] | None = None,
+    is_family: bool = False,
+    resume_from_source_index: int | None = None,
+    resume_from_segment_index: int | None = None,
+    resume_from_checkpoint_id: str = "",
+) -> Dict[str, Any]:
+    runtime = TeachReplayRuntime()
+    preview = runtime.build_plan(
+        family=recipe if is_family else None,
+        recipe=None if is_family else recipe,
+        input_bindings=input_bindings or {},
+        current_state=current_state or {},
+        resume_from_source_index=resume_from_source_index,
+        resume_from_segment_index=resume_from_segment_index,
+        resume_from_checkpoint_id=resume_from_checkpoint_id,
+    )
+    plan = {
+        "instruction": str(preview.get("learned_goal", "") or recipe.get("learned_goal", "Learned taught workflow")),
+        "app_name": str(preview.get("app_name", "") or recipe.get("app_name", "")),
+        "steps": list(preview.get("steps", []) or []),
+        "checkpoint_after_open": False,
+        "learned_recipe_id": str(preview.get("recipe_id", "") or recipe.get("recipe_id", "")),
+        "preconditions": list(preview.get("preconditions", []) or []),
+        "success_signals": list(preview.get("success_signals", []) or []),
+        "state_snapshots": list(preview.get("state_snapshots", []) or []),
+        "state_checks": list(preview.get("state_checks", []) or []),
+        "resume_from_source_index": resume_from_source_index,
+        "resume_from_segment_index": resume_from_segment_index,
+        "resume_from_checkpoint_id": resume_from_checkpoint_id,
+        "can_autorun": bool(preview.get("can_autorun", False)),
+        "pause_reason": str(preview.get("pause_reason", "") or ""),
+        "missing_inputs": list(preview.get("missing_inputs", []) or []),
+        "confidence": float(preview.get("confidence", 0.0) or 0.0),
+    }
+    return {"ok": True, "plan": plan, "preview": preview}
+
+
+def _safe_capture_live_state(adapter: UIAAdapter, app_hint: str = "") -> Dict[str, Any]:
+    try:
+        state = adapter.capture_live_state(app_hint=app_hint, max_candidates=8)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        return {"ok": False, "error": str(exc), "app_name": str(app_hint or "").strip().lower(), "visible_labels": [], "selector_values": []}
+    if not isinstance(state, dict):
+        return {"ok": False, "error": "invalid_live_state", "app_name": str(app_hint or "").strip().lower(), "visible_labels": [], "selector_values": []}
+    return state

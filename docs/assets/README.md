@@ -1,7 +1,9 @@
-# Branding Assets
+# Assets
 
-Place the provided project logo image at:
+This folder contains product-facing documentation assets.
 
-- `docs/assets/openlamb-logo.png`
+## Included
 
-The main README references this file directly.
+- `openlamb-logo.png`: primary logo used by the UI and README
+- `ui-command-center.png`: current desktop command-center screenshot
+- `ui-mobile.png`: compact/mobile layout screenshot

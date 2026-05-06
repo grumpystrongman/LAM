@@ -204,6 +204,48 @@
       "prompt": "Design and build a clean chat-first commercial assistant UI instead of a debug dashboard.",
       "environment_setup": "Existing UI codebase available",
       "required_outputs": ["ui_spec", "artifact_viewer", "canvas_layout"]
+    },
+    {
+      "scenario_id": "M1",
+      "scenario_name": "Mission Runtime Job Package",
+      "prompt": "Find 5 senior data/AI leadership roles I should apply for, build a tracker, tailor my resume to the top 2, and draft cover letters.",
+      "environment_setup": "No prior job artifacts; user profile memory may exist",
+      "required_outputs": ["job_tracker", "resume", "cover_letter", "application_checklist", "critic_revisions"]
+    },
+    {
+      "scenario_id": "M2",
+      "scenario_name": "Mission Runtime Grant Package",
+      "prompt": "Find grants for a healthcare analytics AI project, rank them, and draft the top proposal.",
+      "environment_setup": "No prior grant artifacts; web research allowed if sources are available",
+      "required_outputs": ["grant_tracker", "proposal", "submission_checklist", "critic_revisions"]
+    },
+    {
+      "scenario_id": "M3",
+      "scenario_name": "Mission Runtime Executive Brief",
+      "prompt": "Research the market for AI desktop agents and build an executive briefing with recommendations.",
+      "environment_setup": "No prior brief artifacts",
+      "required_outputs": ["executive_brief", "presentation", "evidence_map", "critic_revisions"]
+    },
+    {
+      "scenario_id": "M4",
+      "scenario_name": "Mission Runtime Data Story",
+      "prompt": "Analyze this dataset, find the story, build charts, and create an executive summary.",
+      "environment_setup": "Dataset and dictionary available locally",
+      "required_outputs": ["data_story", "dashboard", "executive_brief", "caveats"]
+    },
+    {
+      "scenario_id": "M5",
+      "scenario_name": "Mission Runtime UI Build",
+      "prompt": "Redesign the OpenLAMb UI into a commercial chat/canvas assistant and implement it.",
+      "environment_setup": "Existing UI codebase and tests available",
+      "required_outputs": ["ui_spec", "code", "uiux_revision", "smoke_checks"]
+    },
+    {
+      "scenario_id": "L1",
+      "scenario_name": "Topic Mastery Learn Mode",
+      "prompt": "Learn how to build a Power BI KPI dashboard. Start with this video URL: https://youtube.example/powerbi-seed. Find related videos and supporting sources, synthesize the best workflow, build a reusable OpenLAMb skill, create a mastery guide, and practice safely.",
+      "environment_setup": "Mocked tutorial video, related videos, and supporting sources available for offline analysis",
+      "required_outputs": ["source_manifest", "video_analysis_notes", "topic_model", "consensus_workflow", "learned_skill", "mastery_guide", "practice_plan", "critic_results"]
     }
   ]
 }

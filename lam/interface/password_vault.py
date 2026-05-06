@@ -161,19 +161,38 @@ class LocalPasswordVault:
                 tags = _parse_tags(row["tags_json"])
                 if tag and tag.lower() not in tags:
                     continue
-                entry = VaultEntry(
-                    id=row["id"],
-                    service=row["service"],
-                    username=unprotect_text(row["username_enc"]),
-                    password="",
-                    notes="",
-                    tags=tags,
-                    favorite=bool(row["favorite"]),
-                    created_ts=float(row["created_ts"]),
-                    updated_ts=float(row["updated_ts"]),
-                    last_used_ts=float(row["last_used_ts"]),
-                )
-                out.append(entry.redacted())
+                try:
+                    entry = VaultEntry(
+                        id=row["id"],
+                        service=row["service"],
+                        username=unprotect_text(row["username_enc"]),
+                        password="",
+                        notes="",
+                        tags=tags,
+                        favorite=bool(row["favorite"]),
+                        created_ts=float(row["created_ts"]),
+                        updated_ts=float(row["updated_ts"]),
+                        last_used_ts=float(row["last_used_ts"]),
+                    )
+                    out.append(entry.redacted())
+                except Exception:
+                    # Keep the vault usable even if one entry can no longer be unprotected
+                    # in the current Windows session.
+                    out.append(
+                        {
+                            "id": row["id"],
+                            "service": row["service"],
+                            "username_masked": "<unavailable>",
+                            "password_masked": "***",
+                            "notes_present": False,
+                            "tags": tags,
+                            "favorite": bool(row["favorite"]),
+                            "created_ts": float(row["created_ts"]),
+                            "updated_ts": float(row["updated_ts"]),
+                            "last_used_ts": float(row["last_used_ts"]),
+                            "unavailable": True,
+                        }
+                    )
         return out
 
     def get_entry(self, entry_id: str, include_secret: bool = False) -> Dict[str, Any]:

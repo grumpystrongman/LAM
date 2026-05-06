@@ -16,6 +16,8 @@ class TaskContract:
     audience: str
     geography: str
     timeframe: str
+    mission_type: str = ""
+    deliverable_mode: str = ""
     constraints: List[str] = field(default_factory=list)
     requested_outputs: List[str] = field(default_factory=list)
     required_artifacts: List[str] = field(default_factory=list)
@@ -114,7 +116,11 @@ class TaskContractEngine:
         for key, value in contract.invalidation_keys.items():
             if not str(value).strip():
                 continue
-            existing = str(meta.get("invalidation_keys", {}).get(key, meta.get(key, existing_scope.get(key, "")))).strip().lower()
+            if key == "geography":
+                existing_raw = meta.get("invalidation_keys", {}).get(key, meta.get(key, existing_scope.get("geography", existing_scope.get("location", ""))))
+            else:
+                existing_raw = meta.get("invalidation_keys", {}).get(key, meta.get(key, existing_scope.get(key, "")))
+            existing = str(existing_raw).strip().lower()
             if existing and existing != str(value).strip().lower():
                 return False
         return True
@@ -132,6 +138,8 @@ class TaskContractEngine:
             return "email_triage"
         if any(token in low for token in ["linkedin", "indeed", "job board", "job boards", "salary", "vp of data", "vp data", "avp data"]):
             return "job_market"
+        if any(token in low for token in ["youtube", "tutorial", "video url", "well versed", "mastery guide", "reusable playbook"]) and "learn" in low:
+            return "topic_learning"
         if any(token in low for token in ["competitor", "competitors", "oracle health", "epic systems", "market landscape"]):
             return "competitor_analysis"
         if any(
@@ -408,6 +416,8 @@ class TaskContractEngine:
                 invalidation_keys[key] = "|".join(str(item) for item in value)
             elif value not in {"", None}:
                 invalidation_keys[key] = str(value)
+        if str(scope_dimensions.get("location", "")).strip() and "geography" not in invalidation_keys:
+            invalidation_keys["geography"] = str(scope_dimensions.get("location", "")).strip()
         for key in ["account", "file_target", "project_id", "risk_level"]:
             value = str(context.get(key, "")).strip()
             if value:

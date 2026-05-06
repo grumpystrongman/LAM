@@ -185,6 +185,8 @@ def _looks_concrete_target(target: str) -> bool:
         return True
     if t.startswith("type:") and len(t) > 7:
         return True
+    if t.startswith("source:") and len(t) > 9:
+        return True
     if t.startswith("selector:") and len(t) > 11:
         return True
     if t.startswith("app:") and len(t) > 4:
