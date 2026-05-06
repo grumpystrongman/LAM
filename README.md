@@ -276,7 +276,12 @@ If you want to improve OpenLAMb, the fastest path is:
 3. fix the behavior in the capability/runtime layer, not just prompt text
 4. update the relevant guide in `docs/`
 
-## Licensing Status
+## License
 
-This repository does not currently ship a finalized license file.
-Treat the codebase as review-only until licensing terms are explicitly added.
+OpenLAMb is licensed under the Business Source License 1.1.
+
+- non-production, non-commercial use is permitted
+- commercial use, production use, hosted service use, or redistribution for commercial gain requires a separate commercial license
+- on February 25, 2030, the project changes to `GPL-2.0-or-later`
+
+See [LICENSE](LICENSE) for the full terms.

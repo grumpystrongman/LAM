@@ -34,6 +34,10 @@ This documentation library is organized by the way people actually adopt OpenLAM
 - [Implementation Blueprint](IMPLEMENTATION_BLUEPRINT.md)
 - [Implementation Phases](IMPLEMENTATION_PHASES.md)
 
+## Licensing
+
+- [Repository License](..\LICENSE)
+
 ## Domain-Specific Reference
 
 - [Payer RAG](PAYER_RAG.md)
