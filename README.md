@@ -71,32 +71,59 @@ OpenLAMb is designed around five product principles:
 
 ## Quick Start
 
-### 1. Install
+### 1. Easiest Windows install
+
+Open PowerShell in the OpenLAMb folder and run these commands one line at a time.
+
+If `py` works on your machine, use this:
+
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\python -m pip install --upgrade pip
+.\.venv\Scripts\python -m pip install -e .
+```
+
+If `py` does not work, use this instead:
 
 ```powershell
 python -m venv .venv
-.venv\Scripts\activate
-pip install -e .
+.\.venv\Scripts\python -m pip install --upgrade pip
+.\.venv\Scripts\python -m pip install -e .
 ```
 
-### 2. Optional Windows automation/runtime packages
+Why this is simpler:
+- no PowerShell activation step
+- no multiline copy/paste needed
+- every command runs directly through the virtual environment
+
+### 2. Verify the install
 
 ```powershell
-pip install pywinauto pynput pyautogui opencv-python pillow pytesseract
+.\.venv\Scripts\python -m lam.main --help
 ```
 
-### 3. Start the UI
+You should see the OpenLAMb CLI help.
+
+### 3. Optional Windows automation/runtime packages
+
+```powershell
+.\.venv\Scripts\python -m pip install pywinauto pynput pyautogui opencv-python pillow pytesseract
+```
+
+These are recommended if you want stronger desktop automation and OCR support.
+
+### 4. Start the UI
 
 Foreground:
 
 ```powershell
-python -m lam.main ui
+.\.venv\Scripts\python -m lam.main ui
 ```
 
 Detached background launch:
 
 ```powershell
-python -m lam.main ui --background --port 8814
+.\.venv\Scripts\python -m lam.main ui --background --port 8814
 ```
 
 Then open:
@@ -105,7 +132,13 @@ Then open:
 http://127.0.0.1:8795
 ```
 
-### 4. Run a first task
+If you used `--port 8814`, open:
+
+```text
+http://127.0.0.1:8814
+```
+
+### 5. Run a first task
 
 Examples:
 
@@ -126,43 +159,43 @@ Create a new VS Code workspace for this task, write analysis code, add smoke tes
 Global help:
 
 ```powershell
-python -m lam.main --help
+.\.venv\Scripts\python -m lam.main --help
 ```
 
 Start UI:
 
 ```powershell
-python -m lam.main ui --help
+.\.venv\Scripts\python -m lam.main ui --help
 ```
 
 Run Topic Mastery:
 
 ```powershell
-python -m lam.main topic-learn --instruction "Learn how to build a Power BI KPI dashboard" --seed-url https://youtube.com/example --output json
+.\.venv\Scripts\python -m lam.main topic-learn --instruction "Learn how to build a Power BI KPI dashboard" --seed-url https://youtube.com/example --output json
 ```
 
 List learned skills:
 
 ```powershell
-python -m lam.main skill-list --output json
+.\.venv\Scripts\python -m lam.main skill-list --output json
 ```
 
 Preview safe practice:
 
 ```powershell
-python -m lam.main skill-practice-preview --skill-id skill_power_bi_kpi_dashboard --output json
+.\.venv\Scripts\python -m lam.main skill-practice-preview --skill-id skill_power_bi_kpi_dashboard --output json
 ```
 
 Run safe practice:
 
 ```powershell
-python -m lam.main skill-practice-run --skill-id skill_power_bi_kpi_dashboard --output json
+.\.venv\Scripts\python -m lam.main skill-practice-run --skill-id skill_power_bi_kpi_dashboard --output json
 ```
 
 Refresh a learned skill:
 
 ```powershell
-python -m lam.main skill-refresh --skill-id skill_power_bi_kpi_dashboard --version 1.0 --output json
+.\.venv\Scripts\python -m lam.main skill-refresh --skill-id skill_power_bi_kpi_dashboard --version 1.0 --output json
 ```
 
 ## Product Workflows

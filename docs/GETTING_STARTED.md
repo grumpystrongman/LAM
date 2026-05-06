@@ -7,18 +7,43 @@ Minimum:
 - Python 3.11+
 - local browser access for web automation
 
-Recommended optional packages:
+## Easiest Install For PowerShell Users
+
+Run these commands one line at a time from the OpenLAMb folder.
+
+Preferred:
 
 ```powershell
-pip install pywinauto pynput pyautogui opencv-python pillow pytesseract
+py -3.11 -m venv .venv
+.\.venv\Scripts\python -m pip install --upgrade pip
+.\.venv\Scripts\python -m pip install -e .
 ```
 
-## Install
+If `py` is not available:
 
 ```powershell
 python -m venv .venv
-.venv\Scripts\activate
-pip install -e .
+.\.venv\Scripts\python -m pip install --upgrade pip
+.\.venv\Scripts\python -m pip install -e .
+```
+
+This avoids the usual PowerShell pain points:
+- no activate script required
+- no multiline command blocks
+- no need to remember whether the shell is using the right Python
+
+## Verify It Works
+
+```powershell
+.\.venv\Scripts\python -m lam.main --help
+```
+
+If that prints the CLI help, the install is good.
+
+## Optional Desktop Automation Packages
+
+```powershell
+.\.venv\Scripts\python -m pip install pywinauto pynput pyautogui opencv-python pillow pytesseract
 ```
 
 ## Launch the UI
@@ -26,19 +51,25 @@ pip install -e .
 Standard:
 
 ```powershell
-python -m lam.main ui
+.\.venv\Scripts\python -m lam.main ui
 ```
 
 Detached background launch:
 
 ```powershell
-python -m lam.main ui --background --port 8814
+.\.venv\Scripts\python -m lam.main ui --background --port 8814
 ```
 
 Open the local URL printed by the CLI, usually:
 
 ```text
 http://127.0.0.1:8795
+```
+
+If you used `--port 8814`, open:
+
+```text
+http://127.0.0.1:8814
 ```
 
 ## Your First 10 Minutes
