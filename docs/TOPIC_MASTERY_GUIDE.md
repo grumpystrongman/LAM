@@ -6,11 +6,17 @@ It supports two entry modes:
 - topic-only
 - seed video or source URL
 
+For full multimodal setup (Whisper, Tesseract, yt-dlp) and screenshots, see:
+- [Multimodal Video Learning Setup](MULTIMODAL_VIDEO_LEARNING_SETUP_GUIDE.md)
+
 ## What It Produces
 
 A normal Topic Mastery run can produce:
 - `source_manifest.csv`
 - `video_analysis_notes.md`
+- `video_process_state.json`
+- `follow_up_questions.md`
+- `learning_memory_index.json`
 - `topic_model.md`
 - `consensus_workflow.md`
 - `learned_skill.json`

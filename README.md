@@ -154,6 +154,15 @@ Research the market for AI desktop agents and build an executive briefing with r
 Create a new VS Code workspace for this task, write analysis code, add smoke tests, and leave me a runnable scaffold.
 ```
 
+## Multimodal Video Learning Setup (With Screenshots)
+
+To enable commercial-quality video learning (Whisper + Tesseract + yt-dlp), use:
+- [Multimodal Video Learning Setup](docs/MULTIMODAL_VIDEO_LEARNING_SETUP_GUIDE.md)
+
+Preview:
+
+![Multimodal setup verification](docs/assets/multimodal-video-setup-real/06_real_artifact_list.png)
+
 ## CLI Quick Reference
 
 Global help:
@@ -243,6 +252,7 @@ Start here:
 - [CLI Guide](docs/CLI_GUIDE.md)
 - [Teach Mode Guide](docs/TEACH_MODE_GUIDE.md)
 - [Topic Mastery Guide](docs/TOPIC_MASTERY_GUIDE.md)
+- [Multimodal Video Learning Setup](docs/MULTIMODAL_VIDEO_LEARNING_SETUP_GUIDE.md)
 - [Examples Library](docs/EXAMPLES.md)
 - [Troubleshooting](docs/TROUBLESHOOTING.md)
 

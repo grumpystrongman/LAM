@@ -3,12 +3,10 @@ from __future__ import annotations
 import sqlite3
 from typing import Any, Dict, List
 
-from lam.operator_platform.memory_store import MemoryStore
-
 
 class LearnMemory:
-    def __init__(self, store: MemoryStore | None = None) -> None:
-        self.store = store or MemoryStore()
+    def __init__(self, store: Any | None = None) -> None:
+        self.store = store or _default_memory_store()
         self._ensure_store()
 
     def save_topic(self, payload: Dict[str, Any]) -> str:
@@ -60,3 +58,9 @@ class LearnMemory:
         init = getattr(self.store, "_init_db", None)
         if callable(init):
             init()
+
+
+def _default_memory_store():
+    from lam.operator_platform.memory_store import MemoryStore
+
+    return MemoryStore()

@@ -8,12 +8,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
 
-from lam.operator_platform.memory_store import MemoryStore
-
 from .frame_sampler import sample_frames
 from .learn_memory import LearnMemory
 from .mastery_guide_builder import build_mastery_guide
 from .models import LearnMission
+from .multimodal_video_runtime import MultimodalVideoRuntime
 from .multi_source_synthesizer import MultiSourceSynthesizer
 from .procedure_extractor import build_highlights, extract_procedure, extract_topic_concepts, procedure_steps_to_dict
 from .related_source_discovery import discover_related_sources
@@ -29,9 +28,11 @@ from .visual_observer import observe_frames
 
 
 class TopicMasteryRuntime:
-    def __init__(self, memory_store: MemoryStore | None = None) -> None:
-        self.memory = LearnMemory(memory_store or MemoryStore())
+    def __init__(self, memory_store: Any | None = None) -> None:
+        self._memory_store = memory_store or _default_memory_store()
+        self.memory = LearnMemory(self._memory_store)
         self.skill_library = SkillLibrary()
+        self.video_runtime = MultimodalVideoRuntime(memory_store=self._memory_store)
 
     def run(self, instruction: str, *, context: Dict[str, Any] | None = None) -> Dict[str, Any]:
         ctx = dict(context or {})
@@ -44,12 +45,12 @@ class TopicMasteryRuntime:
         discovery_summary = adapter_summary(discovered)
         ranked = SourceRanker().rank(mission.topic, discovered)
         selected = self._select_sources(mission, ranked)
-        analyses = [self._analyze_source(mission.topic, item) for item in selected]
+        analyses = [self._analyze_source(mission.topic, item, workspace=workspace, context=ctx) for item in selected]
         synthesis = MultiSourceSynthesizer().synthesize(mission.topic, analyses)
         critics = self._run_critics(selected, analyses, synthesis)
         if any(not bool(v.get("passed", True)) for v in critics.values() if isinstance(v, dict)):
             selected = self._revise_source_set(selected, ranked)
-            analyses = [self._analyze_source(mission.topic, item) for item in selected]
+            analyses = [self._analyze_source(mission.topic, item, workspace=workspace, context=ctx) for item in selected]
             synthesis = MultiSourceSynthesizer().synthesize(mission.topic, analyses)
             critics = self._run_critics(selected, analyses, synthesis)
         skill = build_skill(mission.topic, synthesis, selected)
@@ -97,6 +98,8 @@ class TopicMasteryRuntime:
                 "transcript_coverage": round(sum(float(a.get("transcript", {}).get("coverage", 0.0) or 0.0) for a in analyses if a.get("source_type") == "video") / max(1, len([a for a in analyses if a.get("source_type") == "video"])), 3),
                 "visual_sampling_coverage": sum(len(list(a.get("sampled_frames", []) or [])) for a in analyses if a.get("source_type") == "video"),
                 "key_timestamps": [ts for a in analyses for ts in list(a.get("key_timestamps", []) or [])][:12],
+                "process_checkpoints": sum(len(list((a.get("process_state", {}) or {}).get("phases", []) or [])) for a in analyses if a.get("source_type") == "video"),
+                "follow_up_questions": [q for a in analyses for q in list((a.get("follow_up_questions", {}) or {}).get("questions", []) or [])][:20],
                 "confidence": float(synthesis.get("confidence", 0.0) or 0.0),
             },
             "topic_model": dict(synthesis.get("topic_model", {}) or {}),
@@ -156,15 +159,22 @@ class TopicMasteryRuntime:
             row["rank"] = idx
         return selected
 
-    def _analyze_source(self, topic: str, source: Dict[str, object]) -> Dict[str, object]:
+    def _analyze_source(self, topic: str, source: Dict[str, object], *, workspace: Path, context: Dict[str, Any]) -> Dict[str, object]:
         stype = str(source.get("source_type", "other") or "other")
         payload = ingest_video_source(str(source.get("source_url", "")), source) if stype == "video" else dict(source)
-        transcript = extract_transcript(payload)
-        frames = sample_frames(str(transcript.get("text", "")), list(payload.get("visual_notes", []) or [])) if stype == "video" else []
-        observations = observe_frames(payload, frames) if stype == "video" else []
-        steps = extract_procedure(payload, str(transcript.get("text", "") or payload.get("snippet", "")), observations)
-        concepts = extract_topic_concepts(topic, str(transcript.get("text", "") or payload.get("snippet", "")), str(source.get("title", "")))
-        highlights = build_highlights(str(transcript.get("text", "") or payload.get("snippet", "")), str(source.get("title", "")))
+        multimodal: Dict[str, Any] = {}
+        if stype == "video":
+            multimodal = self.video_runtime.analyze(topic=topic, source=payload, workspace=workspace, context=context)
+        transcript = dict(multimodal.get("transcript", {}) or extract_transcript(payload))
+        frames = list(multimodal.get("sampled_frames", []) or sample_frames(str(transcript.get("text", "")), list(payload.get("visual_notes", []) or []))) if stype == "video" else []
+        observations = list(multimodal.get("visual_observations", []) or observe_frames(payload, frames)) if stype == "video" else []
+        inferred_text = str(multimodal.get("inferred_process_text", "") or "")
+        analysis_text = str(transcript.get("text", "") or payload.get("snippet", ""))
+        if inferred_text:
+            analysis_text = f"{analysis_text}\n{inferred_text}".strip()
+        steps = extract_procedure(payload, analysis_text, observations)
+        concepts = extract_topic_concepts(topic, analysis_text, str(source.get("title", "")))
+        highlights = build_highlights(analysis_text, str(source.get("title", "")))
         return {
             "source_url": str(source.get("source_url", "")),
             "title": str(source.get("title", "")),
@@ -178,7 +188,13 @@ class TopicMasteryRuntime:
             "tools": concepts.get("tools", []),
             "prerequisites": concepts.get("prerequisites", []),
             "variations": concepts.get("variations", []),
-            "key_timestamps": [str(item.get("timestamp", "")) for item in frames[:6]],
+            "key_timestamps": [str(item.get("timestamp", "")) for item in list(multimodal.get("sampled_frames", []) or frames)[:12]],
+            "process_state": dict(multimodal.get("process_state", {}) or {}),
+            "follow_up_questions": dict(multimodal.get("follow_up_questions", {}) or {}),
+            "chunk_reports": list(multimodal.get("chunk_reports", []) or []),
+            "learning_memory_refs": list(multimodal.get("learning_memory_refs", []) or []),
+            "process_state_path": str(multimodal.get("process_state_path", "") or ""),
+            "local_video_path": str(multimodal.get("local_video_path", "") or ""),
         }
 
     def _run_critics(self, selected: List[Dict[str, object]], analyses: List[Dict[str, object]], synthesis: Dict[str, object]) -> Dict[str, Dict[str, object]]:
@@ -254,8 +270,17 @@ class TopicMasteryRuntime:
             notes_lines.append(f"- Source type: {analysis.get('source_type','')}")
             notes_lines.append(f"- Transcript method: {(analysis.get('transcript',{}) or {}).get('method','')}")
             notes_lines.append(f"- Transcript coverage: {(analysis.get('transcript',{}) or {}).get('coverage','')}")
+            chunk_reports = list(analysis.get("chunk_reports", []) or [])
+            if chunk_reports:
+                notes_lines.append(f"- Chunk count: {len(chunk_reports)}")
+            process_state = dict(analysis.get("process_state", {}) or {})
+            phase_count = len(list(process_state.get("phases", []) or []))
+            if phase_count:
+                notes_lines.append(f"- Process checkpoints: {phase_count}")
             for obs in list(analysis.get("visual_observations", []) or [])[:5]:
                 notes_lines.append(f"- {obs.get('timestamp','')}: {obs.get('workflow_stage','')} | {obs.get('ui_elements','')}")
+            for question in list((analysis.get("follow_up_questions", {}) or {}).get("questions", [])[:4]):
+                notes_lines.append(f"- Follow-up: {question}")
             notes_lines.append("")
         notes_path.write_text("\n".join(notes_lines), encoding="utf-8")
         artifacts["video_analysis_notes_md"] = str(notes_path.resolve())
@@ -293,6 +318,52 @@ class TopicMasteryRuntime:
         timeline_rows = [f"<li>{analysis.get('title','source')} - {', '.join(list(analysis.get('key_timestamps', []) or [])[:5])}</li>" for analysis in analyses]
         timeline_path.write_text(f"<html><body><h1>Visual Timeline</h1><ul>{''.join(timeline_rows)}</ul></body></html>", encoding="utf-8")
         artifacts["visual_timeline_html"] = str(timeline_path.resolve())
+        process_path = out / "video_process_state.json"
+        process_payload = {
+            "videos": [
+                {
+                    "title": str(analysis.get("title", "")),
+                    "source_url": str(analysis.get("source_url", "")),
+                    "process_state": dict(analysis.get("process_state", {}) or {}),
+                    "chunk_reports": list(analysis.get("chunk_reports", []) or []),
+                    "process_state_path": str(analysis.get("process_state_path", "")),
+                }
+                for analysis in analyses
+                if str(analysis.get("source_type", "")) == "video"
+            ]
+        }
+        process_path.write_text(json.dumps(process_payload, indent=2), encoding="utf-8")
+        artifacts["video_process_state_json"] = str(process_path.resolve())
+        follow_up_path = out / "follow_up_questions.md"
+        follow_lines = ["# Follow-up Questions", ""]
+        for analysis in analyses:
+            title = str(analysis.get("title", "video"))
+            questions = list((analysis.get("follow_up_questions", {}) or {}).get("questions", []) or [])
+            queries = list((analysis.get("follow_up_questions", {}) or {}).get("research_queries", []) or [])
+            if not questions and not queries:
+                continue
+            follow_lines.append(f"## {title}")
+            for item in questions[:8]:
+                follow_lines.append(f"- Question: {item}")
+            for item in queries[:8]:
+                follow_lines.append(f"- Research query: {item}")
+            follow_lines.append("")
+        follow_up_path.write_text("\n".join(follow_lines).strip() + "\n", encoding="utf-8")
+        artifacts["follow_up_questions_md"] = str(follow_up_path.resolve())
+        memory_index_path = out / "learning_memory_index.json"
+        memory_index_payload = {
+            "items": [
+                {
+                    "title": str(analysis.get("title", "")),
+                    "source_url": str(analysis.get("source_url", "")),
+                    "learning_memory_refs": list(analysis.get("learning_memory_refs", []) or []),
+                }
+                for analysis in analyses
+                if list(analysis.get("learning_memory_refs", []) or [])
+            ]
+        }
+        memory_index_path.write_text(json.dumps(memory_index_payload, indent=2), encoding="utf-8")
+        artifacts["learning_memory_index_json"] = str(memory_index_path.resolve())
         return artifacts
 
     def _workspace_dir(self, instruction: str, context: Dict[str, Any]) -> Path:
@@ -338,3 +409,9 @@ def _extract_topic(text: str, seed_url: str) -> str:
 def _default_next_review_at(confidence_score: float) -> str:
     days = 3 if confidence_score < 0.6 else (7 if confidence_score < 0.85 else 14)
     return datetime.fromtimestamp(time.time() + (days * 86400)).isoformat(timespec="seconds")
+
+
+def _default_memory_store():
+    from lam.operator_platform.memory_store import MemoryStore
+
+    return MemoryStore()

@@ -18,6 +18,7 @@ This documentation library is organized by the way people actually adopt OpenLAM
 
 - [Teach Mode Guide](TEACH_MODE_GUIDE.md)
 - [Topic Mastery Guide](TOPIC_MASTERY_GUIDE.md)
+- [Multimodal Video Learning Setup](MULTIMODAL_VIDEO_LEARNING_SETUP_GUIDE.md)
 
 ## Operations and Reliability
 

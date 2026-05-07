@@ -109,7 +109,8 @@ def _term_in_text(text: str, term: str) -> bool:
     escaped = re.escape(str(term or "").strip().lower())
     if not escaped:
         return False
-    pattern = rf"(?<![a-z0-9]){escaped.replace('_', r'[\s_\-]+')}(?![a-z0-9])"
+    sep_pattern = r"[\s_\-]+"
+    pattern = rf"(?<![a-z0-9]){escaped.replace('_', sep_pattern)}(?![a-z0-9])"
     return re.search(pattern, str(text or "").lower()) is not None
 
 

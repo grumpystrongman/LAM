@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import shutil
@@ -145,12 +146,14 @@ def workbench_create(args: argparse.Namespace) -> None:
 
 
 def topic_learn(args: argparse.Namespace) -> None:
+    mock_sources = _load_mock_sources_csv(args.sources_csv)
     runtime = TopicMasteryRuntime()
     context = {
         "workspace_dir": args.workspace,
         "topic": args.topic or "",
         "seed_url": args.seed_url or "",
         "skill_library_root": args.skill_root,
+        "mock_sources": mock_sources,
     }
     result = runtime.run(args.instruction, context=context)
     _print_result(result, output_format=args.output)
@@ -247,6 +250,42 @@ def _add_output_arg(parser: argparse.ArgumentParser, default: str = "text") -> N
         default=default,
         help="Choose human-readable text or machine-readable JSON output",
     )
+
+
+def _load_mock_sources_csv(path_value: str) -> list[dict[str, object]]:
+    path_str = str(path_value or "").strip()
+    if not path_str:
+        return []
+    path = Path(path_str)
+    if not path.exists():
+        raise FileNotFoundError(f"sources CSV not found: {path}")
+    rows: list[dict[str, object]] = []
+    with path.open("r", encoding="utf-8", errors="ignore", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            source_url = str(row.get("source_url", "") or row.get("url", "") or "").strip()
+            title = str(row.get("title", "") or "").strip()
+            if not source_url:
+                continue
+            source_type = str(row.get("source_type", "") or "").strip().lower() or "other"
+            channel = str(row.get("channel", "") or "").strip()
+            snippet = str(row.get("snippet", "") or "").strip()
+            upload_date = str(row.get("upload_date", "") or "").strip()
+            captions_text = str(row.get("captions", "") or "").strip()
+            payload: dict[str, object] = {
+                "source_url": source_url,
+                "title": title or source_url,
+                "source_type": source_type,
+                "channel": channel,
+                "snippet": snippet,
+                "upload_date": upload_date,
+                "discovery_mode": "imported_csv",
+                "live_collected": True,
+            }
+            if captions_text:
+                payload["captions"] = {"auto": captions_text}
+            rows.append(payload)
+    return rows
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -424,6 +463,11 @@ def build_parser() -> argparse.ArgumentParser:
     topic_parser.add_argument("--seed-url", default="", help="Optional seed video/source URL")
     topic_parser.add_argument("--workspace", default="data/learn_cli_run", help="Workspace for generated learn artifacts")
     topic_parser.add_argument("--skill-root", default="data/learned_skills", help="Versioned learned-skill library root")
+    topic_parser.add_argument(
+        "--sources-csv",
+        default="",
+        help="Optional CSV of verified sources (columns: source_url,title,source_type,channel,snippet,upload_date,captions)",
+    )
     _add_output_arg(topic_parser, default="text")
     topic_parser.set_defaults(func=topic_learn)
 
