@@ -2623,13 +2623,53 @@ def _run_topic_mastery_learn_mode(
     graph_dict = runtime_result.get("capability_execution_graph", {}) if isinstance(runtime_result.get("capability_execution_graph"), dict) else {}
     learn_node = next((node for node in (graph_dict.get("nodes", []) or []) if str(node.get("capability", "")) == "topic_mastery_learn"), {})
     learn_outputs = dict(learn_node.get("output_payload", {}) or {})
+    learn_mission_payload = dict(learn_outputs.get("learn_mission", {}) or {})
+    source_discovery_payload = dict(learn_outputs.get("source_discovery", {}) or {})
+    status = str(learn_outputs.get("status", "real_partial") or "real_partial")
+    artifacts = dict(runtime_result.get("artifacts", {}) or {})
+    source_rows = [item for item in list(source_discovery_payload.get("sources", []) or []) if isinstance(item, dict)]
+    selected_sources = [item for item in source_rows if bool(item.get("selected", False))]
+    if not selected_sources:
+        selected_count = int(source_discovery_payload.get("selected", 0) or 0)
+        if selected_count > 0:
+            selected_sources = source_rows[:selected_count]
+    input_mode = str(learn_mission_payload.get("input_mode", "")).strip().lower()
+    seed_url = str(learn_mission_payload.get("seed_url", "")).strip()
+    selected_urls = {str(item.get("source_url", "")).strip() for item in selected_sources if str(item.get("source_url", "")).strip()}
+    seed_ingested = (input_mode != "seed_video") or (bool(seed_url) and (seed_url in selected_urls))
+    transcript_coverage = float((learn_outputs.get("video_analysis", {}) or {}).get("transcript_coverage", 0.0) or 0.0)
+    runtime_evidence = bool(artifacts) and (
+        transcript_coverage > 0.0
+        or int((learn_outputs.get("video_analysis", {}) or {}).get("visual_sampling_coverage", 0) or 0) > 0
+        or bool(list(learn_outputs.get("consensus_workflow", []) or []))
+    )
+    real_sources = [
+        item
+        for item in selected_sources
+        if str(item.get("source_url", "")).strip().startswith(("http://", "https://"))
+        and str(item.get("source_url", "")).strip().lower().startswith(("http://", "https://"))
+        and str(item.get("source_type", "")).strip().lower() not in {"instruction", "user_context", "memory", "synthetic_fixture"}
+    ]
+    real_source_count = len(real_sources)
+    attempted_collection = int(source_discovery_payload.get("found", 0) or 0) > 0 or int(source_discovery_payload.get("selected", 0) or 0) > 0
+    verification_checks = [
+        {"name": "seed_ingested", "pass": bool(seed_ingested), "evidence": [f"input_mode={input_mode or 'unknown'}", f"seed_url_present={bool(seed_url)}"]},
+        {"name": "runtime_evidence", "pass": bool(runtime_evidence), "evidence": [f"transcript_coverage={round(transcript_coverage, 3)}", f"artifacts={len(artifacts)}"]},
+        {"name": "real_sources", "pass": real_source_count > 0, "evidence": [f"real_source_count={real_source_count}", f"selected_source_count={len(selected_sources)}"]},
+    ]
+    passed = bool(seed_ingested) and bool(runtime_evidence) and real_source_count > 0 and status in {"real_complete", "real_partial"}
+    verification_line = (
+        f"learning verification: seed ingested={'yes' if seed_ingested else 'no'} | "
+        f"runtime evidence={'yes' if runtime_evidence else 'no'} | "
+        f"real sources={'yes' if real_source_count > 0 else 'no'}"
+    )
     result = dict(runtime_result)
     result.update(
         {
             "mode": "topic_mastery_learn_mode",
             "runtime_mode": "execution_graph_runtime",
-            "learn_mission": dict(learn_outputs.get("learn_mission", {}) or {}),
-            "source_discovery": dict(learn_outputs.get("source_discovery", {}) or {}),
+            "learn_mission": learn_mission_payload,
+            "source_discovery": source_discovery_payload,
             "video_analysis": dict(learn_outputs.get("video_analysis", {}) or {}),
             "topic_model": dict(learn_outputs.get("topic_model", {}) or {}),
             "consensus_workflow": list(learn_outputs.get("consensus_workflow", []) or []),
@@ -2643,8 +2683,43 @@ def _run_topic_mastery_learn_mode(
             "critic_results": dict(learn_outputs.get("critic_results", {}) or {}),
             "skill_validation": dict(learn_outputs.get("skill_validation", {}) or {}),
             "memory": dict(learn_outputs.get("memory", {}) or {}),
-            "status": str(learn_outputs.get("status", "real_partial") or "real_partial"),
+            "status": status,
             "final_package": dict(learn_outputs.get("final_package", {}) or {}),
+            "verification": {
+                "passed": passed,
+                "checks": verification_checks,
+                "evidence": [verification_line, f"status={status}"],
+            },
+            "verification_report": {
+                "final_verification": "passed" if passed else "failed",
+                "verification_checks": verification_checks,
+                "failed_checks": [item["name"] for item in verification_checks if not bool(item["pass"])],
+            },
+            "output_truth": {
+                "status": status if real_source_count > 0 else "no_result_found_with_sufficient_search",
+                "real_evidence_sources": real_source_count,
+                "attempted_collection": attempted_collection,
+                "reason": (
+                    "Learn package includes real source evidence."
+                    if real_source_count > 0
+                    else "No real source evidence was accepted; treat this as guidance-only until stronger sources are added."
+                ),
+            },
+            "source_status": {
+                **(dict(runtime_result.get("source_status", {}) or {}) if isinstance(runtime_result.get("source_status", {}), dict) else {}),
+                "learning_verification": verification_line,
+            },
+            "summary": {
+                **(dict(runtime_result.get("summary", {}) or {}) if isinstance(runtime_result.get("summary", {}), dict) else {}),
+                "seed_ingested": bool(seed_ingested),
+                "runtime_evidence": bool(runtime_evidence),
+                "real_sources": real_source_count,
+            },
+            "canvas": {
+                "title": "Capability Graph Completed" if passed else "Capability Graph Needs Review",
+                "subtitle": verification_line,
+                "cards": list((runtime_result.get("canvas", {}) or {}).get("cards", []))[:6] if isinstance(runtime_result.get("canvas", {}), dict) else [],
+            },
         }
     )
     result["ui_cards"] = build_platform_cards(result)

@@ -299,6 +299,13 @@ class TestTopicMasteryLearnMode(unittest.TestCase):
         self.assertEqual(result["mode"], "topic_mastery_learn_mode")
         self.assertEqual(result["runtime_mode"], "execution_graph_runtime")
         self.assertIn("learned_skill", result)
+        self.assertIn("verification", result)
+        check_names = {str(item.get("name", "")) for item in list((result.get("verification", {}) or {}).get("checks", []) or []) if isinstance(item, dict)}
+        self.assertTrue({"seed_ingested", "runtime_evidence", "real_sources"}.issubset(check_names))
+        self.assertIn("output_truth", result)
+        self.assertGreaterEqual(int((result.get("output_truth", {}) or {}).get("real_evidence_sources", 0) or 0), 1)
+        self.assertTrue(bool((result.get("output_truth", {}) or {}).get("attempted_collection", False)))
+        self.assertIn("learning_verification", dict(result.get("source_status", {}) or {}))
 
     def test_acceptance_scenarios_include_topic_mastery_benchmark(self) -> None:
         payload = json.loads(Path("config/human_operator_scenarios.json").read_text(encoding="utf-8"))
