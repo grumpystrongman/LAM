@@ -795,7 +795,16 @@ class RAGBuildExecutor(BaseCapabilityExecutor):
         notes = dict(inputs.get("research_notes", {}))
         analysis = dict(inputs.get("analysis_results", {}))
         documents = [str(notes.get("summary", ""))] + [str(x) for x in (analysis.get("findings") or [])[:5]]
-        index = {"kind": "lexical_stub", "documents": [x for x in documents if x]}
+        normalized_docs = [x for x in documents if x]
+        term_index: Dict[str, int] = {}
+        for doc in normalized_docs:
+            for token in re.findall(r"[a-z0-9_]{3,}", doc.lower()):
+                term_index[token] = term_index.get(token, 0) + 1
+        index = {
+            "kind": "lexical_term_index",
+            "documents": normalized_docs,
+            "term_counts": term_index,
+        }
         return CapabilityExecutionResult(outputs={"rag_index": index}, evidence=[f"indexed {len(index['documents'])} document(s)"])
 
 

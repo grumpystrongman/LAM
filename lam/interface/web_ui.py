@@ -69,6 +69,8 @@ class UiState:
     artifact_reuse_max_age_hours: int = 72
     use_domain_freshness_defaults: bool = True
     user_id: str = field(default_factory=current_user)
+    current_project_id: str = ""
+    current_project_name: str = ""
     saved_automations: Dict[str, Any] = field(default_factory=dict)
     history: List[Dict[str, Any]] = field(default_factory=list)
     recorder: TeachRecorder = field(default_factory=TeachRecorder)
@@ -133,6 +135,8 @@ class UiState:
                 "freshness_policy": _load_policy_freshness_defaults(),
                 "ai_backends": AI_BACKENDS,
                 "user_id": self.user_id,
+                "current_project_id": self.current_project_id,
+                "current_project_name": self.current_project_name,
                 "saved_automations": dict(self.saved_automations),
                 "history": list(self.history),
                 "teach": self.recorder.state(),
@@ -394,6 +398,22 @@ HTML_PAGE = """<!doctype html>
       </div>
       <div class="side-section-title">History</div>
       <div id="history"></div>
+      <div class="side-section" style="margin-top:10px;">
+        <div class="side-section-title">Projects</div>
+        <div class="small" id="projectStateLine">No active project.</div>
+        <input id="projectName" type="text" placeholder="Project name"/>
+        <div class="row">
+          <button onclick="createProject()">New</button>
+          <button onclick="saveProject()">Save</button>
+        </div>
+        <div class="row">
+          <select id="projectSelect" style="min-width:220px;"></select>
+          <button onclick="loadProject()">Load</button>
+        </div>
+        <div class="row">
+          <button onclick="refreshProjects()">Refresh</button>
+        </div>
+      </div>
     </aside>
     <main class="main">
       <div class="workspace-hero">
@@ -562,6 +582,14 @@ HTML_PAGE = """<!doctype html>
       </div>
       <div class="assistant-feed" id="assistantFeed">
         <div class="assistant-msg meta">Waiting for a task.</div>
+      </div>
+      <div class="composer-box lift" style="margin-top:10px;">
+        <div class="row chat-composer-row">
+          <input id="conversationInstruction" class="wide" type="text" placeholder="Type your prompt here or use Command Center."/>
+          <button class="primary" onclick="runInstructionFromConversation()">Send</button>
+          <button onclick="previewInstructionFromConversation()">Preview</button>
+        </div>
+        <div class="small">Conversation and Command Center share the same draft prompt.</div>
       </div>
     </div>
 
@@ -830,6 +858,8 @@ HTML_PAGE = """<!doctype html>
 </div>
 <script>
 const ui = { history: JSON.parse(localStorage.getItem("lam_ui_history") || "[]"), latestState: null };
+const SHARED_INSTRUCTION_KEY = "lam_instruction_draft";
+let projectCatalog = [];
 let progressPollTimer = null;
 let detailsVisible = false;
 let strictRulesVisible = false;
@@ -845,6 +875,34 @@ function syncViewportMode(){
   }
 }
 function persistHistory(){ localStorage.setItem("lam_ui_history", JSON.stringify(ui.history.slice(-300))); }
+function _instructionInputs(){
+  return [document.getElementById("instruction"), document.getElementById("conversationInstruction")].filter(Boolean);
+}
+function getSharedInstruction(){
+  for(const input of _instructionInputs()){
+    const value = String(input?.value || "").trim();
+    if(value){ return value; }
+  }
+  return String(localStorage.getItem(SHARED_INSTRUCTION_KEY) || "").trim();
+}
+function setSharedInstruction(value){
+  const text = String(value || "");
+  _instructionInputs().forEach(input=>{
+    if(input.value !== text){ input.value = text; }
+  });
+  localStorage.setItem(SHARED_INSTRUCTION_KEY, text);
+}
+function wireSharedInstructionInputs(){
+  _instructionInputs().forEach(input=>{
+    input.addEventListener("input", ()=>{ setSharedInstruction(input.value); void refreshFreshnessPreview(); });
+    input.addEventListener("keydown", (e)=>{
+      if(e.key === "Enter" && !e.shiftKey){
+        e.preventDefault();
+        void runInstruction();
+      }
+    });
+  });
+}
 function toggleCanvas(forceOpen){
   const shouldOpen = (forceOpen === undefined) ? !document.body.classList.contains("canvas-open") : !!forceOpen;
   if(shouldOpen && isCompactViewport()){
@@ -888,7 +946,7 @@ function updateTimelineFilterButtons(){
   });
 }
 function newTaskFromUI(){
-  document.getElementById("instruction").value = "";
+  setSharedInstruction("");
   const feed = document.getElementById("assistantFeed");
   feed.innerHTML = `<div class="assistant-msg meta">Waiting for a task.</div>`;
   document.getElementById("progressBar").style.width = "0%";
@@ -904,6 +962,24 @@ function _appendAssistantFeed(html, kind){
   node.innerHTML = html;
   feed.appendChild(node);
   feed.scrollTop = feed.scrollHeight;
+}
+function _narrateProjectAction(action, payload){
+  const project = payload?.project || {};
+  const name = String(project?.name || project?.id || "").trim() || "project";
+  if(action === "save"){
+    _appendAssistantFeed(`Project saved: <strong>${escapeHtml(name)}</strong>.`, "meta");
+    return;
+  }
+  if(action === "load"){
+    const historyCount = Number(payload?.history_count || 0);
+    const historyText = Number.isFinite(historyCount) && historyCount > 0 ? ` (${historyCount} run${historyCount === 1 ? "" : "s"} restored)` : "";
+    _appendAssistantFeed(`Project loaded: <strong>${escapeHtml(name)}</strong>${historyText}.`, "meta");
+    return;
+  }
+  if(action === "error"){
+    const message = String(payload?.error || "Project action failed.");
+    _appendAssistantFeed(`Project action needs attention: ${escapeHtml(message)}`, "meta");
+  }
 }
 async function submitFeedback(reason){
   try{
@@ -1509,6 +1585,14 @@ async function applyAuthRecoveryRecommendation(){
 async function refreshState(){
   const s=await fetch("/api/state").then(r=>r.json());
   ui.latestState = s;
+  if(Array.isArray(s.history)){
+    const incoming = s.history.slice(-300);
+    if(JSON.stringify(incoming) !== JSON.stringify(ui.history)){
+      ui.history = incoming;
+      persistHistory();
+      renderHistory();
+    }
+  }
   let t=s.control_granted?"Control: granted":"Control: not granted";
   const preflight = s.preflight || {};
   if(preflight.required){
@@ -1543,6 +1627,14 @@ async function refreshState(){
   document.getElementById("artifactReuseMode").value=s.artifact_reuse_mode||"reuse_if_recent";
   document.getElementById("artifactReuseMaxAgeHours").value=String(s.artifact_reuse_max_age_hours||72);
   document.getElementById("useDomainFreshnessDefaults").checked=!!s.use_domain_freshness_defaults;
+  const activeProjectName = String(s.current_project_name||"").trim();
+  const activeProjectId = String(s.current_project_id||"").trim();
+  const projectLine = document.getElementById("projectStateLine");
+  if(projectLine){
+    projectLine.innerText = activeProjectId
+      ? `Active: ${activeProjectName || activeProjectId}`
+      : "No active project.";
+  }
   const teach=s.teach||{};
   document.getElementById("teachState").innerText=`${teach.active?'Recording':'Idle'} | events: ${teach.event_count||0}${s.global_teach_active?' | global hooks active':''}`;
   renderTeachStudio(s);
@@ -1560,6 +1652,74 @@ async function refreshState(){
     : (canvasUrl ? "Live page from latest result." : "No active page.");
   updateWorkCanvas(canvasUrl, note);
   renderAuthRecoveryWizard(s);
+}
+async function refreshProjects(selectId){
+  const r=await fetch("/api/projects").then(resp=>resp.json());
+  if(!r?.ok){
+    showResponse(r||{ok:false,error:"Failed to load projects"});
+    return;
+  }
+  projectCatalog = Array.isArray(r.projects) ? r.projects : [];
+  const select=document.getElementById("projectSelect");
+  if(!select){ return; }
+  select.innerHTML = "";
+  projectCatalog.forEach(project=>{
+    const opt=document.createElement("option");
+    opt.value = String(project.id||"");
+    const name = String(project.name||project.id||"").trim();
+    const updated = project.updated_at ? new Date(Number(project.updated_at) * 1000).toLocaleString() : "";
+    opt.text = updated ? `${name} (${updated})` : name;
+    select.appendChild(opt);
+  });
+  const preferredId = String(selectId||r.current_project_id||"").trim();
+  if(preferredId){
+    select.value = preferredId;
+  }
+  const projectNameInput = document.getElementById("projectName");
+  if(projectNameInput && preferredId){
+    const matched = projectCatalog.find(item=>String(item.id||"") === preferredId);
+    if(matched && !String(projectNameInput.value||"").trim()){
+      projectNameInput.value = String(matched.name||"");
+    }
+  }
+  if(!getSharedInstruction() && r?.current_instruction_draft){
+    setSharedInstruction(String(r.current_instruction_draft||""));
+  }
+}
+async function createProject(){
+  const name = String(document.getElementById("projectName")?.value || "").trim();
+  const instruction = getSharedInstruction();
+  const r=await fetch("/api/projects/new",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name,instruction})}).then(resp=>resp.json());
+  if(!r?.ok){ showResponse(r); return; }
+  if(r?.instruction_draft !== undefined){ setSharedInstruction(String(r.instruction_draft||"")); }
+  if(r?.project?.name){ document.getElementById("projectName").value = String(r.project.name); }
+  showResponse(r);
+  await refreshProjects(r?.project?.id||"");
+  await refreshState();
+}
+async function saveProject(){
+  const name = String(document.getElementById("projectName")?.value || "").trim();
+  const project_id = String(document.getElementById("projectSelect")?.value || "").trim();
+  const instruction = getSharedInstruction();
+  const r=await fetch("/api/projects/save",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({project_id,name,instruction})}).then(resp=>resp.json());
+  if(!r?.ok){ showResponse(r); _narrateProjectAction("error", r||{}); return; }
+  showResponse(r);
+  _narrateProjectAction("save", r||{});
+  await refreshProjects(r?.project?.id||"");
+  await refreshState();
+}
+async function loadProject(){
+  const project_id = String(document.getElementById("projectSelect")?.value || "").trim();
+  if(!project_id){ return; }
+  const r=await fetch("/api/projects/load",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({project_id})}).then(resp=>resp.json());
+  if(!r?.ok){ showResponse(r); _narrateProjectAction("error", r||{}); return; }
+  setSharedInstruction(String(r?.instruction_draft||""));
+  if(r?.project?.name){ document.getElementById("projectName").value = String(r.project.name); }
+  showResponse(r);
+  _narrateProjectAction("load", r||{});
+  await refreshProjects(project_id);
+  await refreshState();
+  renderHistory();
 }
 function renderTeachStudio(state){
   const teach=state?.teach||{};
@@ -1791,7 +1951,11 @@ function renderHistory(){
     const canRerun = !!(item && item.instruction);
     const policySelectId = `rerunPolicy_${idx}`;
     d.innerHTML=`<div style="font-weight:600">${item.instruction||item.mode||"Run"}</div><div class="small">${item.app_name||""} ${item.opened_url||""}</div>${canRerun?`<div class="row" style="margin-top:6px"><button onclick="rerunHistory(${idx}); event.stopPropagation();">Re-run</button><select id="${policySelectId}" onclick="event.stopPropagation();" onchange="event.stopPropagation();" title="Freshness policy"><option value="reuse_if_recent">reuse if recent</option><option value="reuse">reuse</option><option value="always_regenerate">always regenerate</option></select></div>`:''}`;
-    d.onclick=()=>{ renderSummary(item); setRaw(item); };
+    d.onclick=()=>{
+      renderSummary(item);
+      setRaw(item);
+      if(item && item.instruction){ setSharedInstruction(String(item.instruction)); }
+    };
     el.appendChild(d);
     if(canRerun){
       const select=document.getElementById(policySelectId);
@@ -1840,7 +2004,7 @@ async function setArtifactReuseMode(v){ await fetch("/api/settings",{method:"POS
 async function setArtifactReuseMaxAgeHours(v){ const n=Math.max(1,Math.min(720,parseInt(v||"72",10)||72)); await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({artifact_reuse_max_age_hours:n})}); await refreshState(); }
 async function setUseDomainFreshnessDefaults(v){ await fetch("/api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({use_domain_freshness_defaults:!!v})}); await refreshState(); }
 async function refreshFreshnessPreview(){
-  const instruction=(document.getElementById("instruction").value||"").trim();
+  const instruction=getSharedInstruction();
   if(!instruction){
     document.getElementById("freshnessPreview").innerText="Freshness preview: waiting for instruction.";
     return;
@@ -1897,7 +2061,8 @@ async function resetSessionState(){
   await refreshState();
 }
 async function runInstruction(){
-  const instruction=document.getElementById("instruction").value.trim(); if(!instruction) return;
+  const instruction=getSharedInstruction(); if(!instruction) return;
+  setSharedInstruction(instruction);
   _appendAssistantFeed(escapeHtml(instruction), "user");
   lastTaskFeedKey = "";
   const ai_backend=document.getElementById("aiBackend").value;
@@ -1913,6 +2078,16 @@ async function runInstruction(){
   if(!r.ok){ showResponse(r); await refreshState(); return; }
   startTaskPolling(r.task_id, { instruction, ai_backend, min_live_non_curated_citations, manual_auth_phase, browser_worker_mode, human_like_interaction, use_domain_freshness_defaults, artifact_reuse_mode, artifact_reuse_max_age_hours, confirm_risky:false });
 }
+async function runInstructionFromConversation(){
+  const value = String(document.getElementById("conversationInstruction")?.value || "");
+  setSharedInstruction(value);
+  await runInstruction();
+}
+async function previewInstructionFromConversation(){
+  const value = String(document.getElementById("conversationInstruction")?.value || "");
+  setSharedInstruction(value);
+  await previewInstruction();
+}
 async function captureClipboardImageUi(){
   const instruction="Capture the current clipboard image and save it as an artifact package with base64 output.";
   _appendAssistantFeed(escapeHtml(instruction), "user");
@@ -1920,8 +2095,8 @@ async function captureClipboardImageUi(){
   showResponse(r);
   await refreshState();
 }
-async function previewInstruction(){ const instruction=document.getElementById("instruction").value.trim(); if(!instruction)return; const r=await fetch("/api/preview",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({instruction})}).then(r=>r.json()); showResponse(r); await refreshState(); }
-async function saveAutomation(){ const name=document.getElementById("automationName").value.trim(); const instruction=document.getElementById("instruction").value.trim(); const r=await fetch("/api/automation/save",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name,instruction})}).then(r=>r.json()); showResponse(r); await refreshState(); }
+async function previewInstruction(){ const instruction=getSharedInstruction(); if(!instruction)return; const r=await fetch("/api/preview",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({instruction})}).then(r=>r.json()); showResponse(r); await refreshState(); }
+async function saveAutomation(){ const name=document.getElementById("automationName").value.trim(); const instruction=getSharedInstruction(); const r=await fetch("/api/automation/save",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name,instruction})}).then(r=>r.json()); showResponse(r); await refreshState(); }
 async function runAutomation(){
   const name=document.getElementById("automationName").value.trim();
   const ai_backend=document.getElementById("aiBackend").value;
@@ -1937,7 +2112,7 @@ async function runAutomation(){
   startTaskPolling(r.task_id, { instruction:r.instruction||"", ai_backend, min_live_non_curated_citations, manual_auth_phase, browser_worker_mode, human_like_interaction, use_domain_freshness_defaults, artifact_reuse_mode, artifact_reuse_max_age_hours, confirm_risky:false });
 }
 async function regenerateFresh(){
-  const fromInput=document.getElementById("instruction").value.trim();
+  const fromInput=getSharedInstruction();
   const fromLast=String(lastRaw?.instruction||"").trim();
   const instruction=fromInput||fromLast;
   if(!instruction){ showResponse({ok:false,error:"No instruction available to regenerate."}); return; }
@@ -2043,7 +2218,7 @@ async function vaultImport(){
   const r=await fetch("/api/vault/import",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path,merge:true})}).then(r=>r.json());
   showResponse(r); await vaultList(); await refreshState();
 }
-function useTemplate(text){ document.getElementById("instruction").value=text; }
+function useTemplate(text){ setSharedInstruction(text); }
 async function captureSelector(){ const r=await fetch("/api/selector/capture",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(r=>r.json()); showResponse(r); await refreshState(); }
 async function teachStart(){ const app_name=document.getElementById("teachApp").value.trim(); const r=await fetch("/api/teach/start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({app_name})}).then(r=>r.json()); showResponse(r); await refreshState(); await loadTeachRecipes(); }
 async function teachGlobalStart(){ const r=await fetch("/api/teach/global_start",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(r=>r.json()); showResponse(r); await refreshState(); }
@@ -2311,17 +2486,10 @@ window.onload=async()=>{
   toggleStrictRules(strictRulesVisible);
   updateTimelineFilterButtons();
   renderHistory();
+  setSharedInstruction(localStorage.getItem(SHARED_INSTRUCTION_KEY) || "");
+  wireSharedInstructionInputs();
   await refreshState();
-  const instructionInput=document.getElementById("instruction");
-  if(instructionInput){
-    instructionInput.addEventListener("keydown", (e)=>{
-      if(e.key === "Enter" && !e.shiftKey){
-        e.preventDefault();
-        void runInstruction();
-      }
-    });
-    instructionInput.addEventListener("input", ()=>{ void refreshFreshnessPreview(); });
-  }
+  await refreshProjects();
   await refreshFreshnessPreview();
   await loadDomainFreshnessPolicy();
   await loadTeachRecipes();
@@ -2361,6 +2529,29 @@ class _Handler(BaseHTTPRequestHandler):
             snap = self.state.snapshot()
             data = json.dumps({"exported_at": time.time(), "history": snap["history"]}, indent=2)
             self._send_text(200, data, "application/json")
+            return
+        if path == "/api/projects":
+            current = _load_current_project_meta()
+            current_instruction_draft = ""
+            current_id = str(current.get("id", "") or "")
+            if current_id:
+                loaded = _load_project_snapshot(current_id)
+                if loaded.get("ok"):
+                    snapshot = dict(loaded.get("snapshot", {}) or {})
+                    current_instruction_draft = str(snapshot.get("instruction_draft", "") or "")
+            with self.state.lock:
+                self.state.current_project_id = str(current.get("id", "") or "")
+                self.state.current_project_name = str(current.get("name", "") or "")
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "projects": _list_projects(),
+                    "current_project_id": str(current.get("id", "") or ""),
+                    "current_project_name": str(current.get("name", "") or ""),
+                    "current_instruction_draft": current_instruction_draft,
+                },
+            )
             return
         if path == "/api/artifact":
             requested = (qs.get("path", [""])[0] or "").strip()
@@ -2509,6 +2700,131 @@ class _Handler(BaseHTTPRequestHandler):
                 self.state.history = []
                 _save_history(self.state.history)
             self._send_json(200, {"ok": True, "cleared": True})
+            return
+
+        if self.path == "/api/projects/new":
+            requested_name = str(payload.get("name", "")).strip()
+            instruction = str(payload.get("instruction", "")).strip()
+            project = _create_project(requested_name)
+            _set_current_project(project["id"])
+            _save_project_snapshot(
+                project_id=project["id"],
+                project_name=project["name"],
+                instruction_draft=instruction,
+                history=[],
+                saved_automations={},
+                settings={},
+            )
+            with self.state.lock:
+                self.state.current_project_id = project["id"]
+                self.state.current_project_name = project["name"]
+                self.state.history = []
+                self.state.saved_automations = {}
+                _save_history(self.state.history)
+                _save_automations(self.state.saved_automations)
+            self._send_json(200, {"ok": True, "project": project, "instruction_draft": instruction, "cleared": True})
+            return
+
+        if self.path == "/api/projects/save":
+            requested_id = _normalize_project_id(str(payload.get("project_id", "")).strip())
+            requested_name = str(payload.get("name", "")).strip()
+            instruction = str(payload.get("instruction", "")).strip()
+            current = _load_current_project_meta()
+            project_id = requested_id or str(current.get("id", "") or "")
+            if not project_id:
+                created = _create_project(requested_name or "Project")
+                project_id = created["id"]
+                project_name = created["name"]
+            else:
+                project_name = requested_name or str(current.get("name", "") or "")
+            with self.state.lock:
+                history = list(self.state.history)
+                saved_automations = dict(self.state.saved_automations)
+                settings = {
+                    "step_mode": bool(self.state.step_mode),
+                    "manual_auth_phase": bool(self.state.manual_auth_phase),
+                    "browser_worker_mode": str(self.state.browser_worker_mode),
+                    "human_like_interaction": bool(self.state.human_like_interaction),
+                    "ai_backend": str(self.state.ai_backend),
+                    "compression_mode": str(self.state.compression_mode),
+                    "min_live_non_curated_citations": int(self.state.min_live_non_curated_citations),
+                    "artifact_reuse_mode": str(self.state.artifact_reuse_mode),
+                    "artifact_reuse_max_age_hours": int(self.state.artifact_reuse_max_age_hours),
+                    "use_domain_freshness_defaults": bool(self.state.use_domain_freshness_defaults),
+                }
+            project = _save_project_snapshot(
+                project_id=project_id,
+                project_name=project_name,
+                instruction_draft=instruction,
+                history=history,
+                saved_automations=saved_automations,
+                settings=settings,
+            )
+            _set_current_project(project_id)
+            with self.state.lock:
+                self.state.current_project_id = project_id
+                self.state.current_project_name = project.get("name", "")
+            self._send_json(200, {"ok": True, "project": project, "saved": True})
+            return
+
+        if self.path == "/api/projects/load":
+            project_id = _normalize_project_id(str(payload.get("project_id", "")).strip())
+            if not project_id:
+                self._send_json(400, {"ok": False, "error": "project_id is required"})
+                return
+            loaded = _load_project_snapshot(project_id)
+            if not loaded.get("ok"):
+                self._send_json(404, loaded)
+                return
+            snapshot = dict(loaded.get("snapshot", {}) or {})
+            project = dict(loaded.get("project", {}) or {})
+            history = list(snapshot.get("history", []) or [])
+            if not isinstance(history, list):
+                history = []
+            history = [item for item in history if isinstance(item, dict)][-300:]
+            saved_automations = snapshot.get("saved_automations", {}) or {}
+            if not isinstance(saved_automations, dict):
+                saved_automations = {}
+            settings = snapshot.get("settings", {}) or {}
+            if not isinstance(settings, dict):
+                settings = {}
+            with self.state.lock:
+                self.state.current_project_id = str(project.get("id", "") or project_id)
+                self.state.current_project_name = str(project.get("name", "") or "")
+                self.state.history = history
+                self.state.saved_automations = dict(saved_automations)
+                self.state.step_mode = bool(settings.get("step_mode", self.state.step_mode))
+                self.state.manual_auth_phase = bool(settings.get("manual_auth_phase", self.state.manual_auth_phase))
+                self.state.browser_worker_mode = normalize_browser_worker_mode(str(settings.get("browser_worker_mode", self.state.browser_worker_mode)))
+                self.state.human_like_interaction = bool(settings.get("human_like_interaction", self.state.human_like_interaction))
+                self.state.ai_backend = normalize_backend(str(settings.get("ai_backend", self.state.ai_backend)))
+                mode = str(settings.get("compression_mode", self.state.compression_mode)).strip().lower()
+                self.state.compression_mode = mode if mode in {"aggressive", "normal", "strict"} else self.state.compression_mode
+                try:
+                    self.state.min_live_non_curated_citations = max(1, min(20, int(settings.get("min_live_non_curated_citations", self.state.min_live_non_curated_citations))))
+                except Exception:
+                    pass
+                reuse_mode = str(settings.get("artifact_reuse_mode", self.state.artifact_reuse_mode)).strip().lower()
+                if reuse_mode in {"reuse", "reuse_if_recent", "always_regenerate"}:
+                    self.state.artifact_reuse_mode = reuse_mode
+                try:
+                    self.state.artifact_reuse_max_age_hours = max(1, min(720, int(settings.get("artifact_reuse_max_age_hours", self.state.artifact_reuse_max_age_hours))))
+                except Exception:
+                    pass
+                self.state.use_domain_freshness_defaults = bool(settings.get("use_domain_freshness_defaults", self.state.use_domain_freshness_defaults))
+                _save_history(self.state.history)
+                _save_automations(self.state.saved_automations)
+                _save_user_defaults_locked(self.state)
+            _set_current_project(project_id)
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "project": project,
+                    "instruction_draft": str(snapshot.get("instruction_draft", "") or ""),
+                    "history_count": len(history),
+                },
+            )
             return
 
         if self.path == "/api/feedback":
@@ -3608,6 +3924,19 @@ class _Handler(BaseHTTPRequestHandler):
 
 def run_ui_server(host: str = "127.0.0.1", port: int = 8795, open_browser: bool = True) -> None:
     state = UiState(saved_automations=_load_automations(), history=_load_history())
+    current_project = _load_current_project_meta()
+    state.current_project_id = str(current_project.get("id", "") or "")
+    state.current_project_name = str(current_project.get("name", "") or "")
+    if state.current_project_id:
+        loaded = _load_project_snapshot(state.current_project_id)
+        if loaded.get("ok"):
+            snapshot = dict(loaded.get("snapshot", {}) or {})
+            history = snapshot.get("history", [])
+            saved_automations = snapshot.get("saved_automations", {})
+            if isinstance(history, list):
+                state.history = [item for item in history if isinstance(item, dict)][-300:]
+            if isinstance(saved_automations, dict):
+                state.saved_automations = dict(saved_automations)
     state.global_hooks = GlobalTeachHooks(state.recorder)
     _apply_user_defaults(state)
     # Chat-first product mode: do not block normal delegation behind reliability gates.
@@ -3775,6 +4104,195 @@ def _load_history() -> List[Dict[str, Any]]:
 
 def _save_history(history: List[Dict[str, Any]]) -> None:
     _history_path().write_text(json.dumps(history[-300:], indent=2), encoding="utf-8")
+
+
+def _projects_root() -> Path:
+    root = Path("data/interface/projects")
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _projects_index_path() -> Path:
+    return _projects_root() / "index.json"
+
+
+def _current_project_path() -> Path:
+    return _projects_root() / "current.json"
+
+
+def _normalize_project_id(project_id: str) -> str:
+    value = str(project_id or "").strip()
+    return "".join(ch for ch in value if ch.isalnum() or ch in {"-", "_"})
+
+
+def _project_snapshot_path(project_id: str) -> Path:
+    safe_id = _normalize_project_id(project_id)
+    return _projects_root() / safe_id / "project.json"
+
+
+def _load_projects_index() -> Dict[str, Any]:
+    path = _projects_index_path()
+    if not path.exists():
+        return {"projects": []}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"projects": []}
+    if not isinstance(raw, dict):
+        return {"projects": []}
+    projects = raw.get("projects", [])
+    if not isinstance(projects, list):
+        projects = []
+    return {"projects": [item for item in projects if isinstance(item, dict)]}
+
+
+def _save_projects_index(data: Dict[str, Any]) -> None:
+    projects = data.get("projects", [])
+    payload = {"projects": [item for item in projects if isinstance(item, dict)]}
+    _projects_index_path().write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _slugify_label(text: str) -> str:
+    cleaned = "".join(ch.lower() if ch.isalnum() else "-" for ch in str(text or "").strip())
+    normalized = "-".join(part for part in cleaned.split("-") if part)
+    return normalized[:48] or "project"
+
+
+def _upsert_project_index_entry(project_id: str, name: str, updated_at: float) -> Dict[str, Any]:
+    index = _load_projects_index()
+    projects = list(index.get("projects", []))
+    match = None
+    for item in projects:
+        if str(item.get("id", "")) == project_id:
+            match = item
+            break
+    if match is None:
+        match = {"id": project_id}
+        projects.append(match)
+    match["name"] = str(name or project_id)
+    match["updated_at"] = float(updated_at)
+    projects.sort(key=lambda item: float(item.get("updated_at", 0.0) or 0.0), reverse=True)
+    _save_projects_index({"projects": projects})
+    return {"id": str(match.get("id", "")), "name": str(match.get("name", "")), "updated_at": float(match.get("updated_at", updated_at))}
+
+
+def _list_projects() -> List[Dict[str, Any]]:
+    index = _load_projects_index()
+    projects = list(index.get("projects", []))
+    normalized: List[Dict[str, Any]] = []
+    for item in projects:
+        project_id = str(item.get("id", "")).strip()
+        if not project_id:
+            continue
+        normalized.append(
+            {
+                "id": project_id,
+                "name": str(item.get("name", "") or project_id),
+                "updated_at": float(item.get("updated_at", 0.0) or 0.0),
+            }
+        )
+    normalized.sort(key=lambda item: float(item.get("updated_at", 0.0) or 0.0), reverse=True)
+    return normalized
+
+
+def _create_project(name: str) -> Dict[str, Any]:
+    now = time.time()
+    label = str(name or "").strip() or "Project"
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    slug = _slugify_label(label)
+    project_id = f"{stamp}_{slug}_{uuid.uuid4().hex[:6]}"
+    project_dir = _projects_root() / project_id
+    project_dir.mkdir(parents=True, exist_ok=True)
+    project = _upsert_project_index_entry(project_id, label, now)
+    return project
+
+
+def _set_current_project(project_id: str) -> None:
+    project_id = _normalize_project_id(project_id)
+    if not project_id:
+        _current_project_path().write_text(json.dumps({"id": "", "name": "", "updated_at": time.time()}, indent=2), encoding="utf-8")
+        return
+    projects = _list_projects()
+    match = next((item for item in projects if str(item.get("id", "")) == project_id), None)
+    payload = {
+        "id": project_id,
+        "name": str((match or {}).get("name", "") or project_id),
+        "updated_at": float((match or {}).get("updated_at", time.time()) or time.time()),
+    }
+    _current_project_path().write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _load_current_project_meta() -> Dict[str, Any]:
+    path = _current_project_path()
+    if not path.exists():
+        return {"id": "", "name": "", "updated_at": 0.0}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"id": "", "name": "", "updated_at": 0.0}
+    if not isinstance(raw, dict):
+        return {"id": "", "name": "", "updated_at": 0.0}
+    project_id = _normalize_project_id(str(raw.get("id", "") or ""))
+    name = str(raw.get("name", "") or "").strip()
+    updated = float(raw.get("updated_at", 0.0) or 0.0)
+    if project_id and not name:
+        matched = next((item for item in _list_projects() if str(item.get("id", "")) == project_id), None)
+        if matched:
+            name = str(matched.get("name", "") or project_id)
+            updated = float(matched.get("updated_at", updated) or updated)
+    return {"id": project_id, "name": name, "updated_at": updated}
+
+
+def _save_project_snapshot(
+    *,
+    project_id: str,
+    project_name: str,
+    instruction_draft: str,
+    history: List[Dict[str, Any]],
+    saved_automations: Dict[str, Any],
+    settings: Dict[str, Any],
+) -> Dict[str, Any]:
+    now = time.time()
+    project_id = _normalize_project_id(project_id)
+    name = str(project_name or "").strip() or project_id
+    if not project_id:
+        raise ValueError("project_id is required")
+    snapshot_path = _project_snapshot_path(project_id)
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    snapshot = {
+        "project_id": project_id,
+        "name": name,
+        "updated_at": now,
+        "instruction_draft": str(instruction_draft or ""),
+        "history": [item for item in list(history or []) if isinstance(item, dict)][-300:],
+        "saved_automations": dict(saved_automations or {}),
+        "settings": dict(settings or {}),
+    }
+    snapshot_path.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+    project = _upsert_project_index_entry(project_id, name, now)
+    return project
+
+
+def _load_project_snapshot(project_id: str) -> Dict[str, Any]:
+    project_id = _normalize_project_id(project_id)
+    if not project_id:
+        return {"ok": False, "error": "project_id is required"}
+    path = _project_snapshot_path(project_id)
+    if not path.exists():
+        return {"ok": False, "error": f"Project '{project_id}' not found."}
+    try:
+        snapshot = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"ok": False, "error": "project file is unreadable"}
+    if not isinstance(snapshot, dict):
+        return {"ok": False, "error": "project file is invalid"}
+    projects = _list_projects()
+    existing = next((item for item in projects if str(item.get("id", "")) == project_id), None)
+    if existing:
+        project = existing
+    else:
+        project = _upsert_project_index_entry(project_id, str(snapshot.get("name", "") or project_id), float(snapshot.get("updated_at", time.time()) or time.time()))
+    return {"ok": True, "project": project, "snapshot": snapshot}
 
 
 def _capture_live_replay_state(app_hint: str = "") -> Dict[str, Any]:

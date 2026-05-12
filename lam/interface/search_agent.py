@@ -1596,6 +1596,8 @@ def _should_use_execution_graph_runtime(*, task_contract: Any, explicit_route: s
     explicit_editor = any(token in low for token in ["vscode", "vs code", "visual studio code", "workspace", "new instance"])
     if explicit_route == "artifact_generation":
         return False
+    if _is_job_research_intent(instruction):
+        return False
     if domain == "topic_learning":
         return True
     if domain == "ui_build" and any(token in low for token in ui_tokens):
@@ -6204,12 +6206,15 @@ def _is_job_research_intent(instruction: str) -> bool:
     low = instruction.lower()
     job_terms = ["job", "position", "vp", "avp", "linkedin", "indeed", "salary", "remote"]
     analysis_terms = ["spreadsheet", "dashboard", "report", "analysis"]
-    strong_job_signal = sum(1 for t in job_terms if t in low) >= 3 and any(t in low for t in analysis_terms)
+    job_keyword = any(t in low for t in ["job", "jobs", "position", "positions", "job search", "career"])
+    analytics_output = any(t in low for t in analysis_terms)
+    strong_job_signal = (sum(1 for t in job_terms if t in low) >= 3 and analytics_output) or (job_keyword and analytics_output)
     board_signal = any(t in low for t in ["job board", "job boards", "all the job boards", "jobsites", "job sites"])
     comp_signal = any(t in low for t in ["total compensation", "compensation", "total comp", "more than", "above"])
     leadership_signal = any(t in low for t in ["vp", "avp", "vice president", "analytics", "data and ai", "data and analytics"])
     remote_signal = any(t in low for t in ["remote", "hybrid"])
-    return strong_job_signal or (board_signal and leadership_signal and (comp_signal or remote_signal))
+    direct_search_signal = any(t in low for t in ["search jobs", "find jobs", "job market"])
+    return strong_job_signal or direct_search_signal or (board_signal and leadership_signal and (comp_signal or remote_signal))
 
 
 def _run_job_market_research(instruction: str, progress_cb: Optional[Callable[[int, str], None]] = None) -> Dict[str, Any]:

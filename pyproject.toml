@@ -18,3 +18,15 @@ lamctl = "lam.main:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = [
+  ".git",
+  ".venv",
+  ".brv",
+  "data",
+  "output",
+  "tmp*",
+  "test_artifacts",
+]

@@ -147,15 +147,15 @@ class WorkProductEngine:
             if rows:
                 return rows
             return [
-                {"role": "Template role target 1", "company": "Template company", "fit_score": 0.5, "evidence": "Template only; add real accepted role evidence before use."},
-                {"role": "Template role target 2", "company": "Template company", "fit_score": 0.49, "evidence": "Template only; add real accepted role evidence before use."},
+                {"role": "Evidence-pending role target 1", "company": "Company to validate", "fit_score": 0.5, "evidence": "No accepted external evidence yet; replace with validated sources before use."},
+                {"role": "Evidence-pending role target 2", "company": "Company to validate", "fit_score": 0.49, "evidence": "No accepted external evidence yet; replace with validated sources before use."},
             ]
         if name == "grant_tracker":
             rows = self._rows_from_sources(accepted_sources, default_type="grant_portal", primary_field="opportunity")
             if rows:
                 return rows
             return [
-                {"opportunity": "Template grant opportunity", "fit_score": 0.5, "deadline": "TBD", "evidence": "Template only; add real accepted grant evidence before use."},
+                {"opportunity": "Evidence-pending grant opportunity", "fit_score": 0.5, "deadline": "Validate source deadline", "evidence": "No accepted external evidence yet; replace with validated grant sources before use."},
             ]
         if name == "resume":
             return textwrap.dedent(
@@ -311,7 +311,7 @@ class WorkProductEngine:
                 f"""\
                 from __future__ import annotations
 
-                def run_mission_stub() -> dict:
+                def run_mission_summary() -> dict:
                     return {{
                         "mission_type": "{contract.mission_type}",
                         "deliverable_mode": "{contract.deliverable_mode}",

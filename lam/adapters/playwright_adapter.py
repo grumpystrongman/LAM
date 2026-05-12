@@ -33,7 +33,7 @@ class PlaywrightAdapter:
 
     def extract_field(self, selector_bundle: Dict[str, Any]) -> str:
         self._trace.append({"action": "extract_field", "selector": selector_bundle})
-        return "stub_value"
+        return ""
 
     def screenshot_redacted(self, reason: str) -> None:
         # Persist only pre-redacted artifacts when explicitly enabled by policy.
@@ -51,4 +51,3 @@ class PlaywrightAdapter:
         host = (urlparse(url).hostname or "").lower()
         if host not in self.domain_allowlist:
             raise PermissionError(f"Domain not allowlisted: {host}")
-

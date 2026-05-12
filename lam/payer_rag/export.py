@@ -307,7 +307,6 @@ def write_dashboard_html(workspace: str | Path, *, geography_label: str = "Durha
         )
         for row in manifest
     )
-    target = root / "artifacts" / "shopping_dashboard_placeholder.html"
     target = root / "artifacts" / "payer_dashboard.html"
     synthetic_badge = "<span class='pill' style='background:#fee2e2;color:#991b1b;margin-left:8px;'>Synthetic / demo only</span>" if synthetic_label else ""
     target.write_text(

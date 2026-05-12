@@ -110,7 +110,7 @@ class UIAAdapter:
     def extract_field(self, selector_bundle: Dict[str, Any]) -> str:
         self._trace.append({"action": "extract_field", "selector": selector_bundle})
         if self.dry_run:
-            return "stub_value"
+            return ""
         element = self._find_element(selector_bundle)
         for attr in ("window_text", "texts"):
             if hasattr(element, attr):
@@ -121,7 +121,7 @@ class UIAAdapter:
                     return str(value)
                 except Exception:
                     continue
-        return "stub_value"
+        return ""
 
     def screenshot_redacted(self, reason: str) -> None:
         self._trace.append({"action": "screenshot_redacted", "reason": reason})
