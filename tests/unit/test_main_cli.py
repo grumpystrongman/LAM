@@ -13,6 +13,7 @@ class TestMainCli(unittest.TestCase):
         self.assertIn("skill-practice-run", help_text)
         self.assertIn("skill-refresh", help_text)
         self.assertIn("ui", help_text)
+        self.assertIn("capability-check", help_text)
 
     def test_topic_learn_parser_args(self) -> None:
         parser = build_parser()
@@ -42,6 +43,13 @@ class TestMainCli(unittest.TestCase):
         topic_parser = parser._subparsers._group_actions[0].choices["topic-learn"]  # type: ignore[attr-defined]  # noqa: SLF001
         help_text = topic_parser.format_help()
         self.assertIn("Learn how to build a Power BI KPI dashboard", help_text)
+
+    def test_capability_check_parser_args(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["capability-check", "--strict-core", "--output", "json"])
+        self.assertEqual(args.command, "capability-check")
+        self.assertTrue(args.strict_core)
+        self.assertEqual(args.output, "json")
 
 
 if __name__ == "__main__":

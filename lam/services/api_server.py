@@ -16,6 +16,7 @@ class ApiAuthConfig:
     bearer_secret: str = ""
     bearer_issuer: str = "lam-control-plane"
     allow_anonymous_health: bool = True
+    allow_insecure_anonymous_api: bool = False
 
 
 class ApiAuth:
@@ -42,8 +43,9 @@ class ApiAuth:
 
         if self.config.api_key or self.config.bearer_secret:
             raise PermissionError("Unauthorized")
-        # Local development fallback if no auth configured.
-        return {"actor_id": "anonymous", "roles": ["Auditor"], "department": "", "clearance": ""}
+        if self.config.allow_insecure_anonymous_api:
+            return {"actor_id": "anonymous", "roles": ["Auditor"], "department": "", "clearance": ""}
+        raise PermissionError("Authentication is not configured")
 
 
 @dataclass(slots=True)
@@ -293,6 +295,7 @@ def run_http_server(
         bearer_secret=os.getenv("LAM_BEARER_SECRET", ""),
         bearer_issuer=os.getenv("LAM_BEARER_ISSUER", "lam-control-plane"),
         allow_anonymous_health=True,
+        allow_insecure_anonymous_api=bool(str(os.getenv("LAM_ALLOW_INSECURE_ANONYMOUS_API", "0")).strip() in {"1", "true", "yes", "on"}),
     )
     auth = ApiAuth(config=config)
 
@@ -304,4 +307,3 @@ def run_http_server(
     server = ThreadingHTTPServer((host, port), Handler)
     print(f"LAM control plane listening on http://{host}:{port}")
     server.serve_forever()
-

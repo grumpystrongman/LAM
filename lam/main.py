@@ -38,6 +38,7 @@ from lam.services.api_server import ApiAuthConfig, ControlPlaneService, run_http
 from lam.services.audit_store import AuditStore
 from lam.services.sqlite_approval_service import SqliteApprovalService
 from lam.services.workflow_store import WorkflowStore
+from lam.runtime_capabilities import check_runtime_capabilities, format_capability_report
 
 
 def build_runner(config_dir: str = "config", audit_backend: str = "sqlite") -> Runner:
@@ -102,6 +103,7 @@ def serve_control_plane(args: argparse.Namespace) -> None:
         bearer_secret=args.bearer_secret or os.getenv("LAM_BEARER_SECRET", ""),
         bearer_issuer=args.bearer_issuer or os.getenv("LAM_BEARER_ISSUER", "lam-control-plane"),
         allow_anonymous_health=True,
+        allow_insecure_anonymous_api=bool(args.allow_insecure_anonymous_api),
     )
     run_http_server(service=service, host=args.host, port=args.port, auth_config=auth)
 
@@ -243,6 +245,16 @@ def _print_result(result: object, *, output_format: str = "text") -> None:
     print(result)
 
 
+def capability_check(args: argparse.Namespace) -> None:
+    report = check_runtime_capabilities()
+    if args.output == "json":
+        _print_result(report, output_format="json")
+    else:
+        print(format_capability_report(report))
+    if args.strict_core and not bool((report.get("core", {}) or {}).get("ready", False)):
+        raise SystemExit(2)
+
+
 def _add_output_arg(parser: argparse.ArgumentParser, default: str = "text") -> None:
     parser.add_argument(
         "--output",
@@ -328,6 +340,11 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--api-key", default="")
     serve_parser.add_argument("--bearer-secret", default="")
     serve_parser.add_argument("--bearer-issuer", default="lam-control-plane")
+    serve_parser.add_argument(
+        "--allow-insecure-anonymous-api",
+        action="store_true",
+        help="Development-only override: allow anonymous API access when no auth secrets are configured",
+    )
     serve_parser.set_defaults(func=serve_control_plane)
 
     validate_parser = sub.add_parser(
@@ -538,6 +555,15 @@ def build_parser() -> argparse.ArgumentParser:
     skill_refresh_parser.add_argument("--skill-root", default="data/learned_skills")
     _add_output_arg(skill_refresh_parser, default="json")
     skill_refresh_parser.set_defaults(func=skill_refresh)
+
+    capability_parser = sub.add_parser(
+        "capability-check",
+        help="Check runtime dependency capabilities",
+        description="Validate required runtime dependencies and show optional adapter availability.",
+    )
+    capability_parser.add_argument("--strict-core", action="store_true", help="Exit with status 2 if required core capabilities are missing")
+    _add_output_arg(capability_parser, default="text")
+    capability_parser.set_defaults(func=capability_check)
 
     return parser
 

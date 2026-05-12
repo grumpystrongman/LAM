@@ -9,8 +9,25 @@ description = "Governance-first LAM platform scaffold for healthcare Windows end
 requires-python = ">=3.10"
 dependencies = [
   "PyYAML>=6.0",
+  "pypdf>=4.2.0",
+  "PyMuPDF>=1.24.0",
+  "python-pptx>=1.0.2",
   "jsonschema>=4.23.0",
   "playwright>=1.58.0",
+]
+
+[project.optional-dependencies]
+desktop = [
+  "pywinauto>=0.6.8",
+  "pyautogui>=0.9.54",
+  "pytesseract>=0.3.10",
+  "Pillow>=10.0.0",
+]
+excel = [
+  "openpyxl>=3.1.0",
+]
+browser = [
+  "selenium>=4.25.0",
 ]
 
 [project.scripts]

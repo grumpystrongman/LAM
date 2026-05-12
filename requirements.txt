@@ -1,10 +1,6 @@
-PyYAML>=6.0
-pypdf>=4.2.0
-PyMuPDF>=1.24.0
-python-pptx>=1.0.2
-jsonschema>=4.23.0
-playwright>=1.58.0
-# Optional runtime adapters:
-# pywinauto>=0.6.8
-# openpyxl>=3.1.0
-# selenium>=4.25.0
+-e .
+
+# Optional runtime profiles (choose what you need):
+# -e .[desktop]
+# -e .[excel]
+# -e .[browser]

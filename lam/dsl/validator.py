@@ -94,5 +94,62 @@ def evaluate_condition(expression: str, runtime_state: Dict[str, Any]) -> bool:
             ),
         ):
             raise ValueError(f"Unsupported expression element: {type(child).__name__}")
+    resolver = _Resolver()
 
-    return bool(eval(compile(node, "<condition>", "eval"), {"__builtins__": {}}, _Resolver()))
+    def _resolve_name(name: str) -> Any:
+        return resolver[name]
+
+    def _eval_expr(item: ast.AST) -> Any:
+        if isinstance(item, ast.Expression):
+            return _eval_expr(item.body)
+        if isinstance(item, ast.Constant):
+            return item.value
+        if isinstance(item, ast.Name):
+            return _resolve_name(item.id)
+        if isinstance(item, ast.Attribute):
+            base = _eval_expr(item.value)
+            if base is None:
+                return None
+            return getattr(base, item.attr, None)
+        if isinstance(item, ast.BoolOp):
+            if isinstance(item.op, ast.And):
+                result = True
+                for value in item.values:
+                    current = bool(_eval_expr(value))
+                    if not current:
+                        return False
+                    result = result and current
+                return result
+            if isinstance(item.op, ast.Or):
+                for value in item.values:
+                    if bool(_eval_expr(value)):
+                        return True
+                return False
+            raise ValueError(f"Unsupported bool operator: {type(item.op).__name__}")
+        if isinstance(item, ast.UnaryOp) and isinstance(item.op, ast.Not):
+            return not bool(_eval_expr(item.operand))
+        if isinstance(item, ast.Compare):
+            left = _eval_expr(item.left)
+            for op, comparator in zip(item.ops, item.comparators):
+                right = _eval_expr(comparator)
+                if isinstance(op, ast.Eq):
+                    passed = left == right
+                elif isinstance(op, ast.NotEq):
+                    passed = left != right
+                elif isinstance(op, ast.Gt):
+                    passed = left > right
+                elif isinstance(op, ast.GtE):
+                    passed = left >= right
+                elif isinstance(op, ast.Lt):
+                    passed = left < right
+                elif isinstance(op, ast.LtE):
+                    passed = left <= right
+                else:
+                    raise ValueError(f"Unsupported compare operator: {type(op).__name__}")
+                if not passed:
+                    return False
+                left = right
+            return True
+        raise ValueError(f"Unsupported expression element: {type(item).__name__}")
+
+    return bool(_eval_expr(node))
